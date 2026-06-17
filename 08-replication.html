@@ -387,7 +387,7 @@ leaderLog.maybeIncrementHighWatermark(newHW)   // monotonic; only moves up</code
 <div class="callout note"><span class="callout-title">Note — useful JMX gauges</span><p><code>Partition</code> exports <code>UnderReplicated</code>, <code>UnderMinIsr</code>, <code>AtMinIsr</code>, <code>InSyncReplicasCount</code>, <code>ReplicasCount</code>, and <code>LastStableOffsetLag</code> per topic-partition (<code>Partition.scala:221-226</code>); <code>ReplicaManager</code> defines and exports <code>IsrExpandsPerSec</code>, <code>IsrShrinksPerSec</code> and <code>FailedIsrUpdatesPerSec</code> (<code>ReplicaManager.scala:100-102,257-259</code>), marked through the <code>AlterPartitionListener</code> (<code>Partition.scala:101-111</code>). Sustained <code>UnderMinIsr &gt; 0</code> on a busy topic is the canonical "producers are being rejected" alarm.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

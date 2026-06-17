@@ -309,7 +309,7 @@
 <div class="callout key"><span class="callout-title">Carry-away</span><p>The log is a specialist optimized for ordered, replayable, high-throughput, fanned-out streams that you decouple producers and consumers around. Its strengths and its absences are the <em>same</em> design decision. Reach for it when the seven forces light up; route off it the moment an early gate (store, RPC, classic-queue-with-priority/routing) trips — because those gates guard <em>inherent</em> limits no tuning will move. And when in doubt, apply the litmus question: structural, feature-mitigated, or config-tunable. Next, <a href="bp02-design-decisions.html">bp02</a> opens the design-decision space <em>inside</em> the "use the log" branch — partition count, keys, RF, ordering, and the rest — where the interesting tradeoffs begin.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

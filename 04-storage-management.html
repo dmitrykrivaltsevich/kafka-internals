@@ -520,7 +520,7 @@
 <div class="callout note"><span class="callout-title">Note</span><p>Per-partition compaction throughput is gated by one offset map per thread: a partition with more distinct dirty keys than fit in <code>slots × loadFactor</code> is cleaned in multiple passes, advancing the cleaner point a chunk at a time. Increasing <code>log.cleaner.dedupe.buffer.size</code> (or threads) raises the per-pass key budget (<code>Cleaner.java:781,810-813,178</code>).</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

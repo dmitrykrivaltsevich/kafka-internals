@@ -38,7 +38,7 @@ function skeleton(slug, m, fragment) {
 ${fragment}
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
@@ -54,7 +54,7 @@ ${fragment}
 
 function indexPage() {
   let body = `      <div class="hero">
-        <h1>Apache Kafka — The Complete Field Guide</h1>
+        <h1>Apache Kafka Internals</h1>
         <p>A deep, source-derived guide to Apache Kafka in three parts: how it works inside, how to operate it at scale, and what the distributed log teaches us as an architectural blueprint.</p>
         <div class="hero-meta">
           <span class="pill">${PROVENANCE}</span>
@@ -82,7 +82,7 @@ function indexPage() {
       body += `      </div>\n`;
     }
   }
-  return skeleton("index", { title: "Apache Kafka — The Complete Field Guide", desc: "A deep, source-derived guide to Apache Kafka: architecture internals, operations, and the log as an architectural blueprint." }, body)
+  return skeleton("index", { title: "Apache Kafka Internals", desc: "A deep, source-derived guide to Apache Kafka: architecture internals, operations, and the log as an architectural blueprint." }, body)
     .replace('data-page="index"', 'data-page=""');
 }
 

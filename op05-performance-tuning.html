@@ -262,7 +262,7 @@
 <div class="callout invariant"><span class="callout-title">What does not change between profiles</span><p>The durability floor and the resource posture are constant. Keep <code>acks=all</code> with <code>min.insync.replicas=2</code> and RF=3 (see <a href="op06-durability.html">II · 06</a>), keep the heap small so the page cache stays large, keep <code>vm.swappiness=1</code> / <code>vm.max_map_count ≥ 262144</code> / <code>nofile ≥ 100000</code>, and always read the <code>RequestMetrics</code> breakdown and the two idle gauges before turning a knob. Latency and throughput are dials; data loss is not a dial you want to discover you turned.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

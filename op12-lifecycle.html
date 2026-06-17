@@ -325,7 +325,7 @@
 <div class="callout invariant"><span class="callout-title">Five rules that never change</span><p><strong>(1)</strong> Roll binaries before bumping <code>metadata.version</code> — the controller rejects the bump until every node supports it, and the bump is effectively one-way (<code>FeatureControlManager.java:321,399</code>). <strong>(2)</strong> One broker (or one voter) at a time; wait for <code>UnderReplicatedPartitions=0</code> and full unfence before the next. <strong>(3)</strong> Every data move is an explicit, throttled reassignment — Kafka never balances data for you, and an orphaned throttle is a latent outage. <strong>(4)</strong> Decommission by draining replicas <em>before</em> stopping the broker, never after. <strong>(5)</strong> Unclean leader election and forced metadata downgrade are data-destroying last resorts — decide the policy per topic in advance, and keep a MirrorMaker-2 standby for anything you cannot afford to lose.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

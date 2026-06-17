@@ -978,4 +978,15 @@ figure.diagram { box-shadow: none; border-color: var(--border); }
 /* Topbar: plain hairline, no saturate (monochrome) ------------------------- */
 .topbar { backdrop-filter: blur(8px); }
 
+/* Callouts → monochrome. Colour belongs to diagrams, not chrome; the icon and
+   label (ℹ ✦ ⚠ ✓ ✕ ★ + title) carry the type, so no colour is needed. ------- */
+.callout.note, .callout.rationale, .callout.gotcha,
+.callout.invariant, .callout.warning, .callout.key {
+  border-left-color: var(--border-strong); background: var(--bg-soft);
+}
+.callout.note::before, .callout.rationale::before, .callout.gotcha::before,
+.callout.invariant::before, .callout.warning::before, .callout.key::before { color: var(--fg-muted); }
+.callout.note .callout-title, .callout.rationale .callout-title, .callout.gotcha .callout-title,
+.callout.invariant .callout-title, .callout.warning .callout-title, .callout.key .callout-title { color: var(--fg); }
+
 /* end Computer Modern re-skin ============================================== */

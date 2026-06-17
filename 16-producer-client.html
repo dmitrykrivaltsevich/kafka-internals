@@ -418,7 +418,7 @@ finally: free.deallocate(buffer); appendsInProgress--</code></pre>
 <div class="callout note"><span class="callout-title">Note</span><p>A <code>send()</code> that fails synchronously with an <code>ApiException</code> still fires the user callback and interceptor <code>onSendError</code>, and returns a pre-completed <code>FutureFailure</code> rather than throwing — only non-API exceptions (e.g. <code>SerializationException</code>, <code>InterruptException</code>) propagate to the caller (<span class="cite">KafkaProducer.java:1200</span>).</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

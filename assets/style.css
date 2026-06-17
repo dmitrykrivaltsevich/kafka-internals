@@ -741,3 +741,241 @@ figure.diagram .mermaid .node circle, figure.diagram .mermaid .node path { filte
 .part-head:first-of-type { margin-top: 1rem; border-top: none; padding-top: 0; }
 .part-head h2 { font-size: 1.7rem; border: none; margin: 0 0 0.25rem; padding: 0; }
 .part-head p { color: var(--fg-muted); font-size: 0.95rem; margin: 0; max-width: 52rem; }
+
+/* ==========================================================================
+   COMPUTER MODERN RE-SKIN  (append-only override; loads after everything)
+   --------------------------------------------------------------------------
+   Goal: make the whole site read like the krivaltsevich.com book theme —
+   self-hosted Computer Modern type, monochrome chrome & prose on neutral
+   paper-white (#f6f6f6) carrying a faint prime-tiled fractal grain, calm
+   charcoal dark mode — WITHOUT touching HTML, layout, or the diagram
+   semantic-colour system. Colour now appears ONLY inside figures/diagrams.
+
+   Strategy:
+   (a) @font-face for CMU Serif + CMU Typewriter (same woff filenames as the
+       personal site, copied into assets/fonts/).
+   (b) Re-point the font tokens (--font-sans → serif, --font-mono → CM TT).
+   (c) Neutralise the CHROME/PROSE colour tokens to ink/paper monochrome:
+       --bg* / --surface / --fg* / --border* / --accent* / --link / --hl-*.
+       These tokens are used only by chrome + prose, never by --cat-* figures.
+   (d) Add the paper grain to the body background.
+   (e) A handful of targeted rule overrides for spots that hard-code colour
+       or a gradient and cannot be reached by a variable (brand logo, hero,
+       nav-part bar, dark prose-code colour, calmer figure plate).
+   LEFT INTACT: every --c-* and --cat-* token, and all diagram components
+   (logstrip, bytemap/.bf, dflow, dstack, dseq, dstate, legend, mermaid) —
+   so categories stay distinguishable and every legend still reads.
+   ========================================================================== */
+
+/* (a) ---- Self-hosted Computer Modern --------------------------------------*/
+@font-face { font-family: "CMU Serif"; font-style: normal; font-weight: 400;
+  src: url("fonts/cmunrm.woff") format("woff"); font-display: swap; }
+@font-face { font-family: "CMU Serif"; font-style: italic; font-weight: 400;
+  src: url("fonts/cmunti.woff") format("woff"); font-display: swap; }
+@font-face { font-family: "CMU Serif"; font-style: normal; font-weight: 700;
+  src: url("fonts/cmunbx.woff") format("woff"); font-display: swap; }
+@font-face { font-family: "CMU Serif"; font-style: italic; font-weight: 700;
+  src: url("fonts/cmunbi.woff") format("woff"); font-display: swap; }
+@font-face { font-family: "CMU Typewriter"; font-style: normal; font-weight: 400;
+  src: url("fonts/cmuntt.woff") format("woff"); font-display: swap; }
+@font-face { font-family: "CMU Typewriter"; font-style: normal; font-weight: 700;
+  src: url("fonts/cmuntb.woff") format("woff"); font-display: swap; }
+
+/* (b)+(c) ---- Re-point font tokens & monochrome the chrome/prose tokens -----*/
+:root {
+  /* type: serif body+headings, CM typewriter for code/mono */
+  --font-sans: "CMU Serif", "Latin Modern Roman", Georgia, "Times New Roman", serif;
+  --font-mono: "CMU Typewriter", "Latin Modern Mono", "SF Mono", "Consolas", ui-monospace, monospace;
+
+  /* paper-white surfaces (light) */
+  --bg: #f6f6f6;          /* neutral paper-white, not pure white */
+  --bg-soft: #efefee;     /* faint shade for soft panels / table stripes */
+  --bg-sunken: #e9e9e7;   /* sunken wells (ascii diagrams, "next" cells) */
+  --bg-code: #ececec;     /* inline-code & code-block ground (=personal --shade) */
+  --bg-sidebar: #f1f1f0;  /* sidebar barely distinct from page */
+  --surface: #f6f6f6;     /* cards / popovers sit flush with paper */
+
+  /* ink scale (light) */
+  --fg: #1b1b1a;          /* near-black, neutral */
+  --fg-soft: #3a3a39;     /* strong secondary (body emphasis, th) */
+  --fg-muted: #5e5e5c;    /* captions / meta (=personal --ink-soft) */
+  --fg-faint: #7e7e7c;    /* faintest (markers, nums, rules-as-text).
+                             Darkened from #8a8a88: faint text also lands on the
+                             sunken well (--bg-sunken, ascii diagrams / logstrip
+                             "next" cell) where #8a8a88 was 2.85:1 — below the
+                             3:1 floor. #7e7e7c clears it (3.35:1) and stays faint
+                             vs the 15.95:1 body ink. */
+
+  /* hairlines (light) */
+  --border: #d9d9d7;      /* hairline rule (=personal --rule) */
+  --border-strong: #c4c4c1;
+
+  /* accent → INK. The accent only paints chrome/prose (links, active nav/toc,
+     inline-code text, kv terms, brand). Monochrome keeps colour out of prose. */
+  --accent: #1b1b1a;
+  --accent-soft: #e3e3e1;  /* active-nav background: a quiet grey wash */
+  --accent-fg: #1b1b1a;    /* "coloured" prose code / kv dt / active link → ink */
+  --link: #1b1b1a;         /* links are ink; underline carries the affordance */
+
+  /* prose syntax highlighting → graphite monochrome (book listings, not IDE) */
+  --hl-keyword: #1b1b1a;
+  --hl-string:  #3a3a39;
+  --hl-comment: #8a8a88;
+  --hl-number:  #3a3a39;
+
+  /* Quiet the figure FILL tints so colour sits calmly on paper. Hues (the
+     stroke/text --c-* values) are otherwise UNCHANGED, so categories stay
+     distinct and legends read; only the pale background washes are
+     de-saturated a touch. */
+  --c-note-bg:      #eef1f5;
+  --c-rationale-bg: #f0eef5;
+  --c-gotcha-bg:    #f4efe7;
+  --c-invariant-bg: #e9f1ec;
+  --c-warning-bg:   #f4ecec;
+  --c-key-bg:       #e8f0f1;
+  /* ONE hue corrected for contrast: amber #d97706 (control) was only 2.78:1 on
+     its wash / 2.95:1 on paper — control text in cat-control nodes, logstrip
+     ".pending" cells and ".dseq .note" borders failed the 3:1 floor in light
+     mode. Darken to #9a6a10 → 4.0–4.4:1, still unmistakably amber. (Dark-mode
+     amber #e3a008 is fine at 7.4:1, so it is left as-is.) */
+  --c-gotcha:       #9a6a10;
+
+  /* book-ish geometry: tighter radii, near-flat shadows */
+  --radius: 5px;
+  --radius-sm: 4px;
+  --shadow-sm: 0 1px 0 rgba(27, 27, 26, 0.05);
+  --shadow-md: 0 2px 10px rgba(27, 27, 26, 0.08);
+}
+
+/* dark = neutral charcoal (mirrors personal theme) */
+:root[data-theme="dark"] {
+  --bg: #18191c;
+  --bg-soft: #202126;
+  --bg-sunken: #1d1e22;
+  --bg-code: #202126;     /* =personal --shade */
+  --bg-sidebar: #1b1c20;
+  --surface: #1d1e22;
+
+  --fg: #e6e6e4;
+  --fg-soft: #c9c9c6;
+  --fg-muted: #9a9a98;    /* =personal --ink-soft */
+  --fg-faint: #6f6f6d;
+
+  --border: #34353a;      /* =personal --rule */
+  --border-strong: #44454b;
+
+  --accent: #e6e6e4;
+  --accent-soft: #2a2b30; /* active-nav wash, dark */
+  --accent-fg: #e6e6e4;
+  --link: #e6e6e4;
+
+  --hl-keyword: #e6e6e4;
+  --hl-string:  #c9c9c6;
+  --hl-comment: #6f6f6d;
+  --hl-number:  #c9c9c6;
+
+  /* dark figure fills: deep neutral-leaning washes, hues still legible */
+  --c-note-bg:      #14202e;
+  --c-rationale-bg: #1c1730;
+  --c-gotcha-bg:    #241d0e;
+  --c-invariant-bg: #112216;
+  --c-warning-bg:   #2a1414;
+  --c-key-bg:       #0c2128;
+
+  --shadow-md: 0 2px 14px rgba(0, 0, 0, 0.5);
+}
+
+/* (d) ---- Paper grain on the page background -------------------------------*/
+:root {
+  --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='251' height='257'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+}
+body {
+  background-color: var(--bg);
+  background-image: var(--noise);
+  background-size: 251px 257px;          /* native prime tile: never repeats visibly */
+  font-feature-settings: "liga" 1, "onum" 1;  /* CM ligatures + oldstyle figures */
+}
+::selection { background: #d9e8ff; }
+:root[data-theme="dark"] ::selection { background: #2b3a57; }
+
+/* (e) ---- Typographic fidelity: scale, leading, measure --------------------*/
+/* CM runs small & light at a given px; nudge the base up and open the leading
+   so prose reads like the personal site (its body is ~1.28rem / 1.62). */
+body { font-size: 17.5px; line-height: 1.66; }
+
+/* Restrained, classical heading scale. Body face throughout; no -apple-system.
+   Bold via CMU-bx, italic subheads via CMU-ti — matching the personal theme. */
+article h1 { font-weight: 700; letter-spacing: -0.01em; font-size: 2.15rem; line-height: 1.16; }
+article h2 { font-weight: 700; letter-spacing: 0;        font-size: 1.5rem;  }
+article h3 { font-weight: 400; font-style: italic;       font-size: 1.2rem;  color: var(--fg); }
+article h4 { font-weight: 700; font-style: normal;       font-size: 1.0rem;  color: var(--fg-soft); }
+/* slightly looser prose rhythm */
+article p { line-height: 1.66; }
+.lead { font-style: italic; color: var(--fg-soft); border-left-color: var(--border-strong); }
+
+/* Quiet, small-caps-style navigation & section eyebrows (book running heads).
+   Replaces the shouty uppercase+letterspacing with CM small-caps. */
+.nav-group > .nav-group-title,
+.toc .toc-title,
+.section-label,
+.callout .callout-title,
+.page-nav .dir,
+.year-sep {
+  text-transform: none;
+  font-variant: small-caps;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+.nav-group a { font-size: 0.95rem; }            /* serif needs a touch more size */
+.nav-group a .num { color: var(--fg-faint); font-weight: 400; }
+.toc a { font-size: 0.9rem; }
+.toc a.h3 { font-style: italic; }
+
+/* Inline code: CM Typewriter on a faint mark, INK text (no accent colour). */
+code {
+  background: var(--bg-code);
+  border-color: var(--border);
+  color: var(--fg);
+}
+:root[data-theme="dark"] code { color: var(--fg); }   /* override the #a9c7ff blue */
+dl.kv dt { color: var(--fg); }                          /* kv terms → ink, not accent */
+.legend .mono, .logstrip .ls-head .ttl .q { color: var(--fg); } /* mono labels → ink */
+
+/* Links: ink with a hairline underline that strengthens on hover (book style),
+   instead of a coloured link with hover-underline. Chrome links stay quiet. */
+a { text-decoration: underline; text-decoration-thickness: .055em;
+    text-underline-offset: .12em; text-decoration-color: var(--border-strong); }
+a:hover { text-decoration-color: var(--fg); }
+.nav-group a, .toc a, .topbar .brand, .page-nav a, .breadcrumb a, .card,
+.heading-anchor, a.cite { text-decoration: none; }
+.nav-group a:hover, .toc a:hover, .page-nav a:hover { text-decoration: none; }
+
+/* (e) ---- Targeted de-colouring of hard-coded chrome gradients -------------*/
+/* brand logo: was blue→purple gradient with white glyph → ink chip on paper */
+.topbar .brand .logo {
+  background: var(--fg);
+  color: var(--bg);
+}
+/* hero: drop the accent radial glow; keep the plate quiet */
+.hero { background: none; }
+/* hero H1: was accent gradient text-clip → solid ink, italic display (personal) */
+.hero h1 {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: var(--fg);
+  font-style: italic; font-weight: 700;
+}
+/* sidebar Part divider bar: was blue→purple → a short ink rule */
+.nav-part::before { background: var(--fg); }
+
+/* (e) ---- Calmer figure plate (still a plate, just quieter) ----------------*/
+/* keep the dot-grid canvas, but align it to paper & soften the shadow so
+   figures read as quiet inset plates rather than glossy cards. */
+:root            { --canvas: #f1f1f0; --dot: #dcdcda; }
+:root[data-theme="dark"] { --canvas: #1b1c20; --dot: #2c2d33; }
+figure.diagram { box-shadow: none; border-color: var(--border); }
+
+/* Topbar: plain hairline, no saturate (monochrome) ------------------------- */
+.topbar { backdrop-filter: blur(8px); }
+
+/* end Computer Modern re-skin ============================================== */

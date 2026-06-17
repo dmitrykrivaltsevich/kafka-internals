@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Consumer Client · Kafka Internals</title>
+<meta name="description" content="Classic vs async consumer, SubscriptionState, the fetch pipeline, request managers, the poll loop.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="17-consumer-client">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>17 · The Consumer Client</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">The <code>KafkaConsumer</code> reads records from topic partitions, tracks a per-partition position, optionally manages group membership and committed offsets, and turns raw fetch responses into deserialized <code>ConsumerRecord</code>s. As of Kafka 4.x the public class is a thin façade that delegates to one of two engines: the legacy single-threaded <code>ClassicKafkaConsumer</code> (the entire coordinator + fetch loop runs on the user's <code>poll()</code> thread) or the KIP-848 <code>AsyncKafkaConsumer</code>, which splits work across the application thread and a dedicated <code>ConsumerNetworkThread</code> communicating over event queues. This chapter dissects both, the shared <code>SubscriptionState</code>, the fetch pipeline, and offset management — all grounded in the source.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The consumer client is the client-side half of Kafka's read path. Its jobs are:</p>
+<ul>
+  <li><strong>Position tracking</strong> — for every assigned partition, remember the offset of the next record to deliver, plus the high watermark (HW), log-start offset, and last-stable-offset (LSO) reported by the broker.</li>
+  <li><strong>Fetching</strong> — build <code>Fetch</code> RPCs that respect <code>fetch.min.bytes</code>/<code>fetch.max.bytes</code>/<code>max.partition.fetch.bytes</code>/<code>fetch.max.wait.ms</code>, parse and decompress the returned batches, skip aborted transactions under <code>read_committed</code>, and hand back at most <code>max.poll.records</code> records per <code>poll()</code>.</li>
+  <li><strong>Group membership</strong> (optional) — join a consumer group, receive a partition assignment, run <code>ConsumerRebalanceListener</code> callbacks, send heartbeats, and detect liveness via <code>max.poll.interval.ms</code>.</li>
+  <li><strong>Offset management</strong> (optional) — commit positions to the group coordinator (auto or manual) and fetch committed offsets on startup.</li>
+</ul>
+<p>A consumer with no <code>group.id</code> can still <code>assign()</code> partitions manually and fetch; it simply cannot commit offsets or use group management. See <a href="13-group-coordination.html">Group Coordination &amp; Rebalance Protocols</a> for the broker side and <a href="09-fetch-path.html">The Fetch Path &amp; Replica Fetchers</a> for how the broker serves these fetches.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>The consumer is <em>not</em> thread-safe. Both engines enforce single-threaded access with a lightweight CAS lock that throws <code>ConcurrentModificationException</code> rather than blocking (<code>AsyncKafkaConsumer.acquire()</code>, <code>clients/.../internals/AsyncKafkaConsumer.java:2216</code>). The only sanctioned multi-thread interaction is calling <code>wakeup()</code> from another thread.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Class / interface</th><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>KafkaConsumer</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/consumer/KafkaConsumer.java</code></td><td>Public façade; holds a <code>ConsumerDelegate</code> and forwards every method.</td></tr>
+<tr><td><code>ConsumerDelegateCreator</code></td><td><code>.../consumer/internals/ConsumerDelegateCreator.java</code></td><td>Factory; picks the engine from <code>group.protocol</code>.</td></tr>
+<tr><td><code>ClassicKafkaConsumer</code></td><td><code>.../consumer/internals/ClassicKafkaConsumer.java</code></td><td>Legacy single-threaded engine (CLASSIC protocol).</td></tr>
+<tr><td><code>AsyncKafkaConsumer</code></td><td><code>.../consumer/internals/AsyncKafkaConsumer.java</code></td><td>KIP-848 engine (CONSUMER protocol); application thread + background thread.</td></tr>
+<tr><td><code>ConsumerNetworkThread</code></td><td><code>.../consumer/internals/ConsumerNetworkThread.java</code></td><td>Background event loop; drives request managers + network I/O.</td></tr>
+<tr><td><code>SubscriptionState</code></td><td><code>.../consumer/internals/SubscriptionState.java</code></td><td>Thread-safe per-partition state machine; subscription type, positions, pause.</td></tr>
+<tr><td><code>FetchRequestManager</code> / <code>AbstractFetch</code></td><td><code>.../consumer/internals/{FetchRequestManager,AbstractFetch}.java</code></td><td>Builds fetch requests, manages fetch sessions, fills the buffer.</td></tr>
+<tr><td><code>FetchBuffer</code> / <code>CompletedFetch</code> / <code>FetchCollector</code></td><td><code>.../consumer/internals/{FetchBuffer,CompletedFetch,FetchCollector}.java</code></td><td>Thread-safe buffer; per-partition decode/iterate; collection into a <code>Fetch</code>.</td></tr>
+<tr><td><code>CommitRequestManager</code></td><td><code>.../consumer/internals/CommitRequestManager.java</code></td><td>Auto/manual commit, committed-offset fetch (async engine).</td></tr>
+<tr><td><code>OffsetsRequestManager</code></td><td><code>.../consumer/internals/OffsetsRequestManager.java</code></td><td><code>updateFetchPositions</code>: committed-offset / list-offsets / validation (async engine).</td></tr>
+<tr><td><code>ConsumerMembershipManager</code> / <code>AbstractMembershipManager</code></td><td><code>.../consumer/internals/{ConsumerMembershipManager,AbstractMembershipManager}.java</code></td><td>KIP-848 member state machine &amp; assignment reconciliation.</td></tr>
+<tr><td><code>ConsumerHeartbeatRequestManager</code> / <code>AbstractHeartbeatRequestManager</code></td><td><code>.../consumer/internals/{ConsumerHeartbeatRequestManager,AbstractHeartbeatRequestManager}.java</code></td><td>Sends <code>ConsumerGroupHeartbeat</code>; owns the poll timer.</td></tr>
+<tr><td><code>ConsumerCoordinator</code> / <code>AbstractCoordinator</code></td><td><code>.../consumer/internals/{ConsumerCoordinator,AbstractCoordinator}.java</code></td><td>CLASSIC-protocol JoinGroup/SyncGroup + heartbeat thread.</td></tr>
+<tr><td>event classes</td><td><code>.../consumer/internals/events/*.java</code></td><td><code>ApplicationEvent</code> / <code>BackgroundEvent</code> hierarchy crossing the two threads.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Choosing an engine: the delegator</h2>
+<p><code>KafkaConsumer</code> stores a single field <code>private final ConsumerDelegate&lt;K, V&gt; delegate</code> (<code>KafkaConsumer.java:543</code>) and every public method simply forwards (e.g. <code>poll</code> at <code>KafkaConsumer.java:916</code> returns <code>delegate.poll(timeout)</code>). The delegate is built by <code>ConsumerDelegateCreator.create()</code>, which reads <code>group.protocol</code> and dispatches:</p>
+<pre><code>GroupProtocol gp = GroupProtocol.valueOf(config.getString(GROUP_PROTOCOL_CONFIG).toUpperCase());
+if (gp == GroupProtocol.CONSUMER) return new AsyncKafkaConsumer&lt;&gt;(...);   // KIP-848
+else                             return new ClassicKafkaConsumer&lt;&gt;(...);  // legacy</code></pre>
+<p><span class="cite">ConsumerDelegateCreator.java:61</span>. The enum has exactly two values, <code>CLASSIC("CLASSIC")</code> and <code>CONSUMER("CONSUMER")</code> (<code>GroupProtocol.java:30</code>), and <code>group.protocol</code> defaults to <code>classic</code> (<code>ConsumerConfig.java:115</code>, <code>DEFAULT_GROUP_PROTOCOL = GroupProtocol.CLASSIC.name().toLowerCase()</code>). Both engines implement <code>ConsumerDelegate&lt;K,V&gt;</code>, so the façade is oblivious to which one it holds.</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>KIP-848 set out to move rebalancing logic from the client into a broker-side group coordinator and to give the consumer a new threading model that never blocks the user's thread on coordination. The façade/delegate split lets the two implementations co-exist so users opt in with a single config (<code>group.protocol=consumer</code>) without changing code. Cite <span class="pill kip">KIP-848</span>; the new client metrics come from <span class="pill kip">KIP-1068</span>.</p></div>
+
+<h2>The classic engine: one thread does everything</h2>
+<p><code>ClassicKafkaConsumer</code> owns a <code>ConsumerNetworkClient</code> (<code>client</code>), a <code>Fetcher</code>, an <code>OffsetFetcher</code>, and — when grouped — a <code>ConsumerCoordinator</code> (<code>ClassicKafkaConsumer.java:127</code>). Its <code>poll(Timer)</code> loop runs entirely on the caller's thread (<code>ClassicKafkaConsumer.java:648</code>):</p>
+<ol>
+  <li><code>client.maybeTriggerWakeup()</code> — honor a pending <code>wakeup()</code>.</li>
+  <li><code>updateAssignmentMetadataIfNeeded(timer, false)</code> — runs <code>coordinator.poll(timer, waitForJoinGroup=false)</code> (joins the group, sends heartbeats, runs rebalance callbacks, auto-commits) then <code>updateFetchPositions</code>.</li>
+  <li><code>pollForFetches(timer)</code> — <code>fetcher.collectFetch()</code> returns buffered data immediately if present; otherwise <code>sendFetches()</code> issues new fetch RPCs and <code>client.poll(pollTimer, () -&gt; !fetcher.hasAvailableFetches())</code> blocks for responses.</li>
+  <li>If the fetch is non-empty, pipeline: <code>sendFetches()</code> + <code>client.transmitSends()</code> before returning, so the next batch is already in flight while the user processes records.</li>
+</ol>
+<p>Crucially, heartbeats in the classic protocol are <em>also</em> sent off a background <em>heartbeat</em> thread named <code>kafka-coordinator-heartbeat-thread | &lt;groupId&gt;</code> (<code>AbstractCoordinator.java:124,1471</code>), but JoinGroup/SyncGroup and all rebalance work happen on the user thread inside <code>coordinator.poll</code>. This is the structural limitation KIP-848 removes.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">user thread &middot; poll(timeout)</span><span class="nd">the entire loop runs on the caller's thread</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">coordinator.poll(timer)</span><span class="nd">JoinGroup / SyncGroup &middot; rebalance callbacks &middot; auto-commit</span></div>
+  <div class="conn" data-label="metadata ready"></div>
+  <div class="node cat-broker"><span class="nt">updateFetchPositions</span><span class="nd">OffsetFetch / ListOffsets / validate</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">fetcher.sendFetches()</span><span class="nd">build Fetch RPCs for fetchable partitions</span></div>
+  <div class="conn ec-data" data-label="blocking network I/O"></div>
+  <div class="node cat-broker"><span class="nt">client.poll(&hellip;)</span><span class="nd">send / await responses on this thread</span></div>
+  <div class="conn dashed ec-data" data-label="buffered batches"></div>
+  <div class="node cat-storage"><span class="nt">fetcher.collectFetch()</span><span class="nd">&rArr; ConsumerRecords</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker store"><span class="nt">broker / coordinator</span><span class="nd">serves Fetch + coordination RPCs</span></div>
+  <div class="conn dashed ec-async" data-label="heartbeats only"></div>
+  <div class="node cat-coord pill"><span class="nt">kafka-coordinator-heartbeat-thread</span><span class="nd">separate background thread &middot; HB only</span></div>
+</div><figcaption>Classic engine: coordination, position resolution and blocking fetch I/O all share the application thread; only heartbeats run on a separate background thread.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>application thread (caller)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker-facing fetch / metadata step</span>
+  <span class="lgi"><span class="sw cat-coord"></span>coordination / heartbeat</span>
+  <span class="lgi"><span class="sw cat-storage"></span>decoded records</span>
+  <span class="lgi"><span class="sw cat-broker dash"></span>cylinder = broker / coordinator</span>
+  <span class="lgi"><span class="mono">pill</span> = dedicated thread</span>
+  <span class="lgi"><span class="arr ec-data"></span>blocking network I/O</span>
+  <span class="lgi"><span class="arr dashed ec-async"></span>async / heartbeats</span>
+</div></figure>
+
+<h2>The async engine: two threads, two queues</h2>
+<p><code>AsyncKafkaConsumer</code> divides responsibilities between the <strong>application thread</strong> (whatever calls <code>poll()</code>/<code>commit*()</code>/etc.) and a single <strong>background thread</strong>, <code>ConsumerNetworkThread</code>, whose Java thread name is <code>consumer_background_thread</code> (<code>ConsumerNetworkThread.java:68</code>). They communicate through two blocking queues:</p>
+<ul>
+  <li><strong>Application event queue</strong> (<code>LinkedBlockingQueue&lt;ApplicationEvent&gt;</code>): app thread → background. Wrapped by <code>ApplicationEventHandler</code>; <code>add()</code> enqueues and wakes the network thread (<code>ApplicationEventHandler.java:94</code>), <code>addAndGet()</code> enqueues a <code>CompletableApplicationEvent</code> and blocks on its future (<code>ApplicationEventHandler.java:135</code>).</li>
+  <li><strong>Background event queue</strong> (<code>LinkedBlockingQueue&lt;BackgroundEvent&gt;</code>): background → app. Carries errors to surface to the user and rebalance-callback requests, drained by <code>AsyncKafkaConsumer.BackgroundEventProcessor</code> on the app thread (<code>AsyncKafkaConsumer.java:192</code>).</li>
+</ul>
+<p>The background thread holds the actual networking machinery — the <code>NetworkClientDelegate</code> and a list of <code>RequestManager</code>s — none of which the app thread is allowed to touch directly.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="row">
+    <div class="col">
+      <div class="node cat-client"><span class="nt">application thread</span><span class="nd">poll(): add AsyncPollEvent &middot; commitAsync(): add AsyncCommitEvent</span></div>
+      <div class="conn ec-data" data-label="application event queue"></div>
+    </div>
+    <div class="col">
+      <div class="node cat-client"><span class="nt">processBackgroundEvents()</span><span class="nd">surface errors &middot; run rebalance callbacks</span></div>
+      <div class="conn dashed ec-err" data-label="background event queue ↑"></div>
+    </div>
+  </div>
+  <div class="node cat-broker"><span class="nt">consumer_background_thread &middot; runOnce()</span><span class="nd">applicationEventQueue.drainTo(&hellip;)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">ApplicationEventProcessor.process()</span><span class="nd">one handler per ApplicationEvent</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">each RequestManager.poll(now)</span><span class="nd">Coordinator · Commit · Heartbeat · Membership · Offsets · TopicMetadata · Fetch</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">networkClientDelegate.poll(&hellip;)</span><span class="nd">single network step: send · read · fire callbacks</span></div>
+  <div class="conn ec-data" data-label="fetch responses"></div>
+  <div class="node cat-storage store"><span class="nt">FetchBuffer</span><span class="nd">one CompletedFetch per partition</span></div>
+  <div class="conn dashed ec-data" data-label="collectFetch() ↑ (app thread, non-blocking)"></div>
+  <div class="node cat-client"><span class="nt">ConsumerRecords</span><span class="nd">returned to the caller of poll()</span></div>
+</div><figcaption>Async engine: the application thread never blocks on network I/O; it exchanges events with the background loop. The background thread drains application events, polls every RequestManager (Coordinator, Commit, Heartbeat, Membership, Offsets, TopicMetadata, Fetch), does one network step, fills the FetchBuffer, and pushes errors / callbacks back over the background event queue.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>application thread (caller)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>background-thread machinery</span>
+  <span class="lgi"><span class="sw cat-coord"></span>request managers</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>FetchBuffer (shared store)</span>
+  <span class="lgi"><span class="arr ec-data"></span>data / event flow</span>
+  <span class="lgi"><span class="arr dashed ec-err"></span>background event queue (errors / callbacks ↑)</span>
+</div></figure>
+
+<h3>The background event loop</h3>
+<p><code>ConsumerNetworkThread.runOnce()</code> (<code>ConsumerNetworkThread.java:210</code>) is the heart of the engine and executes repeatedly:</p>
+<ol>
+  <li><code>processApplicationEvents()</code> — <code>drainTo</code> the application queue and <code>applicationEventProcessor.process(event)</code> each one; <code>CompletableEvent</code>s are registered with a <code>CompletableEventReaper</code> so they can be timed out.</li>
+  <li>For each <code>RequestManager rm : requestManagers.entries()</code>: <code>PollResult pr = rm.poll(now)</code> then <code>networkClientDelegate.addAll(pr)</code>, accumulating the minimum poll timeout.</li>
+  <li><code>networkClientDelegate.poll(pollWaitTimeMs, now)</code> — single network step: send staged requests, read responses, fire callbacks.</li>
+  <li>Recompute <code>cachedMaximumTimeToWait</code> as <code>min(rm.maximumTimeToWait(now))</code> so the app thread can later read the safe block duration via <code>maximumTimeToWait()</code> without touching the managers (<code>ConsumerNetworkThread.java:340</code>).</li>
+  <li><code>reapExpiredApplicationEvents(now)</code> and surface metadata errors to events implementing <code>MetadataErrorNotifiableEvent</code>.</li>
+</ol>
+<p>The managers iterated each pass include (in order) the <code>CoordinatorRequestManager</code>, <code>CommitRequestManager</code>, <code>ConsumerHeartbeatRequestManager</code>, <code>ConsumerMembershipManager</code>, <code>OffsetsRequestManager</code>, <code>TopicMetadataRequestManager</code>, and <code>FetchRequestManager</code> (<code>RequestManagers.java:91</code>). Each is <code>Optional</code> except offsets/metadata/fetch, so a groupless consumer simply has no coordinator/commit/heartbeat/membership managers.</p>
+
+<h3>poll() on the application thread: the AsyncPollEvent</h3>
+<p>Rather than block waiting for coordination, <code>AsyncKafkaConsumer.poll()</code> (<code>AsyncKafkaConsumer.java:933</code>) submits a single multi-stage <code>AsyncPollEvent</code> and then polls the fetch buffer non-blocking. The event encapsulates "do a poll round-trip": reconciliation check, position validation, and fetch-request creation, executed sequentially on the background thread. Its lifecycle is managed by <code>checkInflightPoll()</code>:</p>
+<ul>
+  <li>On the first pass of a <code>poll()</code> call, if a previous <code>inflightPoll</code> exists, <code>maybeClearPreviousInflightPoll()</code> inspects it: complete-with-error → throw; complete-and-buffer-empty → clear and submit a fresh one; complete-and-buffer-non-empty → keep it (avoids starvation when <code>poll(0)</code> is called repeatedly).</li>
+  <li>If no event is inflight, create <code>new AsyncPollEvent(deadlineMs, now)</code> and <code>applicationEventHandler.add(it)</code> (fire-and-forget, no blocking).</li>
+  <li>Run <code>offsetCommitCallbackInvoker.executeCallbacks()</code> and <code>processBackgroundEvents()</code> (user callbacks / errors) — these <em>are</em> on the app thread.</li>
+</ul>
+<p>On the background side, <code>ApplicationEventProcessor.process(AsyncPollEvent)</code> (<code>events/ApplicationEventProcessor.java:757</code>) runs the stages:</p>
+<ol>
+  <li><code>consumerMembershipManager.maybeReconcile(true)</code> — safely commit + mark revoked partitions <em>before</em> any new fetching, then <code>event.markReconciliationCheckComplete()</code>.</li>
+  <li><code>commitRequestManager.updateTimerAndMaybeCommit(pollTimeMs)</code> (auto-commit on interval) and <code>membershipManager.onConsumerPoll()</code> + <code>heartbeatRequestManager.resetPollTimer(pollTimeMs)</code> — this is what keeps the poll timer alive.</li>
+  <li><code>offsetsRequestManager.updateFetchPositions(deadlineMs)</code> then <code>event.markValidatePositionsComplete()</code>.</li>
+  <li>On completion, <code>fetchRequestManager.createFetchRequests()</code>; then <code>event.completeSuccessfully()</code>.</li>
+</ol>
+<p>The two completion checks <code>isValidatePositionsComplete</code> (a <code>volatile boolean</code>, <code>events/AsyncPollEvent.java:50</code>) and <code>isReconciliationCheckComplete()</code> (a method returning <code>reconciliationCheckFuture.isDone()</code>, backed by a <code>final CompletableFuture&lt;Void&gt;</code>, <code>events/AsyncPollEvent.java:51,104</code>) let the app thread know when it is safe to read the buffer.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>The application thread must not collect records until the background thread has finished validating positions for the inflight poll. <code>collectFetch()</code> returns <code>Fetch.empty()</code> while <code>inflightPoll != null &amp;&amp; !inflightPoll.isValidatePositionsComplete()</code> (<code>AsyncKafkaConsumer.java:2072</code>). This prevents both threads from racing to write <code>SubscriptionState.position()</code> for the same partition.</p></div>
+
+<h3>pollForFetches and prefetch pipelining</h3>
+<p>After <code>checkInflightPoll</code>, <code>poll()</code> calls <code>pollForFetches(timer)</code> (<code>AsyncKafkaConsumer.java:1975</code>): it first tries <code>collectFetch()</code>; if empty, it computes a poll timeout bounded by the background thread's <code>maximumTimeToWait()</code>, then blocks on <code>fetchBuffer.awaitWakeup(pollTimer)</code> until data arrives or a wakeup fires, and finally <code>collectFetch()</code>s again. When a non-empty fetch is returned, <code>sendPrefetches(timer)</code> enqueues a <code>CreateFetchRequestsEvent</code> so the next batch is requested while the user processes the current one (<code>AsyncKafkaConsumer.java:2123</code>) — the async analogue of the classic <code>transmitSends()</code> pipelining. Records are passed through <code>interceptors.onConsume(...)</code> before return.</p>
+
+<h2>SubscriptionState: the shared core</h2>
+<p>Both engines share one <code>SubscriptionState</code> instance, documented as thread-safe — every public method is <code>synchronized</code> (<code>SubscriptionState.java:74</code>). It models <em>what</em> the consumer is reading and <em>where</em>.</p>
+
+<h3>Subscription type</h3>
+<p>A single enum tracks mutually-exclusive modes (<code>SubscriptionState.java:80</code>): <code>NONE</code>, <code>AUTO_TOPICS</code> (collection <code>subscribe</code>), <code>AUTO_PATTERN</code> (java <code>Pattern</code>), <code>AUTO_PATTERN_RE2J</code> (broker-evaluated regex, KIP-848), <code>USER_ASSIGNED</code> (manual <code>assign</code>), and <code>AUTO_TOPICS_SHARE</code> (share groups). <code>setSubscriptionType()</code> throws <em>"Subscription to topics, partitions and pattern are mutually exclusive"</em> if you mix modes (<code>SubscriptionState.java:185</code>). This is why you cannot call both <code>subscribe()</code> and <code>assign()</code> on one consumer.</p>
+
+<h3>Per-partition state &amp; the fetch-state machine</h3>
+<p>Each assigned partition has a <code>TopicPartitionState</code> (<code>SubscriptionState.java:1011</code>) held in an ordered <code>PartitionStates</code> map (order matters for fetch building and round-robin fairness). Its fields:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>FetchState fetchState</code></td><td>One of <code>INITIALIZING</code>, <code>FETCHING</code>, <code>AWAIT_RESET</code>, <code>AWAIT_VALIDATION</code>.</td></tr>
+<tr><td><code>FetchPosition position</code></td><td>Last consumed position = offset of next record to deliver, plus <code>offsetEpoch</code> and <code>currentLeader</code> (<code>SubscriptionState.java:1382</code>).</td></tr>
+<tr><td><code>Long highWatermark</code></td><td>HW from the last fetch response (used for lag and for <code>read_uncommitted</code> end).</td></tr>
+<tr><td><code>Long logStartOffset</code></td><td>Log-start offset (earliest available).</td></tr>
+<tr><td><code>Long lastStableOffset</code></td><td>LSO; under <code>read_committed</code> this bounds delivery and lag.</td></tr>
+<tr><td><code>boolean paused</code></td><td>User called <code>pause()</code>; not fetchable until <code>resume()</code>.</td></tr>
+<tr><td><code>boolean pendingRevocation</code></td><td>Set during a rebalance to stop fetching before the partition is given up.</td></tr>
+<tr><td><code>AutoOffsetResetStrategy resetStrategy</code></td><td>Strategy to apply when in <code>AWAIT_RESET</code>.</td></tr>
+<tr><td><code>Integer preferredReadReplica</code> + expiry</td><td>Follower-fetch target with a lease (KIP-392).</td></tr>
+</tbody>
+</table>
+</div>
+<p>A partition is fetchable only when <code>!paused &amp;&amp; !pendingRevocation &amp;&amp; !pendingOnAssignedCallback &amp;&amp; hasValidPosition()</code> (<code>SubscriptionState.java:1250</code>). Transitions are validated against an explicit table encoded in the <code>FetchStates</code> enum (<code>SubscriptionState.java:1306</code>):</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span><span class="tr"><span class="tl"></span><span class="ta"></span></span>
+  <span class="st">INITIALIZING</span><span class="tr"><span class="tl">seekValidated / position set</span><span class="ta"></span></span>
+  <span class="st accent">FETCHING</span><span class="tr"><span class="tl">FETCHING → FETCHING: consume, advance position</span><span class="ta"></span></span>
+  <span class="tr"><span class="tl">INITIALIZING → AWAIT_VALIDATION: needs epoch check &middot; INITIALIZING → AWAIT_RESET: no position</span><span class="ta"></span></span>
+  <span class="st">AWAIT_VALIDATION</span><span class="tr"><span class="tl">FETCHING ⇄ AWAIT_VALIDATION: new leader epoch / validated</span><span class="ta"></span></span>
+  <span class="st warn">AWAIT_RESET</span><span class="tr"><span class="tl">FETCHING → AWAIT_RESET: offset out of range / seekToX · AWAIT_VALIDATION → AWAIT_RESET: truncation detected</span><span class="ta"></span></span>
+  <span class="st accent">FETCHING</span><span class="tr"><span class="tl">AWAIT_RESET → FETCHING: ListOffsets earliest / latest</span><span class="ta"></span></span>
+</div><figcaption>FetchState transitions. The spine is INITIALIZING → FETCHING (which self-loops to advance the position); AWAIT_VALIDATION guards against log truncation via leader-epoch checks, and AWAIT_RESET resolves a concrete offset via <code>auto.offset.reset</code> before returning to FETCHING.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw round"></span>pill = a fetch state</span>
+  <span class="lgi"><span class="sw round cat-storage"></span>FETCHING (steady, position required)</span>
+  <span class="lgi"><span class="sw round cat-error"></span>AWAIT_RESET (no position; resolving offset)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger)</span>
+  <span class="lgi"><span class="mono">◉</span> = initial state</span>
+</div></figure>
+
+<p><code>transitionState()</code> enforces an interesting invariant: states that <code>requiresPosition()</code> (FETCHING, AWAIT_VALIDATION) must have a non-null position, and states that don't (INITIALIZING, AWAIT_RESET) have their position nulled out on entry (<code>SubscriptionState.java:1055</code>).</p>
+
+<h3>position vs committed</h3>
+<p>These two notions are easy to conflate but distinct:</p>
+<dl class="kv">
+<dt>position</dt><dd>The in-memory offset of the next record <code>poll()</code> will return for a partition. Advanced locally by every successful fetch. Read via <code>consumer.position(tp)</code> — which will block to fetch/reset a position if none is set yet (<code>AsyncKafkaConsumer.java:1230</code>).</dd>
+<dt>committed</dt><dd>The offset durably stored at the group coordinator, the recovery point after a restart. Read via <code>consumer.committed(partitions)</code> (a <code>FetchCommittedOffsetsEvent</code> in the async engine, <code>AsyncKafkaConsumer.java:1260</code>). Has nothing to do with the live position until a commit happens.</dd>
+</dl>
+
+<h2>The fetch pipeline in detail</h2>
+
+<h3>Building fetch requests</h3>
+<p><code>AbstractFetch.prepareFetchRequests()</code> (<code>AbstractFetch.java:421</code>) computes the fetchable-and-unbuffered partitions, groups them by their leader (or preferred read replica), and builds one <code>FetchSessionHandler.Builder</code> per node. Per partition it adds a <code>FetchRequest.PartitionData(topicId, position.offset, INVALID_LOG_START_OFFSET, fetchConfig.fetchSize, position.currentLeader.epoch, …)</code>, where <code>fetchSize</code> = <code>max.partition.fetch.bytes</code>. It deliberately skips a node if (a) there is already an inflight fetch to it, or (b) it currently hosts buffered partitions — fetching other partitions from a node with buffered data would drop the buffered ones from the broker's fetch session and risk session eviction (<code>AbstractFetch.java:461</code>).</p>
+<p>The request-level knobs are stamped in <code>createFetchRequest()</code> (<code>AbstractFetch.java:310</code>): <code>forConsumer(maxVersion, fetchConfig.maxWaitMs, fetchConfig.minBytes, …)</code>, <code>.isolationLevel(...)</code>, <code>.setMaxBytes(fetchConfig.maxBytes)</code>, <code>.rackId(clientRackId)</code>. So <code>fetch.max.wait.ms</code>, <code>fetch.min.bytes</code>, and <code>fetch.max.bytes</code> are all request-level; <code>max.partition.fetch.bytes</code> is per-partition. The version caps at 12 unless the session can use topic IDs.</p>
+
+<h3>Receiving and buffering</h3>
+<p>On a successful response, <code>AbstractFetch.handleFetchSuccess()</code> wraps each partition's data in a <code>CompletedFetch</code> and calls <code>fetchBuffer.add(completedFetch)</code> (<code>AbstractFetch.java:225</code>). <code>FetchBuffer</code> is a <code>ConcurrentLinkedQueue&lt;CompletedFetch&gt;</code> guarded by a <code>ReentrantLock</code> with a <code>Condition</code> (<code>FetchBuffer.java:53</code>); <code>addAll()</code> sets a <code>wokenup</code> flag and <code>signalAll()</code>s so a waiting app thread in <code>awaitWakeup()</code> unblocks. There is at most one <code>CompletedFetch</code> per partition in the queue.</p>
+
+<h3>Decoding, max.poll.records, and aborted transactions</h3>
+<p><code>FetchCollector.collectFetch(buffer)</code> (<code>FetchCollector.java:91</code>) pulls up to <code>maxPollRecords</code> records across partitions: it takes the head <code>CompletedFetch</code>, lazily <code>initialize()</code>s it (validates that the response's first offset still matches the live position, updates HW/LSO/log-start), then <code>fetchRecords()</code> from it. If the partition was paused after the fetch arrived, the records are stashed and re-queued for a later poll (<code>FetchCollector.java:125</code>). It also re-checks <code>isAssigned</code>/<code>isFetchable</code> per partition so records for a partition revoked mid-flight are dropped, and only advances the position when <code>nextInLineFetch.nextFetchOffset() == position.offset</code> (i.e. not a stale response) (<code>FetchCollector.java:168</code>).</p>
+<p><code>CompletedFetch.fetchRecords()</code> (<code>CompletedFetch.java:257</code>) iterates batches via a streaming, decompressing iterator (<code>currentBatch.streamingIterator(decompressionBufferSupplier)</code>). The transaction filtering lives in <code>nextFetchedRecord()</code> (<code>CompletedFetch.java:187</code>): under <code>read_committed</code>, for each batch with a producer ID it (1) drains the per-partition <code>abortedTransactions</code> priority queue (ordered by <code>firstOffset</code>) up to the batch's last offset, adding their producer IDs to <code>abortedProducerIds</code>; (2) if the batch is a control batch carrying an abort marker, removes that producer ID; (3) if <code>isBatchAborted()</code> (transactional &amp; producer ID is in the aborted set), skips the entire batch by advancing <code>nextFetchOffset</code> to <code>currentBatch.nextOffset()</code>. Control batches are never returned to the user. Out-of-range records (offset &lt; <code>nextFetchOffset</code>) are skipped.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-storage"><span class="nt">next batch</span><span class="nd">producerId present</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">drain abortedTransactions PQ</span><span class="nd">by firstOffset, up to batch.lastOffset ⇒ add producerIds</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">control batch with abort marker?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="yes"></div>
+      <div class="node cat-coord"><span class="nt">remove producerId</span><span class="nd">from abortedProducerIds</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-broker decision">isBatchAborted? (txnl &amp; producerId in set)</div>
+      <div class="row">
+        <div class="col">
+          <div class="conn dashed ec-err" data-label="yes"></div>
+          <div class="node cat-error"><span class="nt">skip batch</span><span class="nd">nextFetchOffset = batch.nextOffset()</span></div>
+        </div>
+        <div class="col">
+          <div class="conn ec-data" data-label="no"></div>
+          <div class="node cat-client"><span class="nt">emit records</span><span class="nd">offset &ge; nextFetchOffset · skip control records</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>Aborted-batch skipping under <code>read_committed</code>. The broker sends the aborted-txn list; the client filters client-side, bounded by the LSO — control batches are consumed for their markers but never returned to the user.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-storage"></span>record batch from the log</span>
+  <span class="lgi"><span class="sw cat-coord"></span>aborted-txn bookkeeping</span>
+  <span class="lgi"><span class="sw cat-broker dash"></span>rounded = decision</span>
+  <span class="lgi"><span class="sw cat-error"></span>abort path (batch skipped)</span>
+  <span class="lgi"><span class="sw cat-client"></span>records delivered to the user</span>
+  <span class="lgi"><span class="arr ec-data"></span>emit / keep</span>
+  <span class="lgi"><span class="arr dashed ec-err"></span>abort / skip</span>
+</div></figure>
+
+<div class="callout note"><span class="callout-title">Note</span><p><code>max.poll.records</code> caps how many records each <code>poll()</code> returns but does <em>not</em> change the wire fetch — the broker still ships up to <code>max.partition.fetch.bytes</code> per partition; leftover records stay buffered for the next poll. CRC validation per batch/record is governed by <code>check.crcs</code> (default true).</p></div>
+
+<h2>Offset management</h2>
+
+<h3>Auto vs manual commit</h3>
+<p><code>enable.auto.commit</code> (default <code>true</code>, <code>ConsumerConfig.java:458</code>) and <code>auto.commit.interval.ms</code> (default <code>5000</code>, <code>ConsumerConfig.java:463</code>) drive periodic background commits. In the async engine, <code>CommitRequestManager</code> holds an <code>Optional&lt;AutoCommitState&gt;</code> with a <code>Timer</code> and a <code>hasInflightCommit</code> guard (<code>CommitRequestManager.java:1497</code>). On each poll round, <code>updateTimerAndMaybeCommit()</code> → <code>maybeAutoCommitAsync()</code> fires a commit of <code>subscriptions.allConsumed()</code> only if the timer expired and no commit is already inflight (<code>CommitRequestManager.java:277</code>). A retriable failure resets the timer with the retry backoff rather than the full interval.</p>
+<p>Manual commits: <code>commitSync()</code> blocks until the commit lands (or times out); <code>commitAsync(callback)</code> enqueues an <code>AsyncCommitEvent</code> and returns immediately, invoking the callback later on the app thread via <code>OffsetCommitCallbackInvoker</code> (<code>AsyncKafkaConsumer.java:1112</code>). With no explicit offsets, both commit <code>subscriptions.allConsumed()</code> resolved on the <em>background</em> thread; the sync path blocks on <code>commitEvent.offsetsReady()</code> first so the committed set isn't perturbed by fetches that begin after the call (<code>AsyncKafkaConsumer.java:1135</code>).</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Auto-commit commits the <em>position</em> (next offset to fetch) as of poll time, regardless of whether your application finished processing those records. If you crash mid-batch after an auto-commit, those records are skipped on restart (at-most-once for the un-processed tail). For at-least-once, disable auto-commit and <code>commitSync()</code> only after processing.</p></div>
+
+<h3>Committing before rebalance</h3>
+<p>Before revoking partitions, the async membership manager calls <code>CommitRequestManager.maybeAutoCommitSyncBeforeRebalance(deadlineMs)</code> (<code>CommitRequestManager.java:330</code>), which retries until success/fatal/timeout. Notably it treats <code>STALE_MEMBER_EPOCH</code> as retriable (re-sends with the latest epoch) but <code>UNKNOWN_TOPIC_OR_PARTITION</code> as fatal so a deleted topic can't stall the rebalance forever.</p>
+
+<h3>updateFetchPositions: where positions come from</h3>
+<p><code>OffsetsRequestManager.updateFetchPositions(deadlineMs)</code> (<code>OffsetsRequestManager.java:235</code>) is the canonical "find a position for every partition" routine:</p>
+<ol>
+  <li><code>validatePositionsIfNeeded()</code> — for partitions in <code>AWAIT_VALIDATION</code>, send <code>OffsetsForLeaderEpoch</code> and detect log truncation.</li>
+  <li>If <code>hasAllFetchPositions()</code>, done.</li>
+  <li>Otherwise, for the <em>initializing</em> partitions: if grouped, <code>initWithCommittedOffsetsIfNeeded()</code> issues an <code>OffsetFetch</code> and seeds positions from committed offsets; then <code>initWithPartitionOffsetsIfNeeded()</code> handles any still-missing positions by marking them <code>AWAIT_RESET</code> and issuing <code>ListOffsets</code> per <code>auto.offset.reset</code> (<code>OffsetsRequestManager.java:280,337</code>).</li>
+</ol>
+<p><code>resetInitializingPositions()</code> throws <code>NoOffsetForPartitionException</code> if no reset strategy is configured and there is no committed offset — that is exactly when <code>auto.offset.reset=none</code> surfaces. The default reset is <code>latest</code> (<code>ConsumerConfig.java:546</code>, <code>AutoOffsetResetStrategy.LATEST</code>).</p>
+
+<h2>Group membership &amp; rebalancing (async engine)</h2>
+<p>The KIP-848 member is a state machine in <code>ConsumerMembershipManager</code>/<code>AbstractMembershipManager</code>. The states (<code>MemberState.java:27</code>) are <code>UNSUBSCRIBED</code>, <code>JOINING</code>, <code>RECONCILING</code>, <code>ACKNOWLEDGING</code>, <code>STABLE</code>, <code>FENCED</code>, <code>PREPARE_LEAVING</code>, <code>LEAVING</code>, <code>FATAL</code>, and <code>STALE</code>, with explicit <code>previousValidStates</code> tables enforcing legal transitions.</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span><span class="tr"><span class="tl"></span><span class="ta"></span></span>
+  <span class="st">UNSUBSCRIBED</span><span class="tr"><span class="tl">subscribe</span><span class="ta"></span></span>
+  <span class="st">JOINING</span><span class="tr"><span class="tl">heartbeat resp, epoch ≥ 1 + target assignment</span><span class="ta"></span></span>
+  <span class="st">RECONCILING</span><span class="tr"><span class="tl">commit ⇒ onPartitionsRevoked ⇒ onPartitionsAssigned</span><span class="ta"></span></span>
+  <span class="st">ACKNOWLEDGING</span><span class="tr"><span class="tl">ack via heartbeat</span><span class="ta"></span></span>
+  <span class="st accent">STABLE</span>
+  <span class="tr"><span class="tl">STABLE → RECONCILING: new target assignment</span><span class="ta"></span></span>
+  <span class="tr"><span class="tl">STABLE → FENCED: UNKNOWN_MEMBER_ID / FENCED_MEMBER_EPOCH &middot; FENCED → JOINING: onPartitionsLost ⇒ re-join</span><span class="ta"></span></span>
+  <span class="st warn">FENCED</span>
+  <span class="tr"><span class="tl">STABLE → PREPARE_LEAVING: unsubscribe / close → LEAVING: callbacks done</span><span class="ta"></span></span>
+  <span class="tr"><span class="tl">LEAVING → STALE: poll timer expired (max.poll.interval.ms) &middot; STALE → JOINING: next poll</span><span class="ta"></span></span>
+  <span class="st">LEAVING</span><span class="tr"><span class="tl">heartbeat epoch -1 / -2</span><span class="ta"></span></span>
+  <span class="st">UNSUBSCRIBED</span><span class="term end"></span>
+</div><figcaption>Async member state machine (<code>MemberState</code>). The spine is UNSUBSCRIBED → JOINING → RECONCILING → ACKNOWLEDGING → STABLE; the lower rows list the back-edges (STABLE → RECONCILING on a new assignment, FENCED, the leave path, and the STALE poll-timer recovery). Reconciliation runs entirely in the background but defers revocations / callbacks to the application thread.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw round"></span>pill = a member state</span>
+  <span class="lgi"><span class="sw round cat-storage"></span>STABLE (steady membership)</span>
+  <span class="lgi"><span class="sw round cat-error"></span>FENCED (epoch / id lost)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger)</span>
+  <span class="lgi"><span class="mono">◉</span> = initial, ◎ = terminal (left group)</span>
+</div></figure>
+
+<p>Reconciliation (<code>AbstractMembershipManager.maybeReconcile(canCommit)</code>, <code>AbstractMembershipManager.java:875</code>) diffs the broker-provided target assignment against currently owned partitions to compute <em>added</em> and <em>revoked</em> sets. The ordering is strict: <code>markPendingRevocationToPauseFetching(revoked)</code> → auto-commit (<code>signalReconciliationStarted()</code>) → <code>onPartitionsRevoked</code> → <code>onPartitionsAssigned</code> (<code>revokeAndAssign</code>, <code>AbstractMembershipManager.java:993</code>). Because revocations and user callbacks must run on the application thread, the manager emits <code>PartitionsRemoved</code> (carrying both revocations and losses, dispatched by <code>methodName()</code>)/<code>PartitionsAssigned</code> <em>background events</em>; <code>AsyncKafkaConsumer.BackgroundEventProcessor</code> runs the listener and signals completion back with a <code>ConsumerRebalanceListenerCallbackCompletedEvent</code> (<code>AsyncKafkaConsumer.java:274</code>).</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>A reconciliation that only <em>adds</em> partitions can run from the plain background poll (new partitions have no buffered records). A reconciliation that <em>revokes</em> partitions, or any auto-commit, is only triggered from the <code>AsyncPollEvent</code> path (<code>canCommit=true</code>), because the application thread may already be returning records for a to-be-revoked partition (<code>AbstractMembershipManager.java:929</code>). The <code>reconciliationCheckFuture</code> on the poll event gates <code>collectFetch()</code> so the app thread waits for revocation handling before reading the buffer.</p></div>
+
+<h3>Liveness: the poll timer and max.poll.interval.ms</h3>
+<p><code>AbstractHeartbeatRequestManager</code> owns a <code>pollTimer</code> initialized to <code>max.poll.interval.ms</code> (default <code>300000</code>, <code>ConsumerConfig.java:629</code>) (<code>AbstractHeartbeatRequestManager.java:119</code>). Each <code>poll(now)</code> updates it; if it has expired and the member isn't already leaving, it logs the well-known warning and calls <code>membershipManager().transitionToSendingLeaveGroup(true)</code>, sending a leave heartbeat (<code>AbstractHeartbeatRequestManager.java:171</code>). <code>resetPollTimer(pollMs)</code> — called from the <code>AsyncPollEvent</code> handler — resets it on every user <code>poll()</code>; if it had expired (member is <code>STALE</code>), the next poll transitions it back toward <code>JOINING</code>. To guarantee the timer never silently expires while the app blocks in <code>poll()</code>, <code>maximumTimeToWait()</code> returns at most <code>pollTimer.remainingMs() / 2</code> (<code>AbstractHeartbeatRequestManager.java:262</code>). Heartbeats themselves go out on the interval (<code>heartbeat.interval.ms</code> default <code>3000</code>, <code>session.timeout.ms</code> default <code>45000</code> for the classic protocol; <code>ConsumerConfig.java:438,443</code>).</p>
+
+<h2>Concurrency &amp; threading model</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>State / resource</th><th>Owner / guard</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Public API re-entrancy</td><td><code>AtomicLong currentThread</code> + <code>AtomicInteger refCount</code></td><td>CAS lock; throws <code>ConcurrentModificationException</code> on cross-thread use (<code>AsyncKafkaConsumer.java:2216</code>).</td></tr>
+<tr><td><code>SubscriptionState</code></td><td><code>synchronized</code> methods</td><td>Shared by app thread (seek/pause/position read) and background (assignment, HW updates).</td></tr>
+<tr><td><code>FetchBuffer</code></td><td><code>ReentrantLock</code> + <code>Condition</code></td><td>Producer = background (adds CompletedFetch); consumer = app thread (collect/await).</td></tr>
+<tr><td>Application event queue</td><td><code>LinkedBlockingQueue</code></td><td>App thread enqueues; background drains.</td></tr>
+<tr><td>Background event queue</td><td><code>LinkedBlockingQueue</code></td><td>Background enqueues errors/callbacks; app thread drains in <code>processBackgroundEvents()</code>.</td></tr>
+<tr><td>RequestManagers / NetworkClient</td><td>background thread only</td><td>App thread reads only the cached <code>maximumTimeToWait()</code> snapshot.</td></tr>
+<tr><td><code>groupMetadata</code>, <code>groupAssignmentSnapshot</code></td><td><code>AtomicReference</code></td><td>Updated from background via <code>MemberStateListener</code>; read by app thread.</td></tr>
+<tr><td><code>wakeupTrigger</code></td><td><code>WakeupTrigger</code></td><td>Lets another thread interrupt a blocking <code>poll</code>/<code>commit</code> via <code>WakeupException</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The background thread is a daemon (<code>super(BACKGROUND_THREAD_NAME, true)</code>) and swallows per-iteration exceptions so one bad event cannot kill the loop (<code>ConsumerNetworkThread.java:160</code>). Resources are created <em>inside</em> the thread (<code>initializeResources()</code>) and an <code>initializationLatch</code> + <code>initializationError</code> propagate construction failures (e.g. a bad SASL JAAS config) back to the constructor rather than hanging.</p>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>group.protocol</code></td><td><code>classic</code></td><td><code>consumer</code> selects <code>AsyncKafkaConsumer</code> (KIP-848); <code>classic</code> selects <code>ClassicKafkaConsumer</code>.</td></tr>
+<tr><td><code>group.id</code></td><td><code>null</code></td><td>Enables group management + offset commits. <code>null</code> ⇒ <code>assign()</code>-only, no commits.</td></tr>
+<tr><td><code>group.remote.assignor</code></td><td>(unset)</td><td>Server-side assignor name; CONSUMER protocol only.</td></tr>
+<tr><td><code>enable.auto.commit</code></td><td><code>true</code></td><td>Periodic background commit of consumed positions. Forced <code>false</code> when <code>group.id</code> is null.</td></tr>
+<tr><td><code>auto.commit.interval.ms</code></td><td><code>5000</code></td><td>Interval between auto-commits.</td></tr>
+<tr><td><code>auto.offset.reset</code></td><td><code>latest</code></td><td><code>earliest</code>/<code>latest</code>/<code>none</code> when no committed offset exists; <code>none</code> throws <code>NoOffsetForPartitionException</code>.</td></tr>
+<tr><td><code>max.poll.records</code></td><td><code>500</code></td><td>Max records returned per <code>poll()</code>; does not change the wire fetch.</td></tr>
+<tr><td><code>max.poll.interval.ms</code></td><td><code>300000</code></td><td>Max time between polls before the member is removed from the group.</td></tr>
+<tr><td><code>fetch.min.bytes</code></td><td><code>1</code></td><td>Broker waits for this many bytes (or <code>fetch.max.wait.ms</code>) before responding.</td></tr>
+<tr><td><code>fetch.max.bytes</code></td><td><code>52428800</code> (50 MiB)</td><td>Soft cap on total bytes per fetch response.</td></tr>
+<tr><td><code>fetch.max.wait.ms</code></td><td><code>500</code></td><td>Max broker wait when <code>fetch.min.bytes</code> isn't yet satisfied.</td></tr>
+<tr><td><code>max.partition.fetch.bytes</code></td><td><code>1048576</code> (1 MiB)</td><td>Per-partition byte cap (= <code>FetchConfig.fetchSize</code>).</td></tr>
+<tr><td><code>isolation.level</code></td><td><code>read_uncommitted</code></td><td><code>read_committed</code> bounds delivery to the LSO and skips aborted batches.</td></tr>
+<tr><td><code>session.timeout.ms</code> / <code>heartbeat.interval.ms</code></td><td><code>45000</code> / <code>3000</code></td><td>CLASSIC-protocol liveness; CONSUMER protocol uses a broker-controlled interval.</td></tr>
+<tr><td><code>check.crcs</code></td><td><code>true</code></td><td>Validate batch/record CRCs during decode.</td></tr>
+<tr><td><code>default.api.timeout.ms</code></td><td><code>60000</code></td><td>Default deadline for blocking calls without an explicit timeout.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Wakeup &amp; interrupt</strong> — <code>wakeup()</code> from another thread makes a blocking <code>poll</code>/<code>commitSync</code>/<code>committed</code> throw <code>WakeupException</code>; the async engine routes this through <code>WakeupTrigger</code> on the fetch buffer and the active task future. A blocking call must not be interrupted between updating the position and returning records — both engines re-check the wakeup trigger <em>before</em> polling fetches, never between collect and return (<code>AsyncKafkaConsumer.java:953</code>).</li>
+  <li><strong>Offset out of range</strong> — a fetch error transitions the partition to <code>AWAIT_RESET</code> and triggers a <code>ListOffsets</code> per <code>auto.offset.reset</code>; with <code>none</code>, the user sees <code>OffsetOutOfRangeException</code>/<code>NoOffsetForPartitionException</code>.</li>
+  <li><strong>Log truncation</strong> — <code>AWAIT_VALIDATION</code> + <code>OffsetsForLeaderEpoch</code> detect a divergent epoch; a <code>LogTruncationException</code> (<code>clients/.../consumer/LogTruncationException.java</code>) carries the divergent offset, built from the <code>LogTruncation</code> holder (fields <code>topicPartition</code>, <code>fetchPosition</code>, <code>divergentOffsetOpt</code>; <code>SubscriptionState.java:1422</code>).</li>
+  <li><strong>Fenced member</strong> — <code>UNKNOWN_MEMBER_ID</code>/<code>FENCED_MEMBER_EPOCH</code> moves the member to <code>FENCED</code>, invokes <code>onPartitionsLost</code>, and re-joins as a fresh member.</li>
+  <li><strong>Poll-loop too slow</strong> — exceeding <code>max.poll.interval.ms</code> proactively leaves the group (member → <code>STALE</code>), invoking <code>onPartitionsLost</code>; the next <code>poll()</code> rejoins. The deserializer/processing time counts against this budget, so a large <code>max.poll.records</code> with slow processing is the classic trigger.</li>
+  <li><strong>Stale fetch responses</strong> — responses whose first offset no longer matches the live position (after a seek/rebalance) are discarded in <code>FetchCollector.handleInitializeSuccess()</code> (<code>FetchCollector.java:259</code>).</li>
+  <li><strong>Deserialization failure</strong> — a <code>RecordDeserializationException</code> is thrown only if no records were already collected; the offending offset must be skipped via <code>seek()</code> to make progress (<code>CompletedFetch.java:295</code>).</li>
+  <li><strong>Async-engine construction failure</strong> — surfaced from the background thread via the init latch; partially-built objects are closed to avoid leaks (<code>AsyncKafkaConsumer.java:597</code>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A partition's position only advances after its records have been collected for return to the user, and only when the response offset matches the current position; the position is therefore the offset of the next <em>undelivered</em> record. Returning an empty <code>Fetch</code> guarantees the position is unchanged (<code>FetchCollector.java:82</code>).</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Subscription type is single-valued: <code>subscribe()</code> (topics/pattern) and <code>assign()</code> (manual) are mutually exclusive for a consumer's lifetime until <code>unsubscribe()</code> resets it.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>At most one <code>CompletedFetch</code> per partition exists in the <code>FetchBuffer</code>, and a node with buffered partitions is excluded from new fetch requests, preserving the broker's fetch-session incrementality.</p></div>
+<p>Within a partition, records are delivered in strictly increasing offset order with no gaps the consumer can observe (aborted/control records are skipped invisibly under <code>read_committed</code>). Across partitions there is no ordering guarantee. Delivery semantics are application-determined by <em>when</em> you commit relative to processing.</p>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="13-group-coordination.html">Group Coordination</a> — the membership manager and heartbeat/commit managers speak <code>ConsumerGroupHeartbeat</code>/<code>OffsetCommit</code>/<code>OffsetFetch</code> to the group coordinator; the classic engine uses JoinGroup/SyncGroup.</li>
+  <li><a href="09-fetch-path.html">The Fetch Path</a> — the broker side that serves the <code>Fetch</code> RPCs this chapter builds, including follower-fetch (preferred read replica) and HW/LSO semantics.</li>
+  <li><a href="01-record-format.html">Record Format &amp; Batches</a> — <code>CompletedFetch</code> decodes the very batches/records defined there, including control batches and transactional markers.</li>
+  <li><a href="14-transactions-eos.html">Transactions &amp; EOS</a> — <code>isolation.level=read_committed</code> and the aborted-transaction list make the consumer the read side of exactly-once.</li>
+  <li><a href="02-wire-protocol.html">Wire Protocol &amp; RPC Framework</a> — every request the managers emit (<code>FetchRequest.Builder</code>, etc.) is framed by that layer.</li>
+  <li><a href="15-share-groups.html">Share Groups</a> — the parallel <code>KafkaShareConsumer</code> reuses much of this machinery (<code>ShareConsumeRequestManager</code>, <code>ShareFetchBuffer</code>) with acknowledge-based delivery.</li>
+  <li><a href="20-kafka-streams.html">Kafka Streams</a> — drives the async engine through the same event model but with a <code>StreamsRebalanceListener</code> and task-based callbacks.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The async engine exists because the classic consumer interleaves coordination (join, sync, callbacks) with the user's <code>poll()</code> thread, so a long rebalance or a slow callback stalls record processing and a slow processing loop can trip the session timeout. <span class="pill kip">KIP-848</span> moves assignment computation to the broker-side coordinator and introduces the <code>ConsumerNetworkThread</code> so that, in steady state, most members keep fetching during a rebalance. The non-blocking <code>AsyncPollEvent</code> design specifically targets parity with the classic <code>poll()</code> latency while keeping all network I/O off the application thread. New observability for this engine arrived with <span class="pill kip">KIP-1068</span> (e.g. application-event queue size/time, time-between-network-thread-polls in <code>AsyncConsumerMetrics</code>).</p></div>
+<p>The async engine remains feature-compatible: the same public <code>Consumer</code> contract, the same <code>ConsumerRebalanceListener</code>, the same <code>SubscriptionState</code> and fetch pipeline. The differences are confined to how coordination is threaded and where state transitions happen.</p>
+
+<h2>Gotchas &amp; operational notes</h2>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Calling consumer methods from a rebalance callback is constrained: the async engine runs callbacks on the application thread <em>inside</em> the poll, and re-entrant API calls take the same single-thread lock via <code>refCount</code> (nested acquire by the same thread is allowed). But blocking calls (e.g. <code>commitSync</code>) inside <code>onPartitionsRevoked</code> remain the supported pattern for committing before giving up partitions.</p></div>
+<div class="callout warning"><span class="callout-title">Caution</span><p><code>poll(Duration.ZERO)</code> with the async engine relies on a subtle rule: if a previous inflight poll already filled the buffer, a new event is <em>not</em> submitted, otherwise a zero-timeout poll could spin forever re-validating positions and never return buffered data (<code>AsyncKafkaConsumer.java:1045</code>). Don't assume <code>poll(0)</code> performs no work — it still drains background events and may complete a prior poll's stages.</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>To size fetches: raise <code>fetch.min.bytes</code> (and accept up to <code>fetch.max.wait.ms</code> latency) for throughput; raise <code>max.partition.fetch.bytes</code> if single records/batches exceed 1 MiB (it must be ≥ the broker/topic <code>max.message.bytes</code> or a partition can stall). Tune <code>max.poll.records</code> down (not <code>max.partition.fetch.bytes</code>) to bound per-poll processing time against <code>max.poll.interval.ms</code>.</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>Background thread name <code>consumer_background_thread</code> and (classic) <code>kafka-coordinator-heartbeat-thread | &lt;groupId&gt;</code> are useful when reading thread dumps: a hot background thread points at fetch/commit volume; a stuck application thread in <code>awaitWakeup</code> is simply an idle poll waiting for data.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

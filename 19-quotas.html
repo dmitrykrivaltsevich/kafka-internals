@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quotas &amp; Throttling · Kafka Internals</title>
+<meta name="description" content="ClientQuotaManager, token buckets, quota entities, throttle responses, client metrics (KIP-714).">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="19-quotas">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>19 · Quotas, Throttling &amp; Client Metrics</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Kafka protects a shared cluster from being overwhelmed by any single tenant through a layered set of <em>quotas</em>: bandwidth (produce/fetch byte-rate), request-thread time, controller-mutation rate, replication and alter-log-dirs throttles, and connection count / creation rate. All of them are built on the same primitive — a <code>Sensor</code> wrapping a sampled <code>Rate</code> or <code>TokenBucket</code> stat with a <code>Quota</code> bound — and all of them throttle by <em>holding the channel muted</em> for a computed delay and returning <code>throttle_time_ms</code> so well-behaved clients back off rather than being disconnected. The same broker also acts as a sink for client telemetry (KIP-714): <code>ClientMetricsManager</code> assigns each client a UUID, hands out metric subscriptions via <code>GetTelemetrySubscriptions</code>, and ingests OpenTelemetry payloads via <code>PushTelemetry</code>, gating each client to its own push interval. This chapter derives the data structures, algorithms, threading, and configuration of all of these from source.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The quota subsystem answers a single operational question — "is this client allowed to do this much, right now?" — for several distinct resources, and translates "no" into a backpressure signal rather than an error wherever possible. Its responsibilities:</p>
+<ul>
+  <li><strong>Bandwidth quotas</strong> (<code>QuotaType.PRODUCE</code>, <code>QuotaType.FETCH</code>): cap bytes/sec per principal/client-id, measured against the request/response size on the produce and fetch hot paths.</li>
+  <li><strong>Request quota</strong> (<code>QuotaType.REQUEST</code>): cap the fraction of broker request-handler + network-thread CPU time a client may consume (<code>request_percentage</code>), so a client cannot starve others with cheap-but-numerous requests.</li>
+  <li><strong>Controller-mutation quota</strong> (<code>QuotaType.CONTROLLER_MUTATION</code>, KIP-599): cap the rate of partition creations/deletions from <code>CreateTopics</code>, <code>CreatePartitions</code>, <code>DeleteTopics</code> using a token bucket that tolerates bursts.</li>
+  <li><strong>Replication throttles</strong> (<code>LEADER_REPLICATION</code>, <code>FOLLOWER_REPLICATION</code>, <code>ALTER_LOG_DIRS_REPLICATION</code>): cap reassignment / log-dir-move traffic so it does not crowd out client traffic.</li>
+  <li><strong>Connection quotas</strong>: cap concurrent connection <em>count</em> (broker / listener / per-IP) and connection <em>creation rate</em> (broker / listener / per-IP), enforced inside the acceptor.</li>
+  <li><strong>Client telemetry</strong> (KIP-714): subscribe clients to metric sets, ingest pushed OTLP, and throttle each client to its negotiated push interval.</li>
+</ul>
+<p>Quota limits are stored as cluster metadata (config records in the KRaft metadata log) and applied dynamically; see <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>. The throttling mechanism is interleaved with request processing (<a href="07-request-processing.html">Request Processing (KafkaApis)</a>) and the network layer's channel mute/unmute machinery (<a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a>).</p>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Class / file</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/quota/ClientQuotaManager.java</code></td><td>Base manager for bandwidth/request/mutation quotas; sensor lifecycle, entity resolution, throttle-delay computation, the reaper thread and delay queue.</td></tr>
+<tr><td><code>core/src/main/java/kafka/server/ClientRequestQuotaManager.java</code></td><td><code>REQUEST</code> quota; records request-thread + network-thread time as a percentage; exempt sensor.</td></tr>
+<tr><td><code>server/.../quota/ControllerMutationQuotaManager.java</code> (+ <code>StrictControllerMutationQuota</code>, <code>PermissiveControllerMutationQuota</code>, <code>AbstractControllerMutationQuota</code>)</td><td>Token-bucket controller-mutation quota and the per-request quota objects.</td></tr>
+<tr><td><code>server/.../quota/ReplicationQuotaManager.java</code></td><td>Replication / alter-log-dirs byte-rate throttle; throttled-partition set.</td></tr>
+<tr><td><code>core/src/main/java/kafka/server/QuotaFactory.java</code></td><td>Instantiates the seven managers into a <code>QuotaManagers</code> record and wires the quota callback plugin.</td></tr>
+<tr><td><code>server/.../quota/ThrottledChannel.java</code>, <code>ThrottleCallback.java</code>, <code>ClientSensors.java</code></td><td>Delay-queue element, the start/end-throttling callback interface, and the per-client sensor tuple.</td></tr>
+<tr><td><code>server-common/.../quota/QuotaType.java</code>, <code>QuotaUtils.java</code>, <code>SensorAccess.java</code></td><td>Quota-type enum, throttle-time math, lock-guarded sensor creation.</td></tr>
+<tr><td><code>server-common/.../config/QuotaConfig.java</code></td><td>All quota config keys, defaults and <code>ConfigDef</code>s.</td></tr>
+<tr><td><code>clients/.../common/metrics/stats/{Rate,TokenBucket}.java</code>, <code>Sensor.java</code>, <code>Quota.java</code></td><td>The metric primitives that do the actual rate accounting and quota check.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/network/SocketServer.scala</code> (<code>ConnectionQuotas</code>)</td><td>Connection count + creation-rate enforcement in the acceptor.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/metadata/ClientQuotaMetadataManager.scala</code></td><td>Applies <code>ClientQuotasDelta</code> from the metadata log to the managers and to <code>ConnectionQuotas</code>.</td></tr>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/ClientMetricsManager.java</code></td><td>KIP-714 telemetry: subscriptions, client-instance cache, push-interval gating, OTLP export.</td></tr>
+<tr><td><code>server/.../metrics/{ClientMetricsInstance,ClientMetricsConfigs}.java</code></td><td>Per-client telemetry state &amp; the <code>metrics</code>/<code>interval.ms</code>/<code>match</code> subscription config.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+  <dt>Quota entity</dt><dd>The subject a quota applies to. For client quotas it is a combination of a <em>user</em> (principal) and/or a <em>client-id</em>; for connection quotas it is broker / listener / IP. Defaults exist at each level (<code>&lt;default&gt;</code>).</dd>
+  <dt>Quota type</dt><dd>One of the nine <code>QuotaType</code> values (<code>server-common/.../quota/QuotaType.java:19</code>): <code>FETCH, PRODUCE, REQUEST, CONTROLLER_MUTATION, LEADER_REPLICATION, FOLLOWER_REPLICATION, ALTER_LOG_DIRS_REPLICATION, RLM_COPY, RLM_FETCH</code>. The first four map to a <code>ClientQuotaType</code>; the last two are tiered-storage throttles (see <a href="05-tiered-storage.html">Tiered Storage</a>).</dd>
+  <dt>Sensor</dt><dd>A named accumulator (<code>org.apache.kafka.common.metrics.Sensor</code>) holding one or more stats. Recording a value updates every stat; if <code>checkQuotas</code> is requested and any stat's measured value crosses its configured <code>Quota</code>, a <code>QuotaViolationException</code> is thrown carrying the observed value, the bound, and the metric.</dd>
+  <dt>Throttle time</dt><dd>The delay (ms) needed to bring the observed rate back to the bound, assuming no further recording. Computed by <code>QuotaUtils.throttleTime</code> for rates and by <code>ControllerMutationQuotaManager.throttleTimeMs</code> for token buckets.</dd>
+  <dt>Muting a channel</dt><dd>Suppressing reads on a connection so the client receives no further responses (and its in-flight window fills) until the throttle expires. Used to enforce the delay without a busy-wait.</dd>
+  <dt>Subscription / client instance</dt><dd>KIP-714 terms: a <em>subscription</em> is a named set of (metric prefixes, push interval, match pattern) stored as broker config; a <em>client instance</em> is one connected client identified by a broker-assigned UUID, carrying its resolved subscription and last-request timestamps.</dd>
+</dl>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Every client quota is "one <code>Sensor</code> per (quota-type, resolved entity)". The quota <em>limit</em> lives in the sensor's <code>MetricConfig.quota()</code>; the quota <em>usage</em> is the sensor's sampled <code>Rate</code>/<code>TokenBucket</code> value. Changing a limit is just re-setting <code>MetricConfig</code> on an existing metric — no usage is reset — which is why dynamic quota changes are cheap and non-disruptive.</p></div>
+
+<h2>Data structures</h2>
+
+<h3>In-memory: the sampled Rate and the quota check</h3>
+<p>A bandwidth/request quota sensor carries a <code>Rate</code> (<code>clients/.../metrics/stats/Rate.java:33</code>) wrapping a <code>SampledStat</code> (a <code>WindowedSum</code> by default). The sampled stat keeps <code>N</code> windows; the rate is "total observed over the live windows ÷ elapsed time across those windows". <code>Rate.windowSize</code> (line 81) deliberately pads the denominator to at least <code>samples-1</code> full windows so that a tiny amount of elapsed time in a fresh window does not produce an absurdly high instantaneous rate.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Field / object</th><th>Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>MetricConfig.timeWindowMs</code></td><td>long</td><td>Width of one sample window. From <code>quota.window.size.seconds</code> (default 1 s).</td></tr>
+<tr><td><code>MetricConfig.samples</code></td><td>int</td><td>Number of windows retained. From <code>quota.window.num</code> (default 11 = 10 whole + 1 current; <code>QuotaConfig.java:42</code>).</td></tr>
+<tr><td><code>MetricConfig.quota</code></td><td><code>Quota</code></td><td>The bound (bytes/sec, percentage, or token refill rate) and direction (upper).</td></tr>
+<tr><td><code>SampledStat.samples</code></td><td>list of windows</td><td>Each window has <code>startTimeMs</code>, <code>eventCount</code>, accumulated <code>value</code>.</td></tr>
+</tbody>
+</table></div>
+<p><code>Quota</code> (<code>clients/.../metrics/Quota.java:22</code>) is a <code>(double bound, boolean upper)</code>; <code>acceptable(v)</code> returns <code>upper ? v &lt;= bound : v &gt;= bound</code>. The check happens in <code>Sensor.checkQuotas(timeMs)</code> (<code>Sensor.java:253</code>): for each metric with a configured quota it measures the value and, for a <code>TokenBucket</code>, violates iff the value (remaining tokens) is <code>&lt; 0</code>; otherwise it violates iff <code>!quota.acceptable(value)</code>.</p>
+
+<h3>In-memory: the token bucket (controller mutations)</h3>
+<p><code>TokenBucket</code> (<code>clients/.../metrics/stats/TokenBucket.java:59</code>) holds a running <code>tokens</code> credit and <code>lastUpdateMs</code>. On every <code>record(config, value, timeMs)</code> it first <em>refills</em> — <code>tokens = min(burst, tokens + quota·Δt)</code> — then subtracts the recorded permits — <code>tokens = min(burst, tokens − value)</code>. The maximum burst is <code>samples · windowMs · quota</code> (line 99). The quota is "exhausted" when <code>tokens &lt; 0</code>.</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">record(value, timeMs)</span><span class="nd">value = permits charged</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord store"><span class="nt">refill · tokens = min(B, tokens + Q·Δt)</span><span class="nd">B = S·W·Q (max burst credits) · Q = controller_mutation_rate (mutations/sec)</span></div>
+  <div class="conn" data-label="then"></div>
+  <div class="node cat-coord store"><span class="nt">spend · tokens = min(B, tokens − value)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage decision">tokens &lt; 0 ?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-data" data-label="no"></div>
+      <div class="node"><span class="nt">within quota</span><span class="nd">throttle = 0</span></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-err" data-label="yes"></div>
+      <div class="node cat-error"><span class="nt">exhausted</span></div>
+      <div class="conn ec-err"></div>
+      <div class="node cat-coord"><span class="nt">throttle = round(−tokens / Q · 1000) ms</span></div>
+    </div>
+  </div>
+</div><figcaption>Token-bucket accounting in <code>TokenBucket</code> (refill-then-spend) and the throttle math in <code>ControllerMutationQuotaManager.throttleTimeMs</code>.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>caller (request handler)</span>
+  <span class="lgi"><span class="sw cat-coord"></span>token bucket · waiting</span>
+  <span class="lgi"><span class="sw cat-storage"></span>quota check</span>
+  <span class="lgi"><span class="sw cat-error"></span>quota exhausted</span>
+  <span class="lgi"><span class="arr"></span>control flow</span>
+  <span class="lgi"><b>cylinder</b> = bucket credit op</span>
+  <span class="lgi"><b>rounded</b> = decision</span>
+</div></figure>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The token bucket exists because a single large sample can pin a sampled <code>Rate</code> above quota until that sample <em>expires</em>, forcing a throttle of up to <code>S·W</code> seconds even when the true backlog is small. The bucket tracks continuously-refilled credits instead, so a burst of 560 against Q=5, B=500 lands at −60 tokens and clears in 12 s rather than 100 s (worked example in the <code>TokenBucket</code> Javadoc). This is the controller-mutation enhancement of <span class="pill kip">KIP-599</span>.</p></div>
+
+<h3>In-memory: per-client sensor tuple &amp; manager state</h3>
+<p><code>ClientSensors</code> (<code>server/.../quota/ClientSensors.java:31</code>) is a record of <code>(metricTags, quotaSensor, throttleTimeSensor)</code>. Inside <code>ClientQuotaManager</code> the important fields are:</p>
+<ul>
+  <li><code>volatile int quotaTypesEnabled</code> — a bitmask (<code>NO_QUOTAS=0, CLIENT_ID=1, USER=2, USER_CLIENT_ID=4, CUSTOM=8</code>) summarising which entity levels currently have any quota set; enables a fast path that skips quota work entirely when nothing is configured (<code>ClientQuotaManager.java:188</code>, <code>quotasEnabled()</code> at 306).</li>
+  <li><code>ConcurrentHashMap&lt;Integer,Integer&gt; activeQuotaEntities</code> — reference counts per level, so <code>quotaTypesEnabled</code> can be cleared when the last entity at a level is removed (<code>updateQuotaTypes</code>, line 572).</li>
+  <li><code>DelayQueue&lt;ThrottledChannel&gt; delayQueue</code> — the in-flight throttled channels, ordered by expiry.</li>
+  <li><code>DefaultQuotaCallback.overriddenQuotas</code> — a <code>ConcurrentHashMap&lt;ClientQuotaEntity, Quota&gt;</code> holding the configured limits keyed by entity (the source of truth for limit lookups).</li>
+</ul>
+
+<h3>On-wire: the delayed channel</h3>
+<p><code>ThrottledChannel</code> (<code>server/.../quota/ThrottledChannel.java:27</code>) implements <code>java.util.concurrent.Delayed</code>. It records <code>endTimeNanos = now + throttleTimeMs</code>, calls <code>callback.startThrottling()</code> in its constructor, orders itself by <code>endTimeNanos</code>, and on dequeue calls <code>callback.endThrottling()</code> via <code>notifyThrottlingDone()</code>.</p>
+
+<h3>Persistent: quota config records</h3>
+<p>Client/user/IP quotas are stored as <code>ClientQuotaRecord</code> entries in the KRaft metadata log, managed by <code>metadata/.../controller/ClientQuotaControlManager.java</code> (<code>alterClientQuotas</code> at line 97, <code>replay</code> at 131). Each record names an entity (a list of <code>(entityType, entityName)</code> with <code>null</code> = default) and a single <code>(key, value)</code> such as <code>producer_byte_rate → 1048576</code>. The config key constants are in <code>QuotaConfig.java:89-93</code>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Override key</th><th>Type</th><th>Quota type</th></tr></thead>
+<tbody>
+<tr><td><code>producer_byte_rate</code></td><td>LONG</td><td>PRODUCE bandwidth</td></tr>
+<tr><td><code>consumer_byte_rate</code></td><td>LONG</td><td>FETCH bandwidth</td></tr>
+<tr><td><code>request_percentage</code></td><td>DOUBLE</td><td>REQUEST CPU %</td></tr>
+<tr><td><code>controller_mutation_rate</code></td><td>DOUBLE</td><td>CONTROLLER_MUTATION (mutations/sec)</td></tr>
+<tr><td><code>connection_creation_rate</code></td><td>INT</td><td>per-IP connection rate (default <code>Integer.MAX_VALUE</code>)</td></tr>
+</tbody>
+</table></div>
+<p>Replication throttles are <em>broker</em> configs (<code>leader.replication.throttled.rate</code>, <code>follower.replication.throttled.rate</code>, <code>replica.alter.log.dirs.io.max.bytes.per.second</code>; <code>QuotaConfig.java:75-86</code>) paired with topic configs <code>{leader,follower}.replication.throttled.replicas</code> that name which partitions are throttled.</p>
+
+<h2>Architecture &amp; control/data flow</h2>
+<figure class="diagram"><div class="dflow">
+  <div class="sep">Config plane — controller ⇒ publisher</div>
+  <div class="node cat-client"><span class="nt">Admin: AlterClientQuotas / IncrementalAlterConfigs</span></div>
+  <div class="conn" data-label="forward to controller"></div>
+  <div class="node cat-control"><span class="nt">ClientQuotaControlManager</span></div>
+  <div class="conn" data-label="writes ClientQuotaRecord"></div>
+  <div class="node cat-storage store"><span class="nt">metadata log</span><span class="nd">replicated</span></div>
+  <div class="conn" data-label="ClientQuotasDelta"></div>
+  <div class="node cat-broker"><span class="nt">ClientQuotaMetadataManager.accept()</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col"><div class="conn" data-label="user / client keys"></div><div class="node cat-broker"><span class="nt">manager.updateQuota(user, client, Quota)</span></div></div>
+    <div class="col"><div class="conn" data-label="IP key"></div><div class="node cat-broker"><span class="nt">connectionQuotas.updateIpConnectionRateQuota()</span></div></div>
+  </div>
+</div>
+<div class="dflow">
+  <div class="sep">↓ limit lookup feeds the hot path ↓</div>
+  <div class="sep">Request hot path — handler thread</div>
+  <div class="node cat-client"><span class="nt">KafkaApis.handleProduce / handleFetch</span></div>
+  <div class="conn" data-label="size or thread-time"></div>
+  <div class="node cat-broker"><span class="nt">maybeRecordAndGetThrottleTimeMs(session, clientId, v)</span><span class="nd">reads the configured limit set above</span></div>
+  <div class="conn" data-label="record ⇒ checkQuotas"></div>
+  <div class="node cat-storage decision">throttleTimeMs &gt; 0 ?</div>
+  <div class="conn" data-label="yes"></div>
+  <div class="node cat-coord"><span class="nt">RequestHandlerHelper.throttle</span><span class="nd">build ThrottleCallback</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">ClientQuotaManager.throttle</span><span class="nd">delayQueue.add · startThrottling</span></div>
+  <div class="conn dashed ec-async" data-label="throttleTimeMs later"></div>
+  <div class="node cat-coord"><span class="nt">ThrottledChannelReaper: poll</span><span class="nd">endThrottling — unmute channel</span></div>
+</div><figcaption>End-to-end quota configuration (top) and enforcement (bottom): metadata-derived limits feed the per-request throttle decision.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client / admin</span>
+  <span class="lgi"><span class="sw cat-control"></span>controller · metadata</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker component</span>
+  <span class="lgi"><span class="sw cat-storage"></span>metadata log · check</span>
+  <span class="lgi"><span class="sw cat-coord"></span>throttle · waiting</span>
+  <span class="lgi"><span class="arr"></span>flow</span>
+  <span class="lgi"><span class="arr dashed"></span>deferred (reaper)</span>
+  <span class="lgi"><b>cylinder</b> = log/store · <b>rounded</b> = decision</span>
+</div></figure>
+
+<h2>Detailed mechanics</h2>
+
+<h3>Entity resolution order</h3>
+<p>For a given <code>(principal, client-id)</code> the most specific configured quota wins. <code>DefaultQuotaCallback.findQuota</code> (<code>ClientQuotaManager.java:747</code>) walks this precedence, returning the first hit:</p>
+<ol>
+  <li><code>/config/users/&lt;user&gt;/clients/&lt;client-id&gt;</code></li>
+  <li><code>/config/users/&lt;user&gt;/clients/&lt;default&gt;</code></li>
+  <li><code>/config/users/&lt;user&gt;</code></li>
+  <li><code>/config/users/&lt;default&gt;/clients/&lt;client-id&gt;</code></li>
+  <li><code>/config/users/&lt;default&gt;/clients/&lt;default&gt;</code></li>
+  <li><code>/config/users/&lt;default&gt;</code></li>
+  <li><code>/config/clients/&lt;client-id&gt;</code></li>
+  <li><code>/config/clients/&lt;default&gt;</code></li>
+</ol>
+<p>The metric is <em>tagged</em> by the level that matched, not by the raw (user, client). The manager optimizes the common case where only one level is configured: <code>quotaMetricTags</code> (line 821) short-circuits to "(client-id only)", "(user only)" or "(user, client-id)" by inspecting <code>quotaTypesEnabled</code>, and only does the full eight-step probe of <code>overriddenQuotas</code> when multiple levels coexist. This keeps the per-request tag computation O(1) for the vast majority of clusters.</p>
+
+<h3>Recording &amp; the throttle-time formula</h3>
+<p>The bandwidth/request path is <code>recordAndGetThrottleTimeMs</code> (<code>ClientQuotaManager.java:333</code>): get-or-create the sensor, then <code>quotaSensor().record(value, timeMs, true)</code>. The <code>true</code> asks the sensor to enforce; on violation it computes <code>throttleTime(e, timeMs)</code> and returns it (else 0). The formula (<code>QuotaUtils.throttleTime</code>, line 41) is derived from "to bring observed rate O down to target T over window W, add delay X such that O·W/(W+X)=T", giving:</p>
+<pre><code>X = (O − T) / T · W      // W = the metric's current window size</code></pre>
+<p>The request quota caps this at one window (<code>maxThrottleTimeMs = quotaWindowSizeSeconds·1000</code>) via <code>QuotaUtils.boundedThrottleTime</code> (<code>ClientRequestQuotaManager.java:99</code>); connection-rate throttling is likewise capped at one window (<code>SocketServer.scala:1585</code>).</p>
+
+<h3>The fetch "unrecord" subtlety</h3>
+<p>Because the <code>Sensor</code> API couples recording and quota-checking, the fetch path must record the response size to test it. When the result is a throttle, the broker returns an <em>empty</em> response and so must subtract the value it just recorded: <code>quotas.fetch.unrecordQuotaSensor(...)</code> (<code>ClientQuotaManager.java:367</code>; called from <code>KafkaApis.scala:710</code>) records the negative of the same quantity, since the windowed sum is additive. Conversely, fetch <em>sizing</em> is pre-capped: <code>maxValueInQuotaWindow</code> (line 377) returns <code>limit · (samples−1) · windowSeconds</code>, the largest payload that could ever be returned without guaranteeing a throttle, and <code>KafkaApis</code> clamps <code>fetchMaxBytes</code> to it (line 742).</p>
+
+<h3>Request-quota accounting (CPU time)</h3>
+<p>The request quota measures <em>time</em>, not bytes. <code>ClientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(request, timeMs)</code> (line 78) records <code>nanosToPercentage(request.requestThreadTimeNanos())</code> — request-handler thread time expressed as a percentage of one second (<code>NANOS_TO_PERCENTAGE_PER_SECOND = 100 / 1e9</code>, line 41) — and installs a callback so the <em>network</em> thread's send time is added later via <code>recordNoThrottle</code>. Internal/cluster-action traffic is recorded against a separate, never-expiring <code>exempt-Request</code> sensor through <code>maybeRecordExempt</code> (line 89) so it shows up in metrics without counting toward any client's quota.</p>
+
+<h3>Strict vs permissive controller-mutation quotas</h3>
+<p>Topic-mutation handlers obtain a per-request quota object whose strictness depends on the request version. <code>ControllerMutationQuotaManager.newQuotaFor(session, header, strictSinceVersion)</code> (line 169) returns a <code>StrictControllerMutationQuota</code> at or above the version and a <code>PermissiveControllerMutationQuota</code> below it. On the controller these are wired with <code>strictSinceVersion</code> = 5 (DeleteTopics), 6 (CreateTopics), 3 (CreatePartitions) — <code>ControllerApis.scala:200,364,801</code>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Strict (<code>StrictControllerMutationQuota</code>)</th><th>Permissive (<code>PermissiveControllerMutationQuota</code>)</th></tr></thead>
+<tbody>
+<tr><td>Accepts when exhausted?</td><td>No — rejects with <code>THROTTLING_QUOTA_EXCEEDED</code></td><td>Yes — always records</td></tr>
+<tr><td>Throttles below quota?</td><td>No (only once exhausted)</td><td>Throttles as soon as exhausted</td></tr>
+<tr><td>record()</td><td><code>checkQuotas</code> then <code>record(v,…,false)</code> inside <code>synchronized(quotaSensor)</code>; on violation throws (<code>StrictControllerMutationQuota.java:54</code>)</td><td><code>record(v,…,true)</code>; on violation just remembers the delay (<code>PermissiveControllerMutationQuota.java:51</code>)</td></tr>
+</tbody>
+</table></div>
+<p>Both extend <code>AbstractControllerMutationQuota</code>, whose <code>throttleTime()</code> (line 46) <em>decays</em> the remembered delay by the time already elapsed since recording — important because a controller request can sit in purgatory long after the quota was evaluated. The strict path is "pre-check before mutate": the controller invokes <code>controllerMutationQuota.record(permits)</code> as it counts partitions (<code>ControllerApis.scala:387</code>), so an over-quota <code>CreateTopics</code> is rejected before any metadata record is written.</p>
+
+<h3>Holding the channel: mute / unmute</h3>
+<p><code>ClientQuotaManager.throttle</code> (<code>ClientQuotaManager.java:392</code>) records the delay into the throttle-time sensor and enqueues a <code>ThrottledChannel</code>. The callback is built in <code>RequestHandlerHelper.throttle</code> (<code>RequestHandlerHelper.scala:39</code>): <code>startThrottling → requestChannel.startThrottling(request)</code> and <code>endThrottling → requestChannel.endThrottling(request)</code>. Those send special responses (<code>StartThrottlingResponse</code> / <code>EndThrottlingResponse</code>, <code>RequestChannel.scala:147,151</code>) that the <code>Processor</code> turns into channel mute events <code>THROTTLE_STARTED</code> / <code>THROTTLE_ENDED</code> (<code>SocketServer.scala:961,965</code>), feeding the channel's mute state machine. The actual user response carrying <code>throttle_time_ms</code> is sent <em>immediately</em> (via the various <code>sendResponseMaybeThrottle</code> helpers) so the client learns the delay; the mute then suppresses further reads from that connection until the reaper fires <code>THROTTLE_ENDED</code>.</p>
+
+<h3>Connection quotas inside the acceptor</h3>
+<p><code>ConnectionQuotas.inc</code> (<code>SocketServer.scala:1295</code>) runs under <code>counts.synchronized</code> on every accepted socket and does three things in order: (1) <code>waitForConnectionSlot</code> blocks until a count slot is free and the creation-rate throttle has elapsed; (2) <code>recordIpConnectionMaybeThrottle</code> checks the per-IP creation rate and throws <code>ConnectionThrottledException</code> if exceeded; (3) it bumps the per-IP / listener / total counters and throws <code>TooManyConnectionsException</code> if the per-IP <em>count</em> max is reached.</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">accept(socket)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">ConnectionQuotas.inc(listener, ip)</span><span class="nd">counts.synchronized</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">waitForConnectionSlot</span><span class="nd">throttleMs = recordConnectionAndGetThrottleTimeMs(listener)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage decision">throttleMs &gt; 0 OR no slot ?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-async" data-label="yes"></div>
+      <div class="node cat-coord"><span class="nt">counts.wait(remaining)</span><span class="nd">blocks the ACCEPTOR · re-checks slot on wakeup ↺</span></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-data" data-label="no"></div>
+      <div class="node cat-storage decision">per-IP rate exceeded ?</div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn ec-err" data-label="yes"></div>
+          <div class="node cat-error"><span class="nt">unrecord · updateListenerMetrics</span><span class="nd">throw ConnectionThrottledException</span></div>
+        </div>
+        <div class="col">
+          <div class="conn ec-data" data-label="no"></div>
+          <div class="node cat-broker"><span class="nt">counts[ip]++ · listenerCounts++ · totalCount++</span></div>
+          <div class="conn"></div>
+          <div class="node cat-storage decision">counts[ip] ≥ maxPerIp ?</div>
+          <div class="conn"></div>
+          <div class="row">
+            <div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error"><span class="nt">throw TooManyConnectionsException</span></div></div>
+            <div class="col"><div class="conn ec-data" data-label="no"></div><div class="node cat-client"><span class="nt">admit connection</span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>Connection admission control inside the acceptor. Note the acceptor thread itself blocks in <code>counts.wait</code> and re-checks the slot on wakeup; the inter-broker listener is "protected" so it is never starved.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>socket / admitted</span>
+  <span class="lgi"><span class="sw cat-broker"></span>acceptor (ConnectionQuotas)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>check / decision</span>
+  <span class="lgi"><span class="sw cat-coord"></span>blocked / waiting</span>
+  <span class="lgi"><span class="sw cat-error"></span>rejected (exception)</span>
+  <span class="lgi"><span class="arr"></span>admit path</span>
+  <span class="lgi"><span class="arr dashed"></span>block &amp; retry</span>
+  <span class="lgi"><b>rounded</b> = decision</span>
+</div></figure>
+<p>Creation-rate limits use the same <code>Rate</code>+<code>Quota</code> primitive (<code>getOrCreateConnectionRateQuotaSensor</code>, line 1597) with broker, per-listener and per-IP sensors. The broker rate metric is named <code>broker-connection-accept-rate</code>; per-IP/listener metrics are <code>connection-accept-rate</code> tagged by ip/listener (<code>ConnectionQuotaEntity.java:29-54</code>). A "protected" listener (<code>protectedListener</code>, line 1487) is the inter-broker listener when more than one listener exists; it bypasses the broker-wide rate and count so replication is never throttled by client connection pressure.</p>
+
+<h2>Concurrency &amp; threading</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Guarded by</th><th>Accessed by</th></tr></thead>
+<tbody>
+<tr><td>Sensor creation (per-client)</td><td><code>SensorAccess</code> read/write lock (read to look up, write to create) — <code>SensorAccess.java:39</code></td><td>request-handler threads (via <code>getOrCreateQuotaSensors</code>)</td></tr>
+<tr><td>Sensor recording &amp; <code>checkQuotas</code></td><td><code>synchronized(this)</code> + <code>metricLock()</code> inside <code>Sensor.recordInternal</code> (<code>Sensor.java:232</code>); mutation quotas additionally wrap the check+record in <code>synchronized(quotaSensor)</code> to make it atomic</td><td>request-handler threads</td></tr>
+<tr><td>Quota limit map &amp; <code>quotaTypesEnabled</code></td><td><code>ReentrantReadWriteLock</code> write lock in <code>updateQuota</code> (<code>ClientQuotaManager.java:530</code>); <code>quotaTypesEnabled</code> is <code>volatile</code> for lock-free reads</td><td>metadata publisher thread writes; request threads read</td></tr>
+<tr><td><code>DelayQueue&lt;ThrottledChannel&gt;</code></td><td>the queue's own lock (concurrent)</td><td>request threads enqueue; one reaper thread dequeues</td></tr>
+<tr><td>Connection counts &amp; rate config</td><td><code>counts.synchronized</code> (an intrinsic monitor; <code>counts.notifyAll</code> wakes blocked acceptors)</td><td>acceptor threads; config-update thread</td></tr>
+<tr><td>Telemetry client cache / subscriptions</td><td><code>SynchronizedCache</code> (LRU) + <code>ConcurrentHashMap</code>; double-checked <code>synchronized(this)</code> for instance creation</td><td>request-handler threads; expiration-timer thread</td></tr>
+</tbody>
+</table></div>
+<p>Each <code>ClientQuotaManager</code> starts exactly one daemon thread, the <code>ThrottledChannelReaper</code> (<code>ClientQuotaManager.java:276</code>), named <code>&lt;prefix&gt;ThrottledChannelReaper-&lt;QuotaType&gt;</code> (e.g. <code>...ThrottledChannelReaper-Produce</code>). Its loop polls the delay queue with a 1-second timeout; when a channel's delay expires it decrements the queue-size sensor and calls <code>notifyThrottlingDone()</code> to unmute. So there is one reaper per managed quota type (Produce, Fetch, Request, ControllerMutation). The four reaper threads, the request handlers, and the metadata publisher are the only actors here; bandwidth/fetch/request enforcement is entirely on the calling request-handler thread, with no extra hop.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A channel is unmuted exactly once per throttle: the reaper is the sole consumer of the delay queue, and the channel mute state machine treats <code>THROTTLE_STARTED</code>/<code>THROTTLE_ENDED</code> as a balanced pair. On shutdown, <code>initiateShutdown</code> enqueues a zero-delay no-op <code>ThrottledChannel</code> (<code>ClientQuotaManager.java:700</code>) to wake the reaper out of its blocking poll.</p></div>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>quota.window.num</code></td><td>11</td><td>Samples retained for client quotas (10 whole + 1 current).</td></tr>
+<tr><td><code>quota.window.size.seconds</code></td><td>1</td><td>Width of one client-quota window; also caps request-quota and connection-rate throttle to one window.</td></tr>
+<tr><td><code>controller.quota.window.num</code> / <code>...size.seconds</code></td><td>11 / 1</td><td>Sampling for the controller-mutation token bucket (the bucket's burst = num·size·rate).</td></tr>
+<tr><td><code>replication.quota.window.num</code> / <code>...size.seconds</code></td><td>11 / 1</td><td>Sampling for leader/follower replication throttle.</td></tr>
+<tr><td><code>alter.log.dirs.replication.quota.window.num</code> / <code>...size.seconds</code></td><td>11 / 1</td><td>Sampling for the alter-log-dirs throttle.</td></tr>
+<tr><td><code>client.quota.callback.class</code></td><td><code>null</code></td><td>Custom <code>ClientQuotaCallback</code>; when set, <code>quotaTypesEnabled = CUSTOM_QUOTAS</code> and the built-in entity resolution / metric-update optimizations are bypassed.</td></tr>
+<tr><td><code>producer_byte_rate</code> / <code>consumer_byte_rate</code> (entity config)</td><td><code>Long.MAX_VALUE</code></td><td>Produce / fetch bandwidth ceiling (bytes/sec) for a user/client entity.</td></tr>
+<tr><td><code>request_percentage</code> (entity config)</td><td><code>Integer.MAX_VALUE</code> (as double)</td><td>Request-thread + network-thread CPU percentage ceiling.</td></tr>
+<tr><td><code>controller_mutation_rate</code> (entity config)</td><td><code>Integer.MAX_VALUE</code> (as double)</td><td>Partition mutations/sec ceiling (KIP-599).</td></tr>
+<tr><td><code>leader.replication.throttled.rate</code> / <code>follower.replication.throttled.rate</code></td><td><code>Long.MAX_VALUE</code></td><td>Bytes/sec ceiling for throttled replicas (broker config, dynamic only).</td></tr>
+<tr><td><code>replica.alter.log.dirs.io.max.bytes.per.second</code></td><td><code>Long.MAX_VALUE</code></td><td>Bytes/sec ceiling for inter-log-dir moves (dynamic only).</td></tr>
+<tr><td><code>{leader,follower}.replication.throttled.replicas</code></td><td><code>[]</code></td><td>Per-topic list <code>partitionId:brokerId,…</code> or <code>*</code> marking which replicas are throttled.</td></tr>
+<tr><td><code>max.connections</code></td><td><code>Integer.MAX_VALUE</code></td><td>Broker-wide concurrent connection count limit.</td></tr>
+<tr><td><code>max.connections.per.ip</code> / <code>max.connections.per.ip.overrides</code></td><td><code>Integer.MAX_VALUE</code> / <code>""</code></td><td>Per-IP connection count limit and host/ip overrides.</td></tr>
+<tr><td><code>max.connection.creation.rate</code></td><td><code>Integer.MAX_VALUE</code></td><td>Broker-wide new-connection rate; per-listener via <code>listener.name.X.</code> prefix.</td></tr>
+<tr><td><code>connection_creation_rate</code> (IP entity)</td><td><code>Integer.MAX_VALUE</code></td><td>Per-IP new-connection rate (KIP-612), set dynamically per IP or default.</td></tr>
+<tr><td><code>telemetry.max.bytes</code></td><td>1048576 (1 MiB)</td><td>Max compressed size of a single <code>PushTelemetry</code> payload (<code>MetricConfigs.java:66</code>).</td></tr>
+<tr><td><code>interval.ms</code> (client-metrics subscription)</td><td>300000 (5 min)</td><td>Push interval; clamped 100 ms–1 h (<code>ClientMetricsConfigs.java:89-91</code>).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Client telemetry (KIP-714)</h2>
+<p>The same broker that throttles a client also collects metrics <em>from</em> it. <code>ClientMetricsManager</code> handles two RPCs that any broker advertising them can serve (<code>KafkaApis.scala:233-234</code>).</p>
+
+<h3>The two RPCs</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>RPC</th><th>Handler</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>GetTelemetrySubscriptions</code></td><td><code>processGetTelemetrySubscriptionRequest</code> (line 159)</td><td>Resolves/creates the client instance, returns its <code>clientInstanceId</code> (generating a fresh UUID if the client sent <code>ZERO_UUID</code>), the resolved metric set, a <code>subscriptionId</code>, the negotiated <code>pushIntervalMs</code>, accepted compression types, <code>telemetryMaxBytes</code>, and <code>deltaTemporality=true</code>.</td></tr>
+<tr><td><code>PushTelemetry</code></td><td><code>processPushTelemetryRequest</code> (line 188)</td><td>Validates the instance &amp; push timing, checks compression and size, then hands the OTLP <code>metrics</code> <code>ByteBuffer</code> to <code>clientTelemetryExporterPlugin.exportMetrics(...)</code>.</td></tr>
+</tbody>
+</table></div>
+
+<h3>Subscriptions &amp; the subscription id</h3>
+<p>A subscription is broker config (<code>metrics</code>, <code>interval.ms</code>, <code>match</code>; <code>ClientMetricsConfigs.java:73-75</code>) applied via <code>updateSubscription</code> (line 135), which bumps an <code>AtomicInteger subscriptionUpdateVersion</code> on every change. When a client first appears, <code>createClientInstance</code> (line 330) unions all subscriptions whose <code>match</code> pattern matches the client's metadata (client-id, software name/version, source address/port), unions their metric prefixes, and takes the <em>minimum</em> push interval; if any matching subscription requests <code>*</code> the metric set collapses to just <code>*</code>. The <code>subscriptionId</code> is <code>CRC32C(metrics.toString()+pushIntervalMs) XOR clientInstanceId.hashCode()</code> (line 368), so it changes whenever the effective subscription changes — letting the client detect drift by comparing ids.</p>
+
+<h3>Push-interval gating (a per-client throttle)</h3>
+<p>Telemetry has its own throttle independent of the quota managers: a client may push only once per <code>pushIntervalMs</code>. <code>ClientMetricsInstance.maybeUpdatePushRequestTimestamp</code> (<code>ClientMetricsInstance.java:111</code>) accepts a push iff (a) it follows a <code>GetTelemetrySubscriptions</code> that has not yet been "consumed" by a push (<code>lastGetRequestTimestamp &gt; lastPushRequestTimestamp</code>), or (b) at least <code>pushIntervalMs</code> has elapsed since the last push. A too-early request raises <code>ThrottlingQuotaExceededException</code> (counted by the <code>throttle</code> sensor) and is reflected back as <code>throttle_time_ms</code>. The Get side is gated identically (<code>maybeUpdateGetRequestTimestamp</code>, line 101) but always lets through clients whose last error was <code>UNKNOWN_SUBSCRIPTION_ID</code> / <code>UNSUPPORTED_COMPRESSION_TYPE</code> so they can recover immediately.</p>
+<figure class="diagram"><div class="dseq" style="--cols:2">
+  <div class="lanes"><span class="actor cat-client">Client</span><span class="actor cat-broker">Broker — ClientMetricsManager</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">GetTelemetrySubscriptions(ZERO_UUID)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">id=U, subId, metrics=[…], pushIntervalMs=P, maxBytes</span><span class="ln"></span></div>
+    <div class="note">Client: wait ~P (0.5–1.5× jitter) before pushing</div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">PushTelemetry(U, subId, OTLP bytes)</span><span class="ln"></span></div>
+    <div class="note">Broker: validate(size ≤ maxBytes, subId, interval) ⇒ exporter.exportMetrics()</div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">PushTelemetryResponse(NONE)</span><span class="ln"></span></div>
+    <div class="note">subId mismatch ⇒ UNKNOWN_SUBSCRIPTION_ID · client re-Gets to refresh</div>
+  </div>
+</div><figcaption>KIP-714 client-telemetry handshake and push loop.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker (telemetry sink)</span>
+  <span class="lgi"><span class="arr"></span>request</span>
+  <span class="lgi"><span class="arr dashed"></span>response</span>
+  <span class="lgi"><b>note</b> = local processing / branch</span>
+  <span class="lgi"><span class="mono">time flows ↓</span></span>
+</div></figure>
+
+<h3>Instance lifecycle</h3>
+<p>Instances live in an LRU <code>SynchronizedCache</code> capped at 16 384 entries (<code>CACHE_MAX_SIZE</code>, line 90) keyed by UUID, plus a <code>connectionId → UUID</code> map. Each instance has an expiration <code>TimerTask</code> scheduled <code>max(60s, 3·pushIntervalMs)</code> ahead on a <code>SystemTimerReaper</code> thread named <code>client-metrics-reaper</code> (line 84). Disconnects are observed via a <code>ConnectionDisconnectListener</code> (line 477) that evicts the instance and unregisters its per-instance metrics. A re-evaluation path (line 288) recomputes a client's subscription when <code>subscriptionVersion &lt; subscriptionUpdateVersion</code> so config changes take effect on the client's next request.</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>acks=0 produce</strong>: request throttling is exempt (a no-op response cannot carry <code>throttle_time_ms</code>), but the channel can still be muted for a <em>bandwidth</em> violation — <code>KafkaApis.scala:523-525</code> sends a no-op-exempt response yet the produce-quota throttle still mutes.</li>
+  <li><strong>Forwarded requests</strong>: when a broker forwards to the controller, request throttling is applied only on the original (non-forwarded) request to avoid double-counting (<code>RequestHandlerHelper.scala:86,96,130</code>); the response also merges the controller's own <code>throttle_time_ms</code> with the broker's via <code>max</code> (line 73).</li>
+  <li><strong>Telemetry payload too large / bad compression</strong>: <code>validatePushRequest</code> raises <code>TelemetryTooLargeException</code> (&gt; <code>telemetry.max.bytes</code>) or <code>UnsupportedCompressionTypeException</code>; an exporter failure returns <code>INVALID_RECORD</code> and increments <code>plugin-error</code> (line 219).</li>
+  <li><strong>Terminating clients</strong>: a client that previously set <code>terminating=true</code> is refused further pushes with <code>InvalidRequestException</code> (line 404); the terminating push itself bypasses the interval gate so last-gasp metrics are not lost (line 411).</li>
+  <li><strong>Telemetry cache pressure</strong>: if an instance is LRU-evicted before its timer fires, the timer's <code>remove</code> returns false and the manager logs a capacity warning at most once per 5 minutes (line 558).</li>
+  <li><strong>Connection-rate over-record</strong>: throwing <code>ConnectionThrottledException</code> for an IP violation <em>un-records</em> the connection from the IP, listener and broker sensors (<code>updateListenerMetrics</code>, line 1533) so a rejected connection does not inflate the broker rate.</li>
+  <li><strong>Acceptor blocking</strong>: <code>waitForConnectionSlot</code> blocks the acceptor thread under <code>counts</code>; an increase to <code>max.connections</code> calls <code>counts.notifyAll</code> (line 1323) to release waiters. A connection that hit the per-IP <em>count</em> max is created-then-rejected (the counter is incremented before the check at line 1307), and the socket is closed by the caller.</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<ul>
+  <li>Changing a quota limit never resets accumulated usage — only the metric's <code>MetricConfig.quota</code> is replaced (<code>updateQuotaMetricConfigs</code>, line 633; <code>ReplicationQuotaManager.updateQuota</code>, line 64).</li>
+  <li>A client that obeys returned <code>throttle_time_ms</code> is never disconnected for a soft quota; throttling is backpressure, not failure. Hard limits (connection count, strict mutation quota) <em>do</em> reject.</li>
+  <li>The observed rate over any contiguous span converges to ≤ the quota: any excess is delayed by exactly the time required to dilute it back to the bound (the <code>(O−T)/T·W</code> identity).</li>
+  <li>The inter-broker listener is never throttled by broker-wide connection count/rate when multiple listeners exist (<code>protectedListener</code>), preserving replication under client overload.</li>
+  <li>A telemetry client accepts at most one push per push interval; the subscription id is a pure function of the effective subscription, so id-equality implies subscription-equality.</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="07-request-processing.html">Request Processing (KafkaApis)</a> and <code>RequestHandlerHelper</code> are the call sites for every client quota; the produce/fetch paths combine bandwidth and request throttles with <code>max</code>.</li>
+  <li><a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a> owns the channel mute state machine the reaper drives, and hosts <code>ConnectionQuotas</code> inside the acceptor.</li>
+  <li><a href="08-replication.html">Replication, ISR &amp; High Watermark</a> and <a href="09-fetch-path.html">The Fetch Path</a> consult <code>ReplicationQuotaManager</code> (leader side records throttled response sizes; <code>KafkaApis.scala:689</code>).</li>
+  <li><a href="11-kraft-controller.html">The KRaft Controller</a> enforces the strict controller-mutation quota in <code>ControllerApis</code>; <a href="12-metadata-propagation.html">Metadata Propagation</a> delivers <code>ClientQuotasDelta</code> via <code>ClientQuotaMetadataManager</code>.</li>
+  <li><a href="05-tiered-storage.html">Tiered Storage</a> reuses the same machinery for <code>RLM_COPY</code>/<code>RLM_FETCH</code> throttles (<code>RLMQuotaManager</code>).</li>
+  <li><a href="16-producer-client.html">The Producer Client</a> / <a href="17-consumer-client.html">The Consumer Client</a> read <code>throttle_time_ms</code> and the telemetry subscription; client-side telemetry plumbing lives in <code>org.apache.kafka.common.telemetry</code>.</li>
+  <li><a href="18-security.html">Security</a> supplies the <code>KafkaPrincipal</code> in the <code>Session</code> that the user-level quota keys on (<code>Session.java:24</code>).</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<ul>
+  <li><span class="pill kip">KIP-599</span> added the controller-mutation quota and the <code>TokenBucket</code> stat to cope with bursty topic-admin workloads, plus the <code>THROTTLING_QUOTA_EXCEEDED</code> error for strict rejection. The strict-since-version gating lets old clients keep the permissive behaviour while new clients get hard rejection.</li>
+  <li><span class="pill kip">KIP-714</span> made the broker a telemetry sink: standardized client metrics serialized as OpenTelemetry, pushed to any broker, with broker-managed subscriptions and a per-client push-interval. The <code>deltaTemporality</code> flag and the CRC32C subscription id are direct artifacts of that design.</li>
+  <li>Per-IP connection-rate quotas (<code>connection_creation_rate</code>) were introduced to defend against connection storms from a single host independent of the broker-wide rate (KIP-612, inferred from the IP-entity plumbing in <code>ConnectionQuotas</code>).</li>
+  <li>The mute-channel mechanism (returning <code>throttle_time_ms</code> and holding the connection rather than erroring) is the long-standing quota-enforcement design (request-quota era, KIP-124/KIP-219 lineage; inferred). It keeps throttling transparent to correct clients.</li>
+</ul>
+
+<h2>Gotchas / operational notes</h2>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Per-client sensors expire after 1 hour of inactivity (<code>INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS = 3600</code>, <code>ClientQuotaManager.java:62</code>), and per-IP connection-rate sensors after 1 hour (<code>ConnectionQuotaEntity.ipQuotaEntity</code>). A reconnecting idle client starts a fresh quota window — usage history is not retained indefinitely. The request <code>exempt</code> sensor and the broker connection-rate sensor never expire.</p></div>
+<div class="callout warning"><span class="callout-title">Caution</span><p>The replication/connection-rate docs warn to keep throttle limits above ~1 MB/s for accurate behaviour: with a 1-second window and very small limits, the discrete sampling and one-window throttle cap make the effective rate noisy. The token bucket is immune to the "stuck sample" pathology but the plain <code>Rate</code> (bandwidth, replication) is not.</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>Setting <code>client.quota.callback.class</code> flips the manager to <code>CUSTOM_QUOTAS</code>, disabling the single-level fast paths in <code>quotaMetricTags</code> / <code>updateQuotaMetricConfigs</code> and routing every lookup through your callback. A callback that returns <code>quotaResetRequired=true</code> forces a full metric-config sweep on every sensor creation (<code>getOrCreateQuotaSensors</code>, line 464) — correct, but more expensive.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

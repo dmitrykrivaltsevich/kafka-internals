@@ -1,0 +1,232 @@
+<h1>II · 00 · The Operator's Mental Model</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">Before any runbook, any capacity formula, any tuning dial, you need a correct model of what a Kafka cluster <em>is</em> in KRaft 4.x — because nearly every production incident is a control loop that stopped converging, and you cannot diagnose a feedback loop you cannot name. This chapter assembles that model: the two kinds of node and what <code>process.roles</code> decides; the <strong>metadata plane</strong> (the controller quorum) versus the <strong>data plane</strong> (brokers) and the hard line of ownership between them; the five self-correcting control loops — broker heartbeats &amp; fencing, ISR maintenance, high-watermark advancement, metadata propagation, group rebalancing — each presented as something you <em>observe</em> rather than command; the five internal topics you implicitly operate and exactly what breaks when each one is unhealthy; the four SLIs that actually predict user pain and how to turn them into SLOs; and a one-screen map of "what can go wrong, where" that the remaining twelve chapters of Part II expand into detail. Every default and metric name here is pinned to the source file that defines it.</p>
+
+<h2>What you actually run: nodes, roles, and one process class</h2>
+
+<p>A KRaft cluster is a set of JVM processes, every one of which is constructed by the same class — <code>KafkaRaftServer</code> (<code>core/src/main/scala/kafka/server/KafkaRaftServer.scala:49</code>). That single class reads one decisive config, <code>process.roles</code> (<code>raft/src/main/java/org/apache/kafka/raft/KRaftConfigs.java:32</code>; it has <strong>no default</strong> — you must set it), and from it instantiates an <code>Option[BrokerServer]</code>, an <code>Option[ControllerServer]</code>, or both (<code>KafkaRaftServer.scala:76-90</code>). The legal role names are exactly two — <code>broker</code> and <code>controller</code> — enumerated in <code>server/src/main/java/org/apache/kafka/server/ProcessRole.java:21-22</code>. There is no third "ZooKeeper" thing to run: ZooKeeper was removed in 4.0, and this build has no migration path back to it.</p>
+
+<p>So the entire operational fleet decomposes into three deployment shapes of one process:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th><code>process.roles</code></th><th>What this node is</th><th>Runs (from <code>KafkaRaftServer</code>)</th><th>When to use</th></tr></thead>
+<tbody>
+<tr><td><code>broker</code></td><td>Data-plane node: holds partition replicas, serves produce/fetch.</td><td><code>BrokerServer</code> only (<code>:76</code>)</td><td>Production fleets of any size; brokers scale horizontally and independently of the quorum.</td></tr>
+<tr><td><code>controller</code></td><td>Metadata-plane node: a voter in the Raft quorum that owns cluster metadata.</td><td><code>ControllerServer</code> only (<code>:82</code>)</td><td>Dedicated controllers — the recommended shape for any cluster you care about; isolates metadata from data load.</td></tr>
+<tr><td><code>broker,controller</code></td><td>Combined ("co-located") node: both at once, sharing a JVM.</td><td>both <code>BrokerServer</code> + <code>ControllerServer</code> (<code>:76</code>,<code>:82</code>); detected by <code>isKRaftCombinedMode</code> (<code>KafkaConfig.scala:180-181</code>)</td><td>Dev, test, small/edge clusters. Avoid for large production: broker GC pauses and page-cache pressure can disrupt the controller in the same heap.</td></tr>
+</tbody></table></div>
+
+<p>Crucially, even a combined node holds <strong>exactly one</strong> <code>SharedServer</code> instance (<code>core/src/main/scala/kafka/server/SharedServer.scala:97</code>; its doc comment at <code>:86-95</code> states this explicitly). The <code>SharedServer</code> owns the components that the broker and controller halves both need: the <code>KafkaRaftManager</code> (the Raft client for the metadata log), the <code>MetadataLoader</code>, and the <code>SnapshotGenerator</code> (<code>SharedServer.scala:123-130</code>). This matters operationally: in combined mode you are not running two independent servers that happen to share a host — you are running two role-players over one Raft client and one metadata pipeline. A fault in metadata loading is fatal for a process that plays the controller role and merely logged-and-incremented for a pure broker (<code>SharedServer.scala:203-210</code>), which is the first hint that the two planes have very different blast radii.</p>
+
+<div class="callout key"><span class="callout-title">Rule of thumb · quorum sizing</span><p>Run <strong>3 controllers</strong> for a normal production cluster (tolerates 1 controller loss) or <strong>5</strong> for the largest/most critical (tolerates 2). The number must be odd — a Raft quorum needs a strict majority, so an even count gives no extra fault tolerance and wastes a node. Controllers do small, metadata-shaped work; you do <em>not</em> scale them with traffic. You scale <em>brokers</em> with traffic. Cross-link <a href="10-kraft-consensus.html">KRaft consensus</a> for the quorum mechanics and <a href="op09-topologies.html">Topologies</a> for placement.</p></div>
+
+<h2>Two planes, one hard line of ownership</h2>
+
+<p>The single most useful abstraction for operating KRaft is the split between the <strong>metadata plane</strong> and the <strong>data plane</strong>. They run different code, fail differently, are sized differently, and own strictly disjoint state. Confuse them and you will reach for the wrong runbook.</p>
+
+<figure class="diagram"><div class="dstack">
+  <div class="layer cat-control">
+    <div class="ln">Metadata plane — the controller quorum</div>
+    <div class="ld">A Raft cluster of <code>ControllerServer</code> voters. One is the <strong>active controller</strong> (leader); the rest are hot standbys replaying the same log. Owns the authoritative <em>cluster state</em>: topics, partitions, replica assignments, ISR membership, broker registrations &amp; liveness, configs, ACLs, quotas, feature levels. State lives in the <code>__cluster_metadata</code> log (single partition) and is published to brokers as a stream of records + periodic snapshots.</div>
+    <div class="row"><span class="chip">ControllerServer</span><span class="chip">QuorumController</span><span class="chip">KafkaRaftManager</span><span class="chip">__cluster_metadata-0</span></div>
+  </div>
+  <div class="sep">↕ replicate metadata log (Raft) · brokers <em>fetch</em> it, never write it</div>
+  <div class="layer cat-broker">
+    <div class="ln">Data plane — the brokers</div>
+    <div class="ld">A horizontally scaled set of <code>BrokerServer</code> nodes. Each is a <em>follower</em> of the metadata log and a <em>materializer</em> of the slice of cluster state that concerns it. Owns the <em>data</em>: partition replicas on local disk (and tiered object storage), the high-watermark per partition, the request-handling reactor, the group/transaction/share coordinators. Talks to the controller only to register, heartbeat, and propose ISR changes.</div>
+    <div class="row"><span class="chip">BrokerServer</span><span class="chip">ReplicaManager</span><span class="chip">LogManager</span><span class="chip">KRaftMetadataCache</span><span class="chip">partition logs on disk</span></div>
+  </div>
+</div><figcaption>The KRaft control/data split. The controller quorum is the single writer of cluster metadata; brokers are read-only consumers of that metadata and the sole owners of partition data.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>metadata plane (controller / quorum)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>data plane (brokers)</span>
+  <span class="lgi"><span class="mono">↕</span> metadata log replication (one direction of authority)</span>
+</div></figure>
+
+<p>The boundary is enforced in code, not convention. Brokers reach the controller through a <code>NodeToControllerChannelManager</code> for forwarding and for proposing changes (<code>BrokerServer.scala:254-264</code>), and they keep a read-optimized <code>KRaftMetadataCache</code> built by replaying the metadata log (<code>BrokerServer.scala:223</code>). A broker never mutates topic/partition/ISR state directly; it <em>asks</em>. Two concrete asks define almost everything an operator watches:</p>
+
+<ul>
+  <li><strong>Broker → controller liveness:</strong> the broker's <code>BrokerLifecycleManager</code> registers with the controller (per <span class="pill kip">KIP-631</span>) and sends periodic heartbeats (<code>server/src/main/java/org/apache/kafka/server/BrokerLifecycleManager.java:64-67</code>). The controller decides whether the broker is alive (unfenced) or dead (fenced).</li>
+  <li><strong>Broker → controller ISR proposals:</strong> when a partition leader wants to shrink or grow its in-sync set, it does not act unilaterally; it sends an <code>AlterPartition</code> request via the <code>AlterPartitionManager</code> (<code>BrokerServer.scala:305-310</code>) and the controller commits the new ISR to the metadata log. This is why ISR changes show up as controller-driven, log-ordered events.</li>
+</ul>
+
+<div class="callout rationale"><span class="callout-title">Why a single-writer metadata plane</span><p>In the ZooKeeper era, cluster metadata lived in ZK and controller failover meant re-reading <em>O(partitions)</em> of state — Confluent measured ~28 s for 100k partitions on Kafka 1.0.0, dropping to ~14 s on 1.1.0, and it stayed structurally linear, which is the real reason ZK capped clusters near ~200k partitions <em>(empirical; Confluent "200K Partitions" post)</em>. KRaft replaces that with a replicated log the standby controllers already hold in memory, so a new leader is current the instant it wins election. The lab demonstration — Confluent's 2,000,000-partition cluster, ~10× the ZK ceiling — is the headline, but the operational point is the <em>mechanism</em>: failover no longer reloads state <em>(empirical; Confluent KRaft docs / KIP-500)</em>. Do not over-read "millions of partitions" as a per-broker SLA — per-broker counts are still bounded by file descriptors, fetcher threads, and Linux <code>vm.max_map_count</code> (default 65,530, ~2 mmaps/partition ⇒ ~32k partitions/broker until raised) <em>(empirical; Instaclustr)</em>. See <a href="op02-limits.html">Limits</a> and <a href="op03-partitioning.html">Partitioning</a>.</p></div>
+
+<h2>The five control loops you observe (not command)</h2>
+
+<p>Kafka is not a request/response database you drive imperatively; it is a bundle of <strong>negative-feedback control loops</strong>, each continuously measuring an error and correcting toward a setpoint. Health is "all loops converging." Every page-worthy incident is a loop that has stopped converging — diverging, oscillating, or stuck. Learn the loops and the metrics fall out of them, because each loop's "error signal" is a metric you already have.</p>
+
+<figure class="diagram"><div class="dflow h">
+  <div class="node cat-control"><span class="nt">① Heartbeat &amp; fencing</span><span class="nd">setpoint: every broker alive ⇒ unfenced</span></div>
+  <div class="conn" data-label="drives"></div>
+  <div class="node cat-broker"><span class="nt">② ISR maintenance</span><span class="nd">setpoint: ISR = all caught-up replicas</span></div>
+  <div class="conn" data-label="drives"></div>
+  <div class="node cat-storage"><span class="nt">③ High-watermark advance</span><span class="nd">setpoint: HW = min(LEO over ISR)</span></div>
+  <div class="conn" data-label="enables"></div>
+  <div class="node cat-broker"><span class="nt">④ Metadata propagation</span><span class="nd">setpoint: broker cache = committed log</span></div>
+  <div class="conn" data-label="feeds"></div>
+  <div class="node cat-coord"><span class="nt">⑤ Group rebalancing</span><span class="nd">setpoint: every partition assigned once</span></div>
+</div><figcaption>The five control loops, roughly in dependency order: liveness gates membership, membership gates the ISR, the ISR gates the high-watermark (durability), metadata propagation distributes the resulting truth, and rebalancing keeps consumption matched to it.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>controller-owned loop</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker-owned loop</span>
+  <span class="lgi"><span class="sw cat-storage"></span>log/durability loop</span>
+  <span class="lgi"><span class="sw cat-coord"></span>coordinator loop</span>
+  <span class="lgi"><span class="arr"></span>dependency / drives</span>
+</div></figure>
+
+<h3>① Broker heartbeat &amp; fencing — the liveness loop</h3>
+<p>Each broker sends a <code>BrokerHeartbeat</code> to the active controller every <code>broker.heartbeat.interval.ms</code> = <strong>2000 ms</strong> (<code>KRaftConfigs.java:40</code>). The controller grants a lease that expires after <code>broker.session.timeout.ms</code> = <strong>9000 ms</strong> (<code>KRaftConfigs.java:44</code>) — its doc string literally reads "the length of time… that a broker lease lasts if no heartbeats are made." Miss heartbeats for the session window and the controller <strong>fences</strong> the broker: it stops being a valid leader/ISR member, and its leaderships migrate elsewhere. The broker's own state machine tracks this — <code>NOT_RUNNING(0) → STARTING(1) → RECOVERY(2) → RUNNING(3) → PENDING_CONTROLLED_SHUTDOWN(6) → SHUTTING_DOWN(7)</code> (<code>metadata/src/main/java/org/apache/kafka/metadata/BrokerState.java:47-80</code>) — and a freshly registered broker stays <em>fenced</em> until it has caught up on the metadata log and the controller transitions it from <code>RECOVERY</code> to <code>RUNNING</code> (the heartbeat-response handler logs exactly that on unfence, <code>BrokerLifecycleManager.java:665-666</code>). The loop's error signal: heartbeats not arriving. Operator-visible as the controller-side <code>TimedOutBrokerHeartbeatCount</code> and the <code>FencedBrokerCount</code> / <code>ActiveBrokerCount</code> gauges (<code>controller/.../metrics/ControllerMetadataMetrics.java:49,51</code>; <code>QuorumControllerMetrics.java:62</code>).</p>
+
+<div class="callout note"><span class="callout-title">Why 9000 over 2000</span><p>The 4.5× ratio between session timeout and heartbeat interval tolerates two consecutive missed heartbeats plus jitter before fencing — long enough to ride out a GC pause or a brief network blip, short enough that a genuinely dead broker is evicted in under ~10 s. This is the same design logic as a consumer's <code>session.timeout.ms ≈ 3 × heartbeat.interval.ms</code>. Do not set them equal; a single dropped packet would then fence a healthy broker. The interval also bounds how fast a fenced broker re-joins, because the broker re-heartbeats aggressively (it schedules the next heartbeat ~10 ms out after a fence-relevant response, <code>BrokerLifecycleManager.java:660</code>).</p></div>
+
+<h3>② ISR maintenance — the membership loop</h3>
+<p>For each partition, the leader maintains the <strong>in-sync replica set (ISR)</strong>: the replicas that have fetched up to (close to) the leader's log-end offset recently. A follower is dropped from the ISR if it hasn't caught up within <code>replica.lag.time.max.ms</code> = <strong>30000 ms</strong> (<code>server/src/main/java/org/apache/kafka/server/config/ReplicationConfigs.java:55</code>); when it catches up, it is re-added. Shrinks and expansions are committed through the controller (loop ①'s liveness gates who is even eligible). The error signal is the <em>gap</em> between the replica set and the ISR — surfaced as <code>UnderReplicatedPartitions</code> (<code>core/src/main/scala/kafka/server/ReplicaManager.scala:94,241</code>) and as the rates <code>IsrShrinksPerSec</code> / <code>IsrExpandsPerSec</code> (<code>:100,101</code>). In steady state both rates are zero; sustained shrinking with no matching expansion means a follower (or its disk/network) is falling behind, or a broker is down. Cross-link <a href="08-replication.html">Replication</a>.</p>
+
+<h3>③ High-watermark advancement — the durability loop</h3>
+<p>The <strong>high-watermark (HW)</strong> is the offset up to which a record is replicated to the whole current ISR and therefore safe to expose to consumers. It advances to the minimum log-end offset across the ISR. This is the loop that makes "committed" mean something: a producer with <code>acks=all</code> is told its write succeeded only once the HW (gated by <code>min.insync.replicas</code>) covers it. When the ISR shrinks, the HW advances <em>against fewer replicas</em> — faster, but less durable; that tradeoff is the entire reason <code>min.insync.replicas</code> exists, and why its default of <strong>1</strong> (<code>ServerLogConfigs.java:155</code>) is unsafe for durable topics. The operator levers here are covered in depth in <a href="op06-durability.html">Durability</a>; the loop's health is visible as <code>UnderMinIsrPartitionCount</code> and <code>AtMinIsrPartitionCount</code> (<code>ReplicaManager.scala:95,96,242,243</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant · the durability triad</span><p><code>replication.factor=3</code> + <code>min.insync.replicas=2</code> + producer <code>acks=all</code> makes any <em>single</em> broker failure non-data-losing: a write is acknowledged only after ≥2 replicas hold it, so the surviving replica always has every committed record. The compiled-in defaults do <em>not</em> give you this — <code>default.replication.factor</code> is <strong>1</strong> (<code>ReplicationConfigs.java:42</code>), <code>min.insync.replicas</code> is <strong>1</strong> (<code>ServerLogConfigs.java:155</code>), and <code>num.partitions</code> is <strong>1</strong> (<code>ServerLogConfigs.java:36</code>). You must set the triad explicitly. And note the silent trap: <code>min.insync.replicas</code> is capped by the actual replica count, so a topic with RF=1 still accepts writes even when the cluster default is 2 — <em>verify <code>min.insync.replicas ≤ replication.factor</code> per topic</em> <em>(empirical; Conduktor)</em>.</p></div>
+
+<h3>④ Metadata propagation — the truth-distribution loop</h3>
+<p>Once the controller commits a change (a new leader, an ISR update, a created topic), every broker must learn it. Brokers run a <code>MetadataLoader</code> that replays the committed metadata log and applies it to the local <code>KRaftMetadataCache</code> (<code>SharedServer.scala:326-334</code>, <code>BrokerServer.scala:223</code>). To keep replay bounded, the controller periodically snapshots: a new snapshot is generated after <code>metadata.log.max.record.bytes.between.snapshots</code> = <strong>20 MiB</strong> or <code>metadata.log.max.snapshot.interval.ms</code> = <strong>1 hour</strong>, whichever first (<code>raft/src/main/java/org/apache/kafka/raft/MetadataLogConfig.java:41,39</code>), and the active controller writes a no-op record every <code>metadata.max.idle.interval.ms</code> = <strong>500 ms</strong> so the committed offset keeps moving even when idle (<code>:76</code>). The error signal is <em>metadata lag</em>: how far a broker's applied offset trails the committed log. A broker that lags propagation routes clients to stale leaders. Cross-link <a href="12-metadata-propagation.html">Metadata Propagation</a>; controller-side progress is observable via <code>LastAppliedRecordOffset</code> / <code>LastCommittedRecordOffset</code> (<code>QuorumControllerMetrics.java:54,56</code>).</p>
+
+<h3>⑤ Group rebalancing — the consumption-matching loop</h3>
+<p>The <strong>group coordinator</strong> (a broker role, materialized over <code>__consumer_offsets</code>) keeps every partition of a subscribed topic assigned to exactly one consumer in a group. Members join, leave, time out, or fall behind; each change triggers a rebalance that recomputes the assignment. The setpoint is "each partition assigned once, no orphans, no double-consumption." The pathology is the <em>rebalance storm</em>: a member that exceeds <code>max.poll.interval.ms</code> (default 5 min) is evicted, rejoins, and triggers another rebalance — self-sustaining <em>(empirical; Conduktor/AWS)</em>. This loop is unique in that the actors are <em>clients</em> you may not control; see <a href="13-group-coordination.html">Group Coordination</a> and <a href="op07-failure-modes.html">Failure Modes</a>. The newer consumer-group protocol (<span class="pill kip">KIP-848</span>) moves assignment computation broker-side to damp these storms.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Loop</th><th>Setpoint</th><th>Error signal (metric)</th><th>Key tunable / default · source</th><th>Detail chapter</th></tr></thead>
+<tbody>
+<tr><td>① Heartbeat / fencing</td><td>alive broker ⇒ unfenced</td><td><code>FencedBrokerCount</code>, <code>TimedOutBrokerHeartbeatCount</code></td><td><code>broker.session.timeout.ms</code>=9000 · <code>KRaftConfigs.java:44</code></td><td><a href="11-kraft-controller.html">KRaft Controller</a></td></tr>
+<tr><td>② ISR maintenance</td><td>ISR = caught-up replicas</td><td><code>UnderReplicatedPartitions</code>, <code>IsrShrinksPerSec</code></td><td><code>replica.lag.time.max.ms</code>=30000 · <code>ReplicationConfigs.java:55</code></td><td><a href="08-replication.html">Replication</a></td></tr>
+<tr><td>③ HW advancement</td><td>HW = min LEO over ISR</td><td><code>UnderMinIsrPartitionCount</code>, <code>AtMinIsrPartitionCount</code></td><td><code>min.insync.replicas</code>=1 · <code>ServerLogConfigs.java:155</code></td><td><a href="op06-durability.html">Durability</a></td></tr>
+<tr><td>④ Metadata propagation</td><td>broker cache = committed log</td><td>metadata lag; <code>LastAppliedRecordOffset</code></td><td>snapshot @ 20 MiB / 1 h · <code>MetadataLogConfig.java:41,39</code></td><td><a href="12-metadata-propagation.html">Metadata Propagation</a></td></tr>
+<tr><td>⑤ Group rebalancing</td><td>each partition assigned once</td><td>rebalance rate; consumer lag</td><td><code>max.poll.interval.ms</code>=300000 (client)</td><td><a href="13-group-coordination.html">Group Coordination</a></td></tr>
+</tbody></table></div>
+
+<h2>The five internal topics you implicitly operate</h2>
+
+<p>You did not create them and you rarely name them, but five internal topics carry the cluster's nervous system. Four are ordinary (replicated, broker-hosted) topics whose names are hardcoded in <code>clients/src/main/java/org/apache/kafka/common/internals/Topic.java:27-30</code> plus the tiered-storage metadata topic in <code>storage/.../TopicBasedRemoteLogMetadataManagerConfig.java:44</code>; one — <code>__cluster_metadata</code> — is special and is <em>not</em> a normal topic at all but the Raft metadata log itself. Know each one's defaults and, more importantly, its <strong>failure blast radius</strong>.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Internal topic</th><th>Owner plane</th><th>Default partitions · RF · min ISR</th><th>Source</th><th>If it is unhealthy…</th></tr></thead>
+<tbody>
+<tr><td><code>__cluster_metadata</code></td><td>metadata (Raft log, <strong>not</strong> a managed topic)</td><td><strong>1 partition</strong> (fixed); replicated by the controller quorum</td><td><code>Topic.java:30-34</code>; partition 0 is <code>CLUSTER_METADATA_TOPIC_PARTITION</code></td><td><strong>Cluster-wide outage of the control plane.</strong> No leader elections, no topic creation, no config/ISR changes commit. Existing partitions keep serving from cache, but the cluster cannot react to any change. This is the one topic whose loss is catastrophic.</td></tr>
+<tr><td><code>__consumer_offsets</code></td><td>data (group coordinator)</td><td><strong>50</strong> · <strong>3</strong> · (inherits broker <code>min.insync.replicas</code>)</td><td><code>GroupCoordinatorConfig.java:115,124</code></td><td>Consumer groups cannot commit or load offsets. On coordinator loss, affected groups stall and rebalance; committed positions for a lost partition may be unreadable, risking re-processing or skipped messages. Producers/consumers of <em>user</em> topics keep flowing until they need to commit.</td></tr>
+<tr><td><code>__transaction_state</code></td><td>data (transaction coordinator)</td><td><strong>50</strong> · <strong>3</strong> · <strong>2</strong></td><td><code>TransactionLogConfig.java:32,40,45</code></td><td>EOS/transactional producers cannot begin, commit, or abort. In-flight transactions hang; with hung transactions the <em>last stable offset</em> stalls and <code>read_committed</code> consumers block on that partition (see <code>PartitionsWithLateTransactionsCount</code>). Non-transactional traffic is unaffected.</td></tr>
+<tr><td><code>__share_group_state</code></td><td>data (share coordinator, <span class="pill kip">KIP-932</span>)</td><td><strong>50</strong> · <strong>3</strong></td><td><code>ShareCoordinatorConfig.java:38,42</code></td><td>Share groups (queue-style consumption) cannot persist per-record acknowledgement state. Share-group delivery stalls; classic consumer groups and producers are unaffected. Only relevant if you use share groups.</td></tr>
+<tr><td><code>__remote_log_metadata</code></td><td>data (tiered storage, <span class="pill kip">KIP-405</span>)</td><td><strong>50</strong> · <strong>3</strong> · <strong>2</strong></td><td><code>TopicBasedRemoteLogMetadataManagerConfig.java:54,56,57</code></td><td>Tiered-storage metadata (which segments are in object storage) cannot be read/written. Fetches that must reach remote segments fail or stall; local (hot) data still serves. Only present when tiered storage is enabled.</td></tr>
+</tbody></table></div>
+
+<div class="callout warning"><span class="callout-title">Warning · the coordinator topics are RF=3 for a reason — do not under-replicate them</span><p>All four managed internal topics default to <strong>RF 3</strong>, and the transaction and remote-log-metadata topics default to <strong>min ISR 2</strong> (sources above). On a cluster with fewer than 3 brokers the offsets/transaction topics will be created with whatever RF is available, silently weakening durability of the very state that coordinates everyone else. The classic production incident: a 3-broker cluster created <code>__consumer_offsets</code> at RF=3, one broker is lost long-term, an offsets partition goes under-min-ISR, and every group whose coordinator maps to it stalls — an outage that has nothing to do with user-topic configuration. Treat the internal topics as first-class: verify their RF and ISR after any cluster resize, and keep ≥3 brokers before relying on RF=3. Cross-link <a href="op08-metrics-signals.html">Metrics &amp; Signals</a>.</p></div>
+
+<h2>The four SLIs that predict user pain</h2>
+
+<p>You can collect hundreds of Kafka metrics; only four <em>service-level indicators</em> directly track what a producer or consumer experiences. Everything else is a cause or a leading indicator of one of these. Define your SLOs on these four and let the rest be diagnostics.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>SLI</th><th>What the user feels</th><th>Primary signals (source)</th><th>Example SLO (set yours to workload)</th></tr></thead>
+<tbody>
+<tr><td><strong>Availability</strong> (write/read acceptance)</td><td>"Can I produce/consume right now?"</td><td><code>OfflinePartitionsCount</code>=0 (<code>ControllerMetadataMetrics.java:62</code>); <code>UnderMinIsrPartitionCount</code>=0 (<code>ReplicaManager.scala:95</code>); <code>ActiveControllerCount</code> sums to 1 (<code>QuorumControllerMetrics.java:46</code>)</td><td>99.95% of produce requests to RF≥3 topics succeed (non-throttled) per 30-day window.</td></tr>
+<tr><td><strong>Durability</strong> (no acknowledged-write loss)</td><td>"Did my committed data survive a failure?"</td><td><code>UncleanLeaderElectionsPerSec</code>=0 (any non-zero = loss); <code>UnderMinIsrPartitionCount</code>; durability triad in force</td><td>0 unclean leader elections; 100% of <code>acks=all</code> writes retained across single-broker loss.</td></tr>
+<tr><td><strong>End-to-end latency</strong> (produce→consume)</td><td>"How fresh is the data I read?"</td><td>broker <code>RequestMetrics TotalTimeMs</code> p99 (produce/fetch); client produce/fetch latency; e2e probe</td><td>p99 produce ack &lt; 50 ms; p99 e2e (produce→consume) &lt; 200 ms for the hot path.</td></tr>
+<tr><td><strong>Consumer lag</strong> (backlog age)</td><td>"How far behind is my pipeline?"</td><td>client <code>records-lag-max</code>; external trend monitor (Burrow / exporter); alert on <em>trend</em>, not a static count</td><td>Lag for tier-1 groups drains within 5 min of a spike; sustained growth over 15 min pages.</td></tr>
+</tbody></table></div>
+
+<div class="callout key"><span class="callout-title">Turning SLIs into SLOs — three rules</span><p><strong>(1) Latency and lag are <em>distributions and trends</em>, never single thresholds.</strong> Alert latency on p99 over a window; alert lag on sustained growth (recovery time ≈ current lag ÷ net drain rate), because a healthy consumer that briefly spikes is fine and a dead consumer reports <em>no</em> lag at all — only an external monitor catches the stalled group <em>(empirical; LinkedIn Burrow)</em>. <strong>(2) Availability and durability are near-binary — page on &gt;0.</strong> <code>OfflinePartitionsCount</code>, <code>UnderMinIsrPartitionCount</code>, and <code>UncleanLeaderElectionsPerSec</code> should be zero in a healthy cluster; any sustained non-zero is user-visible <em>(empirical; Confluent/Datadog/AWS MSK)</em>. <strong>(3) Aggregate controller gauges with SUM.</strong> <code>ActiveControllerCount</code> is 0 or 1 <em>per node</em>; the cluster is healthy iff the sum is exactly 1 — sum 0 means no controller (critical), sum &gt;1 means split-brain. Datadog's rule: alert on any value lasting longer than one second <em>(empirical; Datadog)</em>.</p></div>
+
+<h2>One screen: what can go wrong, where</h2>
+
+<p>This is the map the rest of Part II fills in. Read it as a triage tree: a symptom at the top, the plane and loop it implicates, and the chapter that holds the runbook. The discipline is to <em>localize to a plane and a loop first</em> — control-plane problems and data-plane problems demand different responses, and within the data plane a durability problem and a latency problem have different fixes.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">symptom observed</span><span class="nd">SLI breached or alert fired</span></div>
+  <div class="conn" data-label="which plane?"></div>
+  <div class="node cat-control decision">control plane or data plane?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-err" data-label="control plane"></div>
+      <div class="node cat-control"><span class="nt">ActiveControllerCount ≠ 1</span><span class="nd">no/duplicate controller; metadata frozen</span></div>
+      <div class="conn dashed" data-label="also"></div>
+      <div class="node cat-control"><span class="nt">quorum can't elect</span><span class="nd">&lt; majority of controllers up</span></div>
+      <div class="conn dashed" data-label="also"></div>
+      <div class="node cat-control"><span class="nt">metadata lag rising</span><span class="nd">brokers route to stale leaders</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="data plane"></div>
+      <div class="node cat-broker decision">durability, availability, or latency?</div>
+      <div class="row">
+        <div class="col">
+          <div class="conn ec-err" data-label="durability/avail"></div>
+          <div class="node cat-error"><span class="nt">OfflinePartitions &gt; 0</span><span class="nd">no leader → unavailable</span></div>
+          <div class="conn dashed"></div>
+          <div class="node cat-error"><span class="nt">UnderMinIsr &gt; 0</span><span class="nd">acks=all rejected</span></div>
+          <div class="conn dashed"></div>
+          <div class="node cat-error"><span class="nt">UncleanLeaderElection &gt; 0</span><span class="nd">committed data lost</span></div>
+        </div>
+        <div class="col">
+          <div class="conn" data-label="latency/lag"></div>
+          <div class="node cat-storage"><span class="nt">disk full / slow</span><span class="nd">high LocalTimeMs; broker halts at 0 free</span></div>
+          <div class="conn dashed"></div>
+          <div class="node cat-broker"><span class="nt">handler/network saturation</span><span class="nd">idle% &lt; 30%</span></div>
+          <div class="conn dashed"></div>
+          <div class="node cat-coord"><span class="nt">rebalance storm / hot partition</span><span class="nd">lag grows; one partition skewed</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>The "what can go wrong, where" triage map. Localize to plane first (control vs data), then to the loop. Each leaf is expanded in a later Part II chapter.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>control-plane fault (quorum/controller)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>data-plane node fault</span>
+  <span class="lgi"><span class="sw cat-storage"></span>storage/disk fault</span>
+  <span class="lgi"><span class="sw cat-coord"></span>coordinator/client fault</span>
+  <span class="lgi"><span class="sw cat-error"></span>availability / data-loss fault</span>
+  <span class="lgi"><span class="arr dashed"></span>sibling symptom (same class)</span>
+</div></figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Symptom</th><th>Plane · loop</th><th>Likely root cause</th><th>Where it's expanded</th></tr></thead>
+<tbody>
+<tr><td><code>ActiveControllerCount</code> sum = 0</td><td>control · —</td><td>Quorum lost majority; controllers down or partitioned.</td><td><a href="op07-failure-modes.html">Failure Modes</a>, <a href="10-kraft-consensus.html">KRaft Consensus</a></td></tr>
+<tr><td>Metadata lag climbing on a broker</td><td>control→data · ④</td><td>Broker can't keep up replaying the metadata log; GC, disk, or network on that node.</td><td><a href="12-metadata-propagation.html">Metadata Propagation</a></td></tr>
+<tr><td><code>OfflinePartitionsCount</code> &gt; 0</td><td>data · ②③</td><td>Partition has no leader: all replicas down, or sole in-sync replica lost.</td><td><a href="op07-failure-modes.html">Failure Modes</a></td></tr>
+<tr><td><code>UnderReplicatedPartitions</code> &gt; 0, all brokers up</td><td>data · ②</td><td>Slow follower — disk I/O, network, or GC on one node; not a broker-down event.</td><td><a href="08-replication.html">Replication</a>, <a href="op05-performance-tuning.html">Performance Tuning</a></td></tr>
+<tr><td><code>UnderMinIsrPartitionCount</code> &gt; 0</td><td>data · ③</td><td>ISR fell below <code>min.insync.replicas</code>; <code>acks=all</code> producers get <code>NotEnoughReplicas</code>.</td><td><a href="op06-durability.html">Durability</a></td></tr>
+<tr><td><code>UncleanLeaderElectionsPerSec</code> &gt; 0</td><td>data · ③</td><td>An out-of-sync replica was elected leader (only if you enabled it) → committed data truncated.</td><td><a href="op06-durability.html">Durability</a></td></tr>
+<tr><td>Disk approaching full; broker halts</td><td>data · storage</td><td>Retention not keeping up with ingest; a full log dir crashes the broker without graceful shutdown.</td><td><a href="op04-capacity-planning.html">Capacity Planning</a>, <a href="04-storage-management.html">Storage Management</a></td></tr>
+<tr><td>Handler/network idle% &lt; 30%</td><td>data · —</td><td>Request-thread or reactor saturation; under-provisioned or hot-spotted broker.</td><td><a href="op05-performance-tuning.html">Performance Tuning</a>, <a href="06-network-and-threading.html">Network &amp; Threading</a></td></tr>
+<tr><td>Consumer lag growing; one partition hot</td><td>data · ⑤</td><td>Skewed key, slow consumer processing, or rebalance storm.</td><td><a href="op03-partitioning.html">Partitioning</a>, <a href="13-group-coordination.html">Group Coordination</a></td></tr>
+<tr><td><code>PartitionsWithLateTransactionsCount</code> &gt; 0; <code>read_committed</code> stalled</td><td>data · —</td><td>Hung transaction pins the last stable offset.</td><td><a href="14-transactions-eos.html">Transactions &amp; EOS</a>, <a href="op07-failure-modes.html">Failure Modes</a></td></tr>
+</tbody></table></div>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha · "constant" vs "fluctuating" under-replication mean opposite things</span><p>A <em>steady, constant</em> <code>UnderReplicatedPartitions</code> with one broker absent is almost always "broker down" — fix the node. A <em>fluctuating</em> URP while all brokers are up is a <em>performance</em> problem — a follower repeatedly drops out and rejoins because its disk, NIC, or GC can't keep pace with the leader's write rate <em>(empirical; oneuptime)</em>. Same metric, two root causes, two completely different runbooks. Always correlate URP with broker liveness (loop ①) before acting, and watch <code>IsrShrinksPerSec</code>/<code>IsrExpandsPerSec</code> — a shrink with no matching expand is the fingerprint of a follower that fell behind and stayed behind.</p></div>
+
+<h2>Operator actions vs. emergent behaviour</h2>
+
+<p>A final framing that prevents a lot of grief: distinguish the handful of things an operator <em>commands</em> from the vast majority that the cluster <em>does on its own</em>. You issue a small set of imperative actions; the control loops above produce everything else as emergent behaviour. Reaching for an imperative action when a loop is mid-correction is how operators turn incidents into outages.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>You command (imperative)</th><th>Mechanism / config · source</th><th>The loops then do (emergent)</th></tr></thead>
+<tbody>
+<tr><td>Start / format a node</td><td><code>process.roles</code>, <code>node.id</code>, <code>controller.quorum.bootstrap.servers</code>; metadata dir <code>metadata.log.dir</code> (<code>MetadataLogConfig.java:34</code>)</td><td>Registration (KIP-631), catch-up on metadata, unfence, leadership assignment.</td></tr>
+<tr><td>Graceful shutdown for maintenance</td><td><code>controlled.shutdown.enable</code>=<strong>true</strong> (<code>ServerConfigs.java:97</code>); broker enters <code>PENDING_CONTROLLED_SHUTDOWN</code></td><td>Controller migrates leaderships off the broker <em>before</em> it stops, so no partition goes leaderless. Why you rolling-restart one broker at a time.</td></tr>
+<tr><td>Create / configure a topic</td><td>Admin API → controller commits to <code>__cluster_metadata</code></td><td>Replica placement, leader election, metadata propagation to all brokers (loop ④), then clients discover it.</td></tr>
+<tr><td>Reassign partitions / rebalance data</td><td><code>kafka-reassign-partitions.sh</code> → controller <code>AlterPartitionReassignments</code></td><td>New replicas catch up (loop ②), join ISR, old replicas drop; throttle to protect the durability/latency SLIs.</td></tr>
+<tr><td>Change quorum membership</td><td>Dynamic quorum (<code>controller.quorum.bootstrap.servers</code>) vs static <code>controller.quorum.voters</code> (<code>QuorumConfig.java:58,67</code>)</td><td>Raft adds/removes a voter and re-replicates; majority must stay live throughout.</td></tr>
+</tbody></table></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant · controlled shutdown is the whole reason you can do rolling restarts</span><p>With <code>controlled.shutdown.enable=true</code> (the default), a broker asked to stop first transitions to <code>PENDING_CONTROLLED_SHUTDOWN</code> (<code>BrokerState.java:70</code>) and the controller moves its partition leaderships to other in-sync replicas before the process exits. That is why a <em>planned</em> single-broker restart causes no leaderless partitions while an <em>unplanned</em> crash does (the controller only learns it's gone after the 9 s session timeout). The operational consequence is concrete: restart brokers <strong>one at a time</strong>, wait for <code>UnderReplicatedPartitions</code> to return to 0 between each, and never restart two replicas of the same partition inside one <code>replica.lag.time.max.ms</code> window — the durability triad only protects you if at least <code>min.insync.replicas</code> replicas are continuously up. See <a href="op12-lifecycle.html">Lifecycle</a>.</p></div>
+
+<h2>Where to go from here</h2>
+<p>This chapter is the index to Part II. The model — two planes, five loops, five internal topics, four SLIs, one failure map — is the lens every later chapter assumes. From here: <a href="op01-configuration.html">Configuration</a> (the dials and how they're applied), <a href="op02-limits.html">Limits</a> (hard constants vs soft configs vs emergent bounds), <a href="op03-partitioning.html">Partitioning</a> and <a href="op04-capacity-planning.html">Capacity Planning</a> (sizing the data plane), <a href="op05-performance-tuning.html">Performance Tuning</a> and <a href="op06-durability.html">Durability</a> (the throughput/latency/durability triangle), <a href="op07-failure-modes.html">Failure Modes</a> and <a href="op08-metrics-signals.html">Metrics &amp; Signals</a> (the runbooks and the signals that trigger them), <a href="op09-topologies.html">Topologies</a> and <a href="op10-cost.html">Cost</a> (placement and the cloud bill), and <a href="op11-scaling-scenarios.html">Scaling Scenarios</a> and <a href="op12-lifecycle.html">Lifecycle</a> (what changes as you grow and how to operate the cluster over time). For the mechanisms beneath the loops, the Part I chapters are cross-linked throughout — start with <a href="00-overview.html">Overview</a> and <a href="10-kraft-consensus.html">KRaft Consensus</a>.</p>
+
+<h2>KIPs referenced</h2>
+<ul>
+  <li><span class="pill kip">KIP-500</span> Replaced ZooKeeper with the self-managed KRaft metadata quorum — the foundation of the metadata-plane / data-plane split in this build.</li>
+  <li><span class="pill kip">KIP-631</span> The KRaft controller's broker-lifecycle protocol: registration, heartbeats, fencing — control loop ① (<code>BrokerLifecycleManager.java:64-67</code>).</li>
+  <li><span class="pill kip">KIP-405</span> Tiered storage; introduces the <code>__remote_log_metadata</code> internal topic (<code>TopicBasedRemoteLogMetadataManagerConfig.java:44</code>).</li>
+  <li><span class="pill kip">KIP-848</span> The new (server-side) consumer group protocol — damps the rebalance-storm pathology of control loop ⑤.</li>
+  <li><span class="pill kip">KIP-932</span> Share groups (queue-style consumption); introduces <code>__share_group_state</code> (<code>ShareCoordinatorConfig.java:38</code>).</li>
+</ul>

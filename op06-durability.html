@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Durability, Availability &amp; Consistency · Kafka Internals</title>
+<meta name="description" content="acks, min.insync.replicas, RF, unclean election, the replication-not-fsync philosophy, ELR.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="op06-durability">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>II · 06 · Durability, Availability &amp; Consistency</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">Durability in Kafka is not a single switch; it is the product of three dials that live in three different places — <code>acks</code> on the producer (the durability <em>request</em>), <code>min.insync.replicas</code> on the broker (the durability <em>enforcement</em>), and <code>replication.factor</code> on the topic (the <em>redundancy</em>). Get the relationship between them right and a single broker loss costs you zero acknowledged data while writes keep flowing; get it wrong and you have either a cluster that stops accepting writes the moment one follower hiccups, or — worse, and silently — a topic that acknowledges writes it cannot survive. This chapter derives the canonical <strong>RF=3 / min.insync.replicas=2 / acks=all</strong> standard from the actual enforcement code, explains why Kafka deliberately does <em>not</em> fsync each message (and what that means for where your replicas must physically sit), maps the availability-vs-durability dial that is unclean leader election, and closes with the arithmetic of data-loss probability and where Kafka sits on the CAP plane. Every default and limit here is read from the 4.4 source; every benchmark is marked empirical and cited.</p>
+
+<h2>The three dials and where each one lives</h2>
+
+<p>Operators routinely conflate these because they all sound like "how durable is my topic." They are mechanically distinct, evaluated at different times, by different components, and a misconfiguration of any one is invisible until the failure that exercises it. Hold this table before touching anything.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Dial</th><th>Config key / default</th><th>Owned by</th><th>What it controls</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>Durability <strong>request</strong></td><td><code>acks</code> = <code>all</code> <span class="pill">producer default</span></td><td>Producer</td><td>How many replicas must confirm before the producer treats a write as done (<code>0</code> / <code>1</code> / <code>all</code>)</td><td><code>clients/.../producer/ProducerConfig.java:405</code></td></tr>
+<tr><td>Durability <strong>enforcement</strong></td><td><code>min.insync.replicas</code> = <code>1</code></td><td>Broker (partition leader)</td><td>Minimum ISR size below which an <code>acks=all</code> write is <em>refused</em></td><td><code>server-common/.../ServerLogConfigs.java:155</code></td></tr>
+<tr><td><strong>Redundancy</strong></td><td><code>default.replication.factor</code> = <code>1</code></td><td>Topic (set at create time)</td><td>How many copies of each partition exist on distinct brokers</td><td><code>server/.../ReplicationConfigs.java:42</code></td></tr>
+<tr><td>Availability vs durability <strong>last resort</strong></td><td><code>unclean.leader.election.enable</code> = <code>false</code></td><td>Topic / broker</td><td>May an out-of-sync replica become leader (accepting possible data loss) when all ISR is down</td><td><code>storage/.../LogConfig.java:139</code></td></tr>
+</tbody>
+</table></div>
+
+<div class="callout warning"><span class="callout-title">The two defaults that ship unsafe</span><p>Both <code>min.insync.replicas</code> and <code>default.replication.factor</code> default to <strong>1</strong> in the broker/controller configuration. A topic created with no explicit overrides therefore has <em>one</em> replica and accepts <code>acks=all</code> writes with an ISR of one — i.e. no durability guarantee at all beyond a single disk. The producer default <em>is</em> the safe one (<code>acks=all</code>), but a safe request against an RF=1 topic is still a single point of failure. Durability is something you must configure <em>up</em>, per topic, not something the defaults give you. See <a href="op01-configuration.html">II · 01 Configuration</a> for setting cluster-wide safe baselines.</p></div>
+
+<figure class="diagram">
+<div class="dstack">
+<div class="layer cat-client"><div class="ln">Producer — the request</div><div class="ld"><code>acks=0</code> fire-and-forget · <code>acks=1</code> leader-only · <code>acks=all</code> full ISR</div><div class="row"><span class="chip">ProducerConfig.java:405</span></div></div>
+<div class="sep">↓ ProduceRequest</div>
+<div class="layer cat-broker"><div class="ln">Leader — the enforcement</div><div class="ld">if <code>acks=all</code> and <code>|ISR| &lt; effectiveMinIsr</code> → reject with <code>NotEnoughReplicasException</code> <em>before</em> appending</div><div class="row"><span class="chip">Partition.scala:1234</span></div></div>
+<div class="sep">↓ replicate to followers in ISR</div>
+<div class="layer cat-storage"><div class="ln">ISR replicas — the redundancy</div><div class="ld">HW only advances once every ISR member has the record; record invisible to consumers until then</div><div class="row"><span class="chip">RF on N distinct brokers</span></div></div>
+</div>
+<figcaption>The three dials act at three stages of one produce. The request is what the client asks for; the enforcement is the broker's veto; the redundancy is the physical copies that make the guarantee real.</figcaption>
+<div class="legend"><span class="sw cat-client"></span> producer/client · <span class="sw cat-broker"></span> leader broker · <span class="sw cat-storage"></span> log/replica copies · <span class="mono">monospace</span> = config key or source citation</div>
+</figure>
+
+<h3>acks — what the producer is willing to wait for</h3>
+
+<p>The <code>acks</code> config is defined with three legal values and a default of <code>"all"</code> (<code>ProducerConfig.java:405</code>, validator <code>in("all","-1","0","1")</code>). Its own documentation states the contract precisely (<code>ProducerConfig.java:131</code>): with <code>acks=1</code> "should the leader fail immediately after acknowledging the record but before the followers have replicated it then the record will be lost"; with <code>acks=all</code> "the leader will wait for the full set of in-sync replicas to acknowledge … This guarantees that the record will not be lost as long as at least one in-sync replica remains alive." Note the exact words: <strong>the full set of in-sync replicas</strong>, not <code>min.insync.replicas</code> of them. If RF=3 and all three are in the ISR, all three must ack — <code>min.insync.replicas</code> is the floor that gates whether the write is <em>allowed</em>, not a quorum count that lets the leader stop early.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th><code>acks</code></th><th>Producer waits for</th><th>Loss window</th><th>Latency cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>0</code></td><td>Nothing — record into socket buffer, offset returned as <code>-1</code></td><td>Any broker/network blip loses in-flight records; retries don't apply</td><td>Lowest</td><td>Metrics, logs, lossy telemetry where a dropped record is free</td></tr>
+<tr><td><code>1</code></td><td>Leader's local write only</td><td>Leader dies after ack, before followers fetch → record lost</td><td>One leader write</td><td>Throughput-sensitive, single-failure-tolerant pipelines</td></tr>
+<tr><td><code>all</code> / <code>-1</code></td><td>Every replica currently in the ISR</td><td>Only if every ISR replica loses unflushed data simultaneously (see flush philosophy)</td><td>One replication round-trip to the slowest ISR follower</td><td>Anything you cannot lose; the durable default</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout rationale"><span class="callout-title">Why <code>acks=all</code> alone is not enough</span><p><code>acks=all</code> says "wait for the full ISR." But the ISR can legitimately shrink to <strong>one</strong> member (just the leader) when followers fall behind — and an <code>acks=all</code> write to a single-member ISR is acknowledged after only the leader has it. That is <em>not</em> a durable write, yet the producer got its success. The dial that closes this hole is <code>min.insync.replicas</code>: it sets the floor on ISR size, below which the leader refuses the write entirely rather than acking a write that only one broker holds. <code>acks=all</code> and <code>min.insync.replicas≥2</code> are a <em>pair</em>; neither delivers durability without the other. This mechanism is detailed in <a href="08-replication.html">Part I · 08 Replication</a>.</p></div>
+
+<h3>min.insync.replicas — the broker's veto, enforced before the write</h3>
+
+<p>This is the single most important durability mechanism to understand at the code level, because its timing is what makes it a guarantee rather than a hope. In <code>appendRecordsToLeader</code>, <em>before</em> the leader appends anything to its own log, it computes the effective minimum ISR and checks the current ISR size (<code>Partition.scala:1230–1238</code>):</p>
+
+<pre><code>val minIsr = effectiveMinIsr(leaderLog)
+val inSyncSize = partitionState.isr.size
+// Avoid writing to leader if there are not enough insync replicas to make it safe
+if (inSyncSize &lt; minIsr &amp;&amp; requiredAcks == -1) {
+  throw new NotEnoughReplicasException(...)
+}</code></pre>
+
+<p>Three operationally critical facts fall out of this:</p>
+<ul>
+<li><strong>The check is pre-write.</strong> When the ISR has already shrunk below the floor, the leader does not append-then-fail; it rejects the produce with <code>NotEnoughReplicasException</code> and the record never enters the log. There is no partial state to clean up. (If the ISR shrinks <em>after</em> the append is in purgatory, the completion path instead returns <code>NotEnoughReplicasAfterAppend</code> — <code>Partition.scala:977</code>.)</li>
+<li><strong>The gate is <code>acks=all</code> only.</strong> The condition is <code>requiredAcks == -1</code>. With <code>acks=1</code> or <code>0</code>, <code>min.insync.replicas</code> is <em>ignored</em> — the leader writes regardless of ISR size. <code>min.insync.replicas</code> is meaningless unless the producer also asks for <code>acks=all</code>. This is why the two must be configured together.</li>
+<li><strong>The value is silently capped to RF.</strong> <code>effectiveMinIsr</code> returns <code>min(configured min.insync.replicas, RF)</code> (<code>Partition.scala:246–248</code>: <code>leaderLog.config.minInSyncReplicas.min(remoteReplicasMap.size + 1)</code>). Set <code>min.insync.replicas=2</code> on an RF=1 topic and the effective floor becomes <strong>1</strong> — the topic happily accepts <code>acks=all</code> writes with one replica, giving you no durability while you believe you configured some. Always verify <code>min.insync.replicas ≤ replication.factor</code> per topic (Conduktor's "silent <code>min.insync.replicas</code> trap", empirical).</li>
+</ul>
+
+<p>The same floor governs <strong>consumer visibility</strong>. The high-watermark — the boundary below which records are readable by consumers — can only advance when the ISR is at or above the effective minimum. In <code>maybeIncrementLeaderHW</code> (<code>Partition.scala:1010–1014</code>): <code>if (isUnderMinIsr) { return false }</code>. So when a partition is under min-ISR, not only are new <code>acks=all</code> writes refused, the HW is <em>frozen</em>: already-replicated-but-not-yet-committed records stay invisible until the ISR heals. The config's own doc spells this out (<code>TopicConfig.java:198</code>): "the messages will not be visible to the consumers until they are replicated to all in-sync replicas and the <code>min.insync.replicas</code> condition is met." The HW machinery is the subject of <a href="09-fetch-path.html">Part I · 09 Fetch Path</a>.</p>
+
+<figure class="diagram"><div class="logstrip">
+<div class="ls-head"><span class="ttl">partition (RF=3, min.insync.replicas=2)</span><span class="append">→</span></div>
+<div class="cells">
+<div class="cell committed">100</div>
+<div class="cell committed">101</div>
+<div class="cell committed">102<span class="tag hw">HW</span></div>
+<div class="cell next">103</div>
+<div class="cell next">104<span class="tag leo">LEO</span></div>
+</div>
+</div>
+<figcaption>Leader LEO is 104, but ISR has just dropped to {leader} only. HW stays pinned at 102 (last offset all-ISR-acknowledged): offsets 103–104 are written on the leader but invisible to consumers, and new <code>acks=all</code> writes are now refused with <code>NotEnoughReplicasException</code> until a follower rejoins and lifts ISR back to 2.</figcaption>
+<div class="legend"><span class="mono">HW</span> = high-watermark, consumer-visible boundary · <span class="mono">LEO</span> = log-end offset, leader's newest record · green = committed/replicated, amber = appended-but-uncommitted</div>
+</figure>
+
+<h3>replication.factor — the redundancy that makes the guarantee physical</h3>
+
+<p>RF is set per topic at creation time and is the number of copies on distinct brokers; it is the only one of the three dials that is genuinely hard to change after the fact (it requires a partition reassignment — see <a href="op12-lifecycle.html">II · 12 Lifecycle</a>). The placement of those copies is the controller's job, performed by the <code>StripedReplicaPlacer</code> (<code>metadata/.../placement/StripedReplicaPlacer.java</code>), which we return to under rack awareness. One hard constraint is worth stating now, because it is compiled into the placer's contract: <strong>you cannot place two replicas of one partition on the same broker</strong> (<code>StripedReplicaPlacer.java:61–64</code>: "we can't place more than one replica on the same broker. This imposes an upper limit on replication factor — for example, a 3-node cluster can't have any topics with replication factor 4"). RF is therefore bounded above by your broker count, and any RF you choose consumes one broker's worth of placement per replica.</p>
+
+<h2>Deriving the standard: RF=3, min.insync.replicas=2, acks=all</h2>
+
+<p>This triad is the industry-standard durable-and-available baseline (Conduktor, Datadog, AWS MSK, all empirical). It is not folklore — it is the unique point that satisfies two requirements at once: <strong>survive the loss of one in-sync broker with zero acknowledged-data loss</strong>, <em>and</em> <strong>keep accepting writes through that loss</strong>. Walk the arithmetic.</p>
+
+<div class="callout key"><span class="callout-title">The headroom equation</span>
+<p>Three quantities drive every number in this section. Name them before using them:</p>
+<dl class="assume">
+<dt><code>RF</code> — replication factor</dt><dd>copies of each partition on distinct brokers; a per-topic <em>config</em> you choose. Worked example uses <strong>RF = 3</strong>. <span class="pill">config</span> (<code>default.replication.factor</code> default <strong>1</strong>, <code>ReplicationConfigs.java:42</code> — you must raise it)</dd>
+<dt><code>M</code> — <code>min.insync.replicas</code></dt><dd>floor on ISR size below which an <code>acks=all</code> write is refused; a per-topic <em>config</em>. Worked example uses <strong>M = 2</strong>. <span class="pill">config</span> (default <strong>1</strong>, <code>ServerLogConfigs.java:155</code>)</dd>
+<dt><code>k</code> — in-sync brokers lost</dt><dd>how many of a partition's ISR members are simultaneously down; the <em>failure scenario</em> we solve for, not a config. <span class="pill">scenario</span></dd>
+</dl>
+<p>After losing <em>k</em> in-sync brokers the surviving ISR size is <code>RF − k</code> replicas. To keep accepting <code>acks=all</code> writes that surviving count must still meet the floor, so the write-availability condition is:</p>
+<p style="text-align:center"><code>RF − k ≥ M</code>  &nbsp;⟺&nbsp;  <code>k ≤ RF − M</code> brokers</p>
+<p>Substituting the worked-example values (RF = 3, M = 2): one loss gives <code>RF − k = 3 − 1 = 2 replicas ≥ M = 2</code> ✓ — you survive one loss and still write. A second loss gives <code>RF − k = 3 − 2 = 1 replica &lt; M = 2</code> ✗, so writes correctly stop (the broker refuses rather than risk a single-copy ack). The maximum tolerable loss is therefore <code>k ≤ RF − M = 3 − 2 = 1 broker</code>. That gap <code>RF − M</code> is your <strong>availability headroom</strong>: the number of ISR members you can lose and still produce. RF=3/M=2 buys <code>3 − 2 = 1</code>; RF=5/M=3 buys <code>5 − 3 = 2</code> — at the cost of <code>5 ÷ 3 ≈ 1.67×</code> the storage and replication bandwidth of RF=3 (each replica is one full copy of the data, so cost scales linearly with RF).</p></div>
+
+<p>Every "tolerates loss of …" cell below is <em>derived</em>, not asserted, from two formulas using the named quantities <code>RF</code> and <code>M</code> (= <code>min.insync.replicas</code>):</p>
+<ul>
+<li><strong>and keeps writing</strong> = the availability headroom <code>RF − M</code> from above (writes survive while <code>RF − k ≥ M</code>), floored at 0 since you cannot lose a negative number of brokers — note the <code>effectiveMinIsr</code> cap means M is first clamped to <code>min(M, RF)</code>, so RF=2/M=2 uses M=2 but RF=1/M=2 would use M=1.</li>
+<li><strong>with zero acked loss</strong> = <code>RF − 1</code>: an <code>acks=all</code> write commits to the full ISR, so as long as <em>one</em> copy of a committed record survives it is not lost; you can therefore lose up to <code>RF − 1</code> of the <code>RF</code> copies. (This assumes the lost brokers are not all the ISR <em>at once before</em> a re-replication — the page-cache-independence caveat below.)</li>
+</ul>
+<div class="table-wrap"><table>
+<thead><tr><th>RF</th><th><code>M</code></th><th>Keeps writing through loss of … <span class="mono">= max(RF−M, 0)</span></th><th>Zero acked loss through loss of … <span class="mono">= RF−1</span></th><th>Storage / cross-AZ cost <span class="mono">= RF×</span></th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>1</td><td><code>1 − 1 = 0</code> brokers</td><td><code>1 − 1 = 0</code> brokers</td><td>1×</td><td>No durability. Dev only.</td></tr>
+<tr><td>2</td><td>2</td><td><code>2 − 2 = 0</code> brokers (any loss stops writes)</td><td><code>2 − 1 = 1</code> broker</td><td>2×</td><td>Durable but <em>not</em> available — one slow follower halts the topic.</td></tr>
+<tr><td>2</td><td>1</td><td><code>2 − 1 = 1</code> broker</td><td><code>1 − 1 = 0</code> brokers (single-copy acks: with M=1 a write can commit to one copy, so the "zero-loss" bound collapses to RF−M = 0)</td><td>2×</td><td>Available but a single-copy ack can be lost on leader failure.</td></tr>
+<tr><td><strong>3</strong></td><td><strong>2</strong></td><td><strong><code>3 − 2 = 1</code> broker</strong></td><td><strong><code>3 − 1 = 2</code>, but bounded by writes-stop at <code>3 − 2 = 1</code> broker</strong></td><td><strong>3×</strong></td><td><strong>The standard. Durable AND available under one failure.</strong></td></tr>
+<tr><td>5</td><td>3</td><td><code>5 − 3 = 2</code> brokers</td><td><code>5 − 1 = 4</code>, bounded by writes-stop at <code>5 − 3 = 2</code> brokers</td><td>5×</td><td>Higher tolerance for critical/financial data; meaningfully pricier.</td></tr>
+</tbody>
+</table></div>
+<p class="fnote">The two "zero acked loss" columns reconcile thus: the raw redundancy bound is <code>RF − 1</code> (lose all but one copy and committed data survives), but once losses reach <code>RF − M</code> the leader has already <em>stopped acking new writes</em>, so for the <em>ongoing</em> guarantee the operative number is <code>min(RF − 1, RF − M) = RF − M</code> whenever <code>M ≥ 1</code>. The RF=2/M=1 and RF=1/M=1 rows expose the trap: a single-copy ack (M=1) means <code>RF − M = 0</code> committed-survivor guarantee, even though <code>RF − 1</code> looks like 1.</p>
+
+<p>Notice the two RF=2 rows: there is <em>no</em> setting of <code>min.insync.replicas</code> on an RF=2 topic that is simultaneously durable and available under a single failure. <code>minISR=2</code> makes any single loss stop all writes; <code>minISR=1</code> reopens the single-copy-ack loss window. RF=3 is the smallest RF that escapes this trap — that is the entire reason the standard is 3 and not 2. (RF=2/minISR=2 is occasionally chosen deliberately as "durable-or-nothing," accepting that a single broker bounce takes the topic read-only; know that you are choosing it.)</p>
+
+<figure class="diagram"><div class="dflow">
+<div class="node cat-broker"><span class="nt">RF=3, min.insync.replicas=2, acks=all — broker B2 dies</span></div>
+<div class="conn" data-label="controller detects, shrinks ISR"></div>
+<div class="node cat-storage decision">ISR was {B1,B2,B3} → now {B1,B3}; size = 2</div>
+<div class="conn"></div>
+<div class="row">
+<div class="col"><div class="conn" data-label="2 ≥ minISR(2)"></div><div class="node cat-coord">writes CONTINUE — leader B1 still has a full healthy ISR of 2; HW keeps advancing</div></div>
+<div class="col"><div class="conn ec-err" data-label="now lose B3 too → ISR {B1}, size 1"></div><div class="node cat-error">1 &lt; minISR(2): writes REFUSED with NotEnoughReplicasException; HW freezes; topic read-only until a replica returns</div></div>
+</div>
+</div>
+<figcaption>The one-failure case is a non-event: the cluster sheds the dead replica, ISR stays at the floor, production never pauses, and no acknowledged record is lost because every acked record was on ≥2 replicas. The two-failure case correctly fails safe rather than acking single-copy writes.</figcaption>
+<div class="legend"><span class="sw cat-broker"></span> broker event · <span class="sw cat-storage"></span> ISR/log state · <span class="sw cat-coord"></span> writes proceed · <span class="sw cat-error"></span> writes refused (fail-safe) · <span class="arr"></span> path</div>
+</figure>
+
+<h2>The flush philosophy: durability from replication, not fsync</h2>
+
+<p>Here is the fact that surprises most operators and that every Kafka-vs-X benchmark argument hinges on: <strong>Kafka does not fsync each message to disk before acknowledging it.</strong> A write that returns success to an <code>acks=all</code> producer is in the OS page cache of every ISR replica — not necessarily on stable storage. The fsync-on-write knobs exist, but they are <em>off by default</em>, set to the maximum possible value so the time/count thresholds effectively never trip:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config</th><th>Default</th><th>Meaning</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>flush.messages</code> (<code>log.flush.interval.messages</code>)</td><td><code>Long.MAX_VALUE</code></td><td>fsync after this many messages — effectively never</td><td><code>server-common/.../ServerLogConfigs.java:101</code></td></tr>
+<tr><td><code>flush.ms</code> (<code>log.flush.interval.ms</code> / <code>log.flush.scheduler.interval.ms</code>)</td><td><code>Long.MAX_VALUE</code></td><td>fsync after this much time — effectively never</td><td><code>server-common/.../ServerLogConfigs.java:109</code></td></tr>
+</tbody>
+</table></div>
+
+<p>This is a deliberate design choice, and the config docs say so outright (<code>TopicConfig.java:54</code>, the <code>flush.messages</code> doc): "In general we recommend you <em>not</em> set this and use replication for durability and allow the operating system's background flush capabilities as it is more efficient." Kafka's durability model is: a record is safe because it lives in the page cache of <em>multiple independent machines</em>, and the OS will write each copy to disk in the background on its own schedule. The fsync path in the broker (<code>UnifiedLog.java:2254</code>, <code>flush(offset, includingOffset)</code>) is driven by segment rolls and recovery, not by the produce hot path; the comment at <code>UnifiedLog.java:2212</code> is explicit that the broker "avoid[s] potentially-costly fsync call" on the write path. The storage engine's relationship to the page cache is covered in <a href="03-storage-log-engine.html">Part I · 03 Storage Log Engine</a> and <a href="04-storage-management.html">Part I · 04 Storage Management</a>.</p>
+
+<div class="callout rationale"><span class="callout-title">Why not fsync? Because replication is cheaper and stronger</span><p>An fsync is a slow, blocking, tail-latency-spiking operation. Forcing one per batch trades away Kafka's headline throughput for a guarantee that <em>replication already provides more cheaply</em>. The probability that one machine loses unflushed page-cache data (a crash) is some modest <em>p</em>; the probability that <em>RF independent machines</em> all lose it in the same instant is the product of <em>RF</em> independent small probabilities, <em>p</em><sup>RF</sup> — vanishingly small if the machines are truly independent (this is derived with explicit numbers in <a href="#durability-math">The durability math</a> below). Replication across <em>RF</em> failure-independent brokers is a stronger durability guarantee than fsync on one, and far faster. This is precisely the critique-and-rebuttal at the heart of vendor benchmarks: the OpenMessaging Benchmark misconfigured Kafka with <code>log.flush.interval.messages=1</code> (fsync per batch) on Java 11, which crippled it; on identical hardware without that handicap Kafka matched or beat the challenger. <strong>Illustrative figure</strong> (not a guarantee — specific to that hardware and version): on 3× i3en.6xlarge at NVMe saturation, Kafka sustained ~<strong>1,900 MB/s</strong> vs the challenger's ~<strong>1,400 MB/s</strong> (Jack Vanlightly, empirical — ops-blueprint §9). "Kafka is unsafe because it doesn't fsync" is false: Kafka relies on replication + log recovery.</p></div>
+
+<div class="callout warning"><span class="callout-title">The corollary that dictates your topology: ISR replicas MUST be failure-independent</span><p>Because acknowledged data may exist only in page cache, a <em>simultaneous power loss of all ISR replicas</em> can lose not-yet-flushed acknowledged records. The entire durability guarantee therefore rests on one physical assumption: <strong>the ISR replicas do not fail together.</strong> If all three copies of a partition sit in one rack on one PDU, or one AZ on one power domain, a correlated power event defeats RF=3 entirely — the math assumed independence you didn't provide. This is why rack/AZ spread is not a nice-to-have but a load-bearing part of the durability model. The dial that delivers it is <code>broker.rack</code>, below. If you genuinely cannot tolerate any page-cache loss window (e.g. a single-AZ deployment, or regulatory fsync requirements), set <code>flush.ms</code> to a small value and accept the tail-latency cost — but prefer fixing failure-independence first.</p></div>
+
+<h2>Rack awareness: making "independent" true</h2>
+
+<p>Setting <code>broker.rack</code> (default <code>null</code> — unset, <code>server-common/.../ServerConfigs.java:142</code>) on each broker turns rack/AZ spread from an accident into a controller-enforced invariant. When racks are configured, the <code>StripedReplicaPlacer</code> treats spreading replicas across racks as its <strong>highest-priority goal</strong> (<code>StripedReplicaPlacer.java:37–40</code>: "we want to spread the replicas as evenly as we can across racks … it is the highest priority goal in multi-rack clusters"). It places replicas round-robin across racks with a random starting offset, producing the characteristic striped pattern — for racks A/B/C with three nodes each, partition 1 lands on A0,B0,C0; partition 2 on B1,C1,A1; and so on (<code>StripedReplicaPlacer.java:98–105</code>). For RF=3 across three AZs, this guarantees one replica per AZ: lose an entire AZ and every partition still has two surviving replicas — exactly the headroom RF=3/minISR=2 needs.</p>
+
+<div class="callout gotcha"><span class="callout-title">Racks must be roughly equal size, or placement skews</span><p>The placer prioritizes rack spread <em>over</em> even broker spread (<code>StripedReplicaPlacer.java:48–53</code>): "if you configure 10 brokers in rack A and B, and 1 broker in rack C … you will end up with a lot of partitions on that one broker in rack C." Every RF=3 partition wants a replica in C, so the lone C broker becomes a hotspot and a single point of failure for an outsized share of partitions. The doc calls unequal racks "a user error." Keep AZs balanced in broker count, or the rack-aware placement that was supposed to protect you concentrates risk.</p></div>
+
+<p>Rack metadata also unlocks the consumer-side cost optimization <span class="pill kip">KIP-392</span> fetch-from-follower (set <code>broker.rack</code> + <code>replica.selector.class</code> + client <code>client.rack</code>), which lets consumers read a same-AZ replica and eliminates cross-AZ fetch traffic — at the cost of up to ~500 ms added latency, since followers only serve up to the HW (Grab, empirical). That is a cost lever covered in <a href="op10-cost.html">II · 10 Cost</a>; here the point is that the <em>same</em> <code>broker.rack</code> setting both hardens durability and cuts the cross-AZ bill.</p>
+
+<h2>How a replica leaves and rejoins the ISR</h2>
+
+<p>The ISR is not static; its membership is the live input to every guarantee above, so you must know what moves a replica in and out. A follower is dropped from the ISR when it falls behind by more than <code>replica.lag.time.max.ms</code> (default <code>30000</code> ms = 30 s, <code>ReplicationConfigs.java:55</code>). The mechanism is time-based, not offset-based: the leader tracks each follower's <code>lastCaughtUpTimeMs</code> and shrinks the ISR if a follower either stopped fetching (a "stuck" follower) or hasn't reached the leader's LEO within the window (a "slow" follower) — both detected via <code>getOutOfSyncReplicas</code> (<code>Partition.scala:1155–1166</code>, comment at <code>:1144–1152</code>). A dropped follower rejoins automatically once it catches back up to the leader's log.</p>
+
+<div class="callout gotcha"><span class="callout-title">Keep <code>replica.fetch.wait.max.ms</code> below <code>replica.lag.time.max.ms</code></span><p><code>replica.fetch.wait.max.ms</code> defaults to <code>500</code> ms (<code>ReplicationConfigs.java:75</code>) and its own doc warns it "should always be less than the <code>replica.lag.time.max.ms</code> at all times to prevent frequent shrinking of ISR for low throughput topics." If a follower's max fetch wait approaches the lag window, a low-traffic topic can flap replicas in and out of the ISR purely because the follower legitimately had nothing to fetch. ISR thrash (watch <code>IsrShrinksPerSec</code>/<code>IsrExpandsPerSec</code> — both should be 0 in steady state) is one of the highest-signal symptoms of a sick cluster; investigate any shrink without a matching expand. See <a href="op08-metrics-signals.html">II · 08 Metrics &amp; Signals</a>.</p></div>
+
+<p>The operational consequence: every shrink of the ISR erodes your availability headroom. An RF=3/minISR=2 topic whose ISR has shrunk to 2 is now <em>one</em> follower-hiccup away from refusing writes. The cluster will keep your acked data safe in this state — but it has spent its slack, and that is why slow followers (GC pauses, disk I/O saturation, network) are durability incidents in disguise, not mere performance noise.</p>
+
+<h2>Unclean leader election: the availability-vs-durability last resort</h2>
+
+<p>Everything above describes the system staying safe. Unclean leader election is what governs the moment it cannot — when <em>every</em> in-sync replica for a partition is down and the only surviving copy is one that was <em>not</em> in the ISR (i.e. behind the HW). You have exactly two choices, and they are mutually exclusive:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th><code>unclean.leader.election.enable</code></th><th>Behavior when all ISR is down</th><th>You lose</th><th>You keep</th></tr></thead>
+<tbody>
+<tr><td><code>false</code> <span class="pill">default</span></td><td>Partition stays <strong>offline</strong> (no leader) until an ISR member returns</td><td>Availability — the partition is unreadable/unwritable, possibly for a long time</td><td>Every acknowledged record — zero data loss</td></tr>
+<tr><td><code>true</code></td><td>An out-of-sync replica is elected leader as a last resort</td><td>Any records the new leader was missing (everything past its log end) — permanent data loss</td><td>Availability — the partition serves again immediately</td></tr>
+</tbody>
+</table></div>
+
+<p>The default is <code>false</code> (<code>LogConfig.java:139</code>, <code>DEFAULT_UNCLEAN_LEADER_ELECTION_ENABLE = false</code>), and Kafka chooses <strong>consistency/durability over availability</strong> by default. The config's own doc names the trade exactly (<code>TopicConfig.java:185</code>): enabling it allows replicas not in the ISR to be elected "as a last resort, even though doing so may result in data loss." When an unclean election does occur, the controller marks the partition's recovery state as <code>RECOVERING</code> (<code>LeaderRecoveryState.java:29–33</code>: "the election for the partition was an unclean leader election and … the leader is recovering from it"), distinguishing it from the clean <code>RECOVERED</code> state — so you can detect after the fact that a partition went through a lossy election.</p>
+
+<div class="callout warning"><span class="callout-title">Any <code>UncleanLeaderElectionsPerSec &gt; 0</code> is an actual data-loss event</span><p>Treat this metric as binary: a single non-zero reading means committed data was discarded. Alert on it as critical (Datadog, Confluent, Grafana all ship critical alerts, empirical). The historical footgun: before Kafka 0.11.0 the default was <code>true</code>, and Datadog suffered temporary data loss on a pre-0.11.0 cluster, recovered only because they dual-wrote to a secondary cluster (Datadog, empirical). On 4.4 the default is safely <code>false</code> — verify it has not been overridden per topic if your data is critical.</p></div>
+
+<div class="callout gotcha"><span class="callout-title">Enabling it dynamically in KRaft is not instantaneous</span><p>In KRaft mode the controller only checks for needed unclean elections periodically — every <code>unclean.leader.election.interval.ms</code>, default <strong>5 minutes</strong> (<code>ReplicationConfigs.java:122–123</code>, <code>TimeUnit.MINUTES.toMillis(5)</code>). If you flip the config during an incident to restore an offline partition, it can take up to five minutes to take effect. The config doc instructs you to run <code>kafka-leader-election.sh</code> with the <code>unclean</code> option to trigger it immediately (<code>ReplicationConfigs.java:128–130</code>). Know this before you need it at 3 a.m.</p></div>
+
+<figure class="diagram"><div class="dstate">
+<span class="term"></span>
+<span class="tr"><span class="tl"></span><span class="ta"></span></span>
+<span class="st">Online (leader in ISR)</span>
+<span class="tr"><span class="tl">all ISR down</span><span class="ta"></span></span>
+<span class="st warn">Offline (no leader)</span>
+<span class="tr"><span class="tl">ISR member returns</span><span class="ta"></span></span>
+<span class="st">Online · RECOVERED</span>
+<span class="term end"></span>
+</div>
+<div class="dstate">
+<span class="term"></span>
+<span class="tr"><span class="tl"></span><span class="ta"></span></span>
+<span class="st warn">Offline (no leader)</span>
+<span class="tr"><span class="tl">unclean=true → elect stale replica</span><span class="ta"></span></span>
+<span class="st err">Online · RECOVERING (data lost)</span>
+<span class="term end"></span>
+</div>
+<figcaption>Top path (default, <code>unclean=false</code>): an all-ISR-down partition waits offline and recovers losslessly when any in-sync replica comes back. Bottom path (<code>unclean=true</code>): the partition is forced back online immediately by promoting a stale replica, entering <code>RECOVERING</code> and permanently discarding records past that replica's log end.</figcaption>
+<div class="legend"><span class="mono">RECOVERED</span> = clean election, no loss · <span class="mono">RECOVERING</span> = unclean election, data discarded · <span class="sw cat-control"></span> amber = unavailable · <span class="sw cat-error"></span> red = lossy</div>
+</figure>
+
+<h3>ELR — eligible leader replicas (KIP-966): a safer recovery</h3>
+
+<p>Classic unclean election is all-or-nothing because once every ISR member is down, Kafka has forgotten <em>which</em> out-of-ISR replicas were most recently in sync — so it may promote an arbitrarily stale one. <span class="pill kip">KIP-966</span> Eligible Leader Replicas fixes this by persisting, in the partition's metadata, the set of replicas that were in the ISR when it shrank below <code>min.insync.replicas</code> — the <code>elr</code> and <code>lastKnownElr</code> fields on the partition registration (<code>metadata/.../PartitionRegistration.java:158–159</code>). These ELR members are guaranteed to hold everything up to the HW at the moment they left, so on recovery the controller can elect an ELR replica <em>without data loss</em> even though a strict ISR election is impossible — strictly better than an unclean election. ELR is a feature-gated capability: <code>EligibleLeaderReplicasVersion.ELRV_1</code> enables it and requires metadata version <code>IBP_4_1_IV0</code> (<code>server-common/.../EligibleLeaderReplicasVersion.java:27</code>); it is the <code>LATEST_PRODUCTION</code> level (<code>:31</code>), so it is available and production-ready in this 4.4 build.</p>
+
+<div class="callout note"><span class="callout-title">ELR changes the meaning of <code>min.insync.replicas</code></span><p>When ELR is enabled, the semantics of <code>min.insync.replicas</code> shift — the config doc points at the dedicated ELR documentation section for the new behavior (<code>TopicConfig.java:204</code>). Practically: <code>min.insync.replicas</code> becomes not just the write-acceptance floor but also the boundary that defines which replicas get remembered as eligible leaders. The operational win is that an RF=3/minISR=2 topic that loses both ISR members can now often recover losslessly from a remembered ELR replica, where pre-ELR it faced the offline-or-lose-data choice. Treat ELR as raising the bar on how bad an all-ISR-down event has to be before unclean election is even on the table. The metadata mechanism is covered in <a href="11-kraft-controller.html">Part I · 11 KRaft Controller</a> and propagation in <a href="12-metadata-propagation.html">Part I · 12 Metadata Propagation</a>.</p></div>
+
+<h2 id="durability-math">The durability math: probability of loss vs RF and independence</h2>
+
+<p>You can put numbers on all of this — but every number below rests on two assumptions that must be stated, with units, before the arithmetic runs. This is an <em>illustrative</em> model; substitute your own measured failure rate.</p>
+
+<dl class="assume">
+<dt><code>p</code> — per-broker loss probability in the window</dt><dd>probability that a single broker (and its copy of a given partition) is unavailable, or has lost its unflushed page-cache data, in a chosen window. We use an annualized commodity-hardware failure rate; <strong>for this worked example, <em>p</em> = 2% = 0.02 per server-year</strong> (illustrative — the literature spans roughly <strong>1–4% per server-year</strong>; substitute your measured value). <span class="pill">illustrative / environment-dependent</span></dd>
+<dt>independence of the <code>RF</code> copies</dt><dd>the <code>RF</code> brokers holding the copies fail <em>independently</em> — no shared rack, PDU, AZ, power event, or kernel rollout. This is the load-bearing assumption (see callout below); it is an <em>operator-provided</em> property, delivered by <code>broker.rack</code> + balanced AZs, not a Kafka guarantee. <span class="pill">topology assumption</span></dd>
+</dl>
+
+<p><strong>Derivation.</strong> An acknowledged <code>acks=all</code> write under <code>min.insync.replicas ≥ 2</code> is committed to all <code>RF</code> copies, so losing the record requires <em>all</em> <code>RF</code> copies to be lost in the same window. If the copies fail independently with probability <em>p</em> each, the probability of the joint event is the product of <code>RF</code> independent probabilities:</p>
+<p style="text-align:center"><code>P(all RF copies lost) = p × p × … (RF times) = p<sup>RF</sup></code></p>
+<p>Plugging in <em>p</em> = 0.02 and reading the <strong>safety multiplier</strong> relative to RF=1 as <code>P(RF=1) ÷ P(RF=n) = p ÷ p<sup>n</sup> = p<sup>1−n</sup> = (1/p)<sup>n−1</sup></code>, with <code>1/p = 1/0.02 = 50</code>:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>RF</th><th>P(all copies lost) = <em>p</em><sup>RF</sup> with <em>p</em>=0.02, computed</th><th>Safety multiplier vs RF=1 = (1/<em>p</em>)<sup>RF−1</sup> = 50<sup>RF−1</sup></th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><em>p</em><sup>1</sup> = 0.02 = 2×10<sup>−2</sup></td><td>50<sup>0</sup> = 1× (baseline)</td><td>One bad disk loses the data.</td></tr>
+<tr><td>2</td><td><em>p</em><sup>2</sup> = 0.02×0.02 = 4×10<sup>−4</sup></td><td>50<sup>1</sup> = <strong>50×</strong> safer than RF=1</td><td>Two independent copies must die together.</td></tr>
+<tr><td>3</td><td><em>p</em><sup>3</sup> = 0.02<sup>3</sup> = 8×10<sup>−6</sup></td><td>50<sup>2</sup> = 2,500 ≈ <strong>2,500×</strong> safer than RF=1</td><td>The durable baseline.</td></tr>
+<tr><td>5</td><td><em>p</em><sup>5</sup> = 0.02<sup>5</sup> = 3.2×10<sup>−9</sup></td><td>50<sup>4</sup> = 6,250,000× safer than RF=1</td><td>Diminishing returns for most workloads.</td></tr>
+</tbody>
+</table></div>
+<p class="fnote">Each cell is reproducible by hand: <code>p<sup>3</sup> = (2×10<sup>−2</sup>)<sup>3</sup> = 2<sup>3</sup> × 10<sup>−6</sup> = 8×10<sup>−6</sup></code>; the RF=3 safety multiplier is <code>p<sup>1</sup> ÷ p<sup>3</sup> = 1/p<sup>2</sup> = 1/(0.02)<sup>2</sup> = 1/0.0004 = 2,500</code>. These probabilities are <em>per chosen window</em> (here, per year) and only as real as the independence assumption.</p>
+
+<div class="callout invariant"><span class="callout-title">The independence assumption is the whole ballgame</span><p>That <em>p</em><sup>RF</sup> only holds if failures are <strong>independent</strong>. The instant your replicas share a failure domain — same rack, same PDU, same AZ, same power event, same bad kernel rollout — the exponent collapses toward 1 and RF=3 buys you almost nothing against that correlated event. Three copies in one rack have roughly the data-loss probability of <em>one</em> copy against a rack-power failure. This is the quantitative restatement of the flush philosophy's corollary: <strong>RF multiplies safety only to the degree your replicas are failure-independent.</strong> <code>broker.rack</code> + balanced AZs is what makes the exponent real. Spend your durability budget on independence before you spend it on a higher RF.</p></div>
+
+<p>The same logic explains the cost/durability frontier. Two cost assumptions, then the arithmetic:</p>
+<dl class="assume">
+<dt>storage cost scales as <code>RF×</code></dt><dd>each replica is one full copy of the log, so total stored bytes = ingress bytes × RF. <span class="pill">structural</span></dd>
+<dt>cross-AZ replication amplification = <code>(RF − 1)×</code> ingress</dt><dd>the leader receives 1 copy from the producer, then ships it to the other <code>RF − 1</code> replicas; in a 3-AZ cluster with one replica per AZ, each of those <code>RF − 1</code> hops crosses an AZ boundary. <span class="pill">empirical, AWS 3-AZ (ops-blueprint §6)</span></dd>
+</dl>
+<p>So at RF=3, cross-AZ replication = <code>(RF − 1) × ingress = (3 − 1) × 1 GB = 2 GB</code> of cross-AZ traffic per 1 GB produced. Stepping RF=3 → RF=5 multiplies both storage and replication bandwidth by <code>5 ÷ 3 ≈ 1.67×</code>, i.e. <code>(5 − 3) ÷ 3 ≈ 67% more</code>, in exchange for moving the per-window loss probability from the RF=3 figure derived above (<em>p</em><sup>3</sup> = 8×10<sup>−6</sup>) to the RF=5 figure (<em>p</em><sup>5</sup> = 3.2×10<sup>−9</sup>) — a further <code>p<sup>3</sup> ÷ p<sup>5</sup> = 1/p<sup>2</sup> = 2,500×</code> reduction. Worthwhile for financial ledgers and irreplaceable data; overkill for most. The economics are quantified in <a href="op10-cost.html">II · 10 Cost</a>; the capacity arithmetic in <a href="op04-capacity-planning.html">II · 04 Capacity Planning</a>.</p>
+
+<h2>Where Kafka sits on CAP</h2>
+
+<p>A partition in Kafka is a small replicated state machine, and its CAP behavior is configurable through exactly the dials above. Under a network partition that separates the leader from its followers:</p>
+<ul>
+<li>With <code>acks=all</code> + <code>min.insync.replicas=2</code> + <code>unclean=false</code>, Kafka behaves as a <strong>CP</strong> system: when the ISR can no longer meet the floor, it <em>refuses</em> writes and freezes the HW (consistency + partition-tolerance), sacrificing availability. The <code>NotEnoughReplicasException</code> path and the frozen-HW behavior <em>are</em> the "C over A" choice, in code.</li>
+<li>Flip <code>unclean.leader.election.enable=true</code> and you shift that partition toward <strong>AP</strong> for the all-ISR-down case: it stays available by promoting a stale replica, at the cost of consistency (lost records). You are literally moving the partition along the CAP spectrum with one config.</li>
+<li>With <code>acks=1</code> or <code>acks=0</code> the producer opts out of the strong-consistency contract entirely for the sake of latency — a per-write relaxation.</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">Operator's durability checklist</span><p><strong>Set and verify, per topic:</strong> <code>replication.factor ≥ 3</code> for anything you cannot lose; <code>min.insync.replicas = 2</code> (and always <code>≤ RF</code> — the <code>effectiveMinIsr</code> cap will silently weaken it otherwise); producers on <code>acks=all</code> (the default) <em>with</em> <code>enable.idempotence=true</code> for ordering. Leave <code>unclean.leader.election.enable=false</code> (the default) unless a specific topic explicitly prefers availability over its own data. <strong>Make independence real:</strong> set <code>broker.rack</code> on every broker, keep AZs balanced in broker count, and confirm the placer spread one replica per AZ. <strong>Watch:</strong> <code>UnderMinIsrPartitionCount</code> and <code>OfflinePartitionsCount</code> (alert &gt; 0), <code>UncleanLeaderElectionsPerSec</code> (alert &gt; 0 = data loss), <code>IsrShrinks/ExpandsPerSec</code> (steady-state 0). <strong>Know your CAP position</strong> and that it is a config, not a fixed property. The failure-mode runbooks for each of these symptoms are in <a href="op07-failure-modes.html">II · 07 Failure Modes</a>.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

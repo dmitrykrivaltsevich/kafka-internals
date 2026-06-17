@@ -1,0 +1,417 @@
+<h1>15 · Share Groups (Queues / KIP-932)</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Share groups are Kafka's queue-like consumption model: many <em>share consumers</em> cooperatively read the <strong>same</strong> partitions, and records are delivered individually under a time-bounded <em>acquisition lock</em> rather than committed by offset. Each record carries a per-record delivery <em>state</em> (Available → Acquired → Acknowledged/Archived) and a <em>delivery count</em>, giving at-least-once queue semantics with redelivery, max-attempt limits and an optional dead-letter queue. The broker's <code>SharePartition</code> tracks in-flight record state and the share-partition start offset (SPSO); the durable state lives in the internal <code>__share_group_state</code> topic, written through a persister SPI to the <code>ShareCoordinator</code>. This chapter follows the data and control flow from the <code>ShareConsumer</code> client through <code>ShareFetch</code>/<code>ShareAcknowledge</code> RPCs into <code>SharePartition</code> and on to the coordinator.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>A <strong>consumer group</strong> (chapter <a href="13-group-coordination.html">13</a>) assigns each partition to exactly one member; progress is a single committed offset per partition; reprocessing is coarse (rewind the offset). A <strong>share group</strong> inverts this: the unit of bookkeeping is the individual record, not the partition cursor. The broker that leads a topic-partition keeps an in-memory map of which records are <em>acquired</em> (leased to a member), <em>acknowledged</em>, <em>archived</em>, or <em>available</em> for (re)delivery, and the consumer acknowledges records one at a time as <code>ACCEPT</code>, <code>RELEASE</code> or <code>REJECT</code>.</p>
+<p>The subsystem must therefore:</p>
+<ul>
+  <li>Lease records to members with an expiring lock so a crashed/slow consumer cannot block the queue (<code>AcquisitionLockTimerTask</code>).</li>
+  <li>Track and persist per-record delivery state and delivery count so leases survive a broker/leader change.</li>
+  <li>Advance the <strong>share-partition start offset (SPSO)</strong> as a contiguous prefix becomes terminal, so the log can age out and lag can be computed.</li>
+  <li>Cap concurrency: a maximum number of in-flight (locked) records per share-partition.</li>
+  <li>Redeliver records up to a max delivery count, then archive them — or route them to a dead-letter queue (KIP-1191).</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Share groups decouple <em>parallelism</em> from <em>partition count</em>. Because acknowledgement is per-record and held in broker memory (durably backed), more consumers than partitions can make progress on the same partition simultaneously — true queue fan-out — without per-key ordering guarantees.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Principal class</th><th>Path</th></tr></thead>
+<tbody>
+<tr><td>Per-partition in-flight state engine</td><td><code>SharePartition</code></td><td><code>core/src/main/java/kafka/server/share/SharePartition.java</code></td></tr>
+<tr><td>Broker orchestration of fetch/ack/sessions</td><td><code>SharePartitionManager</code></td><td><code>core/src/main/java/kafka/server/share/SharePartitionManager.java</code></td></tr>
+<tr><td>Record state machine</td><td><code>RecordState</code>, <code>InFlightState</code>, <code>InFlightBatch</code></td><td><code>server/src/main/java/org/apache/kafka/server/share/fetch/</code></td></tr>
+<tr><td>Lease-expiry timer</td><td><code>AcquisitionLockTimerTask</code></td><td><code>server/src/main/java/org/apache/kafka/server/share/fetch/AcquisitionLockTimerTask.java</code></td></tr>
+<tr><td>Persister SPI / RPC client</td><td><code>Persister</code>, <code>DefaultStatePersister</code>, <code>PersisterStateManager</code></td><td><code>server-common/src/main/java/org/apache/kafka/server/share/persister/</code></td></tr>
+<tr><td>Share coordinator runtime</td><td><code>ShareCoordinatorService</code>, <code>ShareCoordinatorShard</code></td><td><code>share-coordinator/src/main/java/org/apache/kafka/coordinator/share/</code></td></tr>
+<tr><td>Durable state record / batch merge</td><td><code>ShareGroupOffset</code>, <code>PersisterStateBatchCombiner</code></td><td><code>share-coordinator/src/main/java/org/apache/kafka/coordinator/share/</code></td></tr>
+<tr><td>Dead-letter queue writer</td><td><code>ShareGroupDLQStateManager</code></td><td><code>server/src/main/java/org/apache/kafka/server/share/dlq/ShareGroupDLQStateManager.java</code></td></tr>
+<tr><td>Share consumer client</td><td><code>ShareConsumerImpl</code>, <code>ShareConsumeRequestManager</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/consumer/internals/</code></td></tr>
+<tr><td>Group config (dynamic)</td><td><code>ShareGroupConfig</code>, <code>GroupConfig</code></td><td><code>group-coordinator/src/main/java/org/apache/kafka/coordinator/group/</code></td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+<dt>Share-partition</dt><dd>The (groupId, topic-partition) pair as seen by one share group. State is held on the partition leader by a <code>SharePartition</code> instance.</dd>
+<dt>Acquisition lock</dt><dd>A time-bounded lease on acquired records. On expiry the records return to <code>AVAILABLE</code> (or are archived if the delivery count is exhausted). Implemented as a <code>TimerTask</code>.</dd>
+<dt>Delivery count</dt><dd>How many times a record has been handed to a consumer. Incremented on each acquire; bounded by <code>group.share.delivery.count.limit</code> (default 5).</dd>
+<dt>SPSO</dt><dd><strong>Share-Partition Start Offset</strong> — the lowest offset still in-flight. Records below it are terminal (acknowledged/archived) and dropped from the cache. Persisted as <code>startOffset</code>.</dd>
+<dt>State epoch</dt><dd>Fencing version of the durable state, bumped on (re)initialization; protects against stale writers after a coordinator/leader change.</dd>
+<dt>Snapshot / update record</dt><dd>The two coordinator record types in <code>__share_group_state</code>: a full <code>ShareSnapshotValue</code> and an incremental <code>ShareUpdateValue</code>.</dd>
+</dl>
+
+<h2>The record state machine</h2>
+<p><code>RecordState</code> (<code>server/.../fetch/RecordState.java:26</code>) defines five states with an explicit byte id, persisted in the state batches:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>id</th><th>Meaning</th><th>Terminal?</th></tr></thead>
+<tbody>
+<tr><td><code>AVAILABLE</code></td><td>0</td><td>Eligible to be acquired/(re)delivered.</td><td>no</td></tr>
+<tr><td><code>ACQUIRED</code></td><td>1</td><td>Leased to a member under an acquisition lock.</td><td>no</td></tr>
+<tr><td><code>ACKNOWLEDGED</code></td><td>2</td><td>Consumer ACCEPTed it; successfully processed.</td><td>yes</td></tr>
+<tr><td><code>ARCHIVING</code></td><td>3</td><td>Transient (KIP-1191): destined for the DLQ before becoming <code>ARCHIVED</code>.</td><td>no*</td></tr>
+<tr><td><code>ARCHIVED</code></td><td>4</td><td>Permanently dropped: REJECTed, delivery-count exhausted, or compacted away.</td><td>yes</td></tr>
+</tbody>
+</table></div>
+<p>Transitions are policed by <code>RecordState.validateTransition</code> (<code>RecordState.java:50</code>): <code>ACKNOWLEDGED</code> and <code>ARCHIVED</code> are sinks; <code>AVAILABLE</code> may only go to <code>ACQUIRED</code>; a record may never transition to itself. The acknowledgement-byte → state mapping is fixed in <code>SharePartition.ACK_TYPE_TO_RECORD_STATE</code> (<code>SharePartition.java:149</code>): byte 0 (a gap) → <code>ARCHIVED</code>, <code>ACCEPT</code> → <code>ACKNOWLEDGED</code>, <code>RELEASE</code> → <code>AVAILABLE</code>, <code>REJECT</code> → <code>ARCHIVED</code>.</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">initial</span><span class="ta"></span></span>
+  <span class="st">AVAILABLE</span>
+  <span class="tr"><span class="tl">acquire — lease, ++deliveryCount</span><span class="ta"></span></span>
+  <span class="st">ACQUIRED</span>
+  <span class="tr"><span class="tl">ACCEPT</span><span class="ta"></span></span>
+  <span class="st accent">ACKNOWLEDGED</span>
+  <span class="tr"><span class="tl">terminal</span><span class="ta"></span></span>
+  <span class="term end"></span>
+</div>
+<div class="dstate v">
+  <span class="st">ACQUIRED</span>
+  <span class="tr"><span class="tl">RELEASE / lock timeout · deliveryCount &lt; max</span><span class="ta"></span></span>
+  <span class="st">AVAILABLE</span>
+  <span class="tr"><span class="tl">re-deliver (loop back to ACQUIRED)</span><span class="ta"></span></span>
+  <span class="st">ACQUIRED</span>
+</div>
+<div class="dstate v">
+  <span class="st">ACQUIRED</span>
+  <span class="tr"><span class="tl">REJECT &nbsp;·&nbsp; deliveryCount ≥ max, DLQ off</span><span class="ta"></span></span>
+  <span class="st warn">ARCHIVED</span>
+  <span class="tr"><span class="tl">terminal</span><span class="ta"></span></span>
+  <span class="term end"></span>
+</div>
+<div class="dstate v">
+  <span class="st">ACQUIRED</span>
+  <span class="tr"><span class="tl">deliveryCount ≥ max, DLQ on (KIP-1191)</span><span class="ta"></span></span>
+  <span class="st warn">ARCHIVING</span>
+  <span class="tr"><span class="tl">DLQ write succeeds</span><span class="ta"></span></span>
+  <span class="st warn">ARCHIVED</span>
+  <span class="tr"><span class="tl">terminal</span><span class="ta"></span></span>
+  <span class="term end"></span>
+</div>
+<figcaption>Per-record / per-batch state machine in <code>InFlightState.tryUpdateState</code>. A record starts <code>AVAILABLE</code>; each acquire leases it (<code>ACQUIRED</code>) and increments the delivery count. From <code>ACQUIRED</code> it can be accepted (terminal <code>ACKNOWLEDGED</code>), released or lock-timed-out back to <code>AVAILABLE</code> for redelivery while under the limit, or — on REJECT or once the delivery count is exhausted — archived directly (DLQ off) or via the transient <code>ARCHIVING</code> hop (DLQ on).</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-coord"></span>in-flight state (available / acquired)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>acknowledged — success terminal</span>
+  <span class="lgi"><span class="sw cat-error"></span>archiving / archived — drop terminal</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger / guard)</span>
+  <span class="lgi"><span class="sw round dash"></span><b>pill</b> = state, ◉ = terminal</span>
+</div></figure>
+
+<p>The decisive rule lives in <code>InFlightState.tryUpdateState</code> (<code>InFlightState.java:150</code>): when a record is being made <code>AVAILABLE</code> (RELEASE or lock-timeout) but its delivery count has already reached the maximum, it is instead diverted — to <code>ARCHIVING</code> when DLQ support is enabled for the group, otherwise straight to <code>ARCHIVED</code>. Delivery count is bumped via <code>DeliveryCountOps</code> (<code>INCREASE</code>/<code>DECREASE</code>/<code>NO_OP</code>, <code>DeliveryCountOps.java:23</code>); it is incremented on acquire and explicitly not incremented when a record reaches <code>ARCHIVED</code>.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A record's delivery count never decreases on the normal path (it is only ever <code>INCREASE</code> on acquire), and a record can be delivered at most <code>maxDeliveryCount</code> times before it is archived. There is no infinite-redelivery loop: every RELEASE / lock-timeout either makes the record available again with a higher count or archives it.</p></div>
+
+<h2>In-memory data structures</h2>
+<p>A <code>SharePartition</code> (<code>SharePartition.java:103</code>) holds the authoritative in-flight state for one share-partition on its leader. Its salient fields:</p>
+<dl class="kv">
+<dt><code>cachedState : NavigableMap&lt;Long, InFlightBatch&gt;</code></dt><dd>A <code>ConcurrentSkipListMap</code> keyed by the <em>first offset</em> of each in-flight batch (<code>SharePartition.java:178,392</code>). This is the heart of the engine.</dd>
+<dt><code>startOffset</code>, <code>endOffset</code></dt><dd>SPSO and the highest fetched offset; bound the live region of the cache (<code>SharePartition.java:276,282</code>).</dd>
+<dt><code>lock : ReentrantReadWriteLock</code></dt><dd>Guards all access to <code>cachedState</code>/offsets. Mutations take the write lock (<code>SharePartition.java:184,393</code>).</dd>
+<dt><code>fetchLock : AtomicReference&lt;Uuid&gt;</code></dt><dd>Ensures a given share-partition is processed by only one in-flight share-fetch at a time; the acquirer's id is stored (<code>SharePartition.java:191</code>).</dd>
+<dt><code>findNextFetchOffset : boolean</code></dt><dd>Dirty flag: when records become available out of order, the next fetch offset must be recomputed by scanning the cache (<code>SharePartition.java:224</code>).</dd>
+<dt><code>deliveryCompleteCount : AtomicInteger</code></dt><dd>Count of terminal records at/after SPSO; feeds share-partition lag (KIP-1226) (<code>SharePartition.java:305</code>).</dd>
+<dt><code>stateEpoch</code>, <code>partitionState</code></dt><dd>Fencing epoch and lifecycle state (EMPTY → INITIALIZING → ACTIVE / FAILED / FENCED, <code>SharePartition.java:123</code>).</dd>
+<dt><code>timer : Timer</code></dt><dd>Hashed-wheel timer that fires acquisition-lock expirations (<code>SharePartition.java:230</code>).</dd>
+</dl>
+
+<p><code>InFlightBatch</code> (<code>server/.../fetch/InFlightBatch.java:34</code>) stores <code>firstOffset</code>/<code>lastOffset</code> plus <strong>either</strong> a single <code>batchState : InFlightState</code> (the whole batch shares one state) <strong>or</strong> an <code>offsetState : NavigableMap&lt;Long, InFlightState&gt;</code> (per-offset state). The per-offset map is created lazily by <code>maybeInitializeOffsetStateUpdate</code> only when a client acknowledges a <em>subset</em> of a batch, so the common path (whole-batch acks) stays compact. Each <code>InFlightState</code> (<code>InFlightState.java:33</code>) carries <code>state</code>, <code>deliveryCount</code>, <code>memberId</code>, an optional <code>acquisitionLockTimeoutTask</code>, and a <code>rollbackState</code> snapshot used for the persist-then-commit protocol.</p>
+
+<figure class="diagram">
+<p class="diagram-note"><code>SharePartition</code> (group <code>g</code>, topic-partition <code>t-p</code>), leader broker — <code>startOffset=100</code> … <code>endOffset=139</code>; <code>nextFetchOffset=131</code> (first <code>AVAILABLE</code>), <code>findNextFetchOffset=true</code>.</p>
+<div class="logstrip">
+  <div class="ls-head"><span class="ttl">share-partition <span class="q">g · t-p</span> — cachedState</span><span class="append">offsets →</span></div>
+  <div class="cells">
+    <div class="cell committed">100<span class="tag hw">SPSO</span></div>
+    <div class="cell committed">…119</div>
+    <div class="cell pending">120</div>
+    <div class="cell pending">…129</div>
+    <div class="cell pending">130</div>
+    <div class="cell next">131<span class="tag leo">next fetch</span></div>
+    <div class="cell pending">132</div>
+    <div class="cell pending">…139</div>
+  </div>
+  <div class="marks">
+    <div class="mslot"><span class="mk">ack’d<br>dc 1</span></div>
+    <div class="mslot"></div>
+    <div class="mslot"><span class="mk b">M1<br>dc 2</span></div>
+    <div class="mslot"></div>
+    <div class="mslot"><span class="mk b">M2<br>dc 1</span></div>
+    <div class="mslot"><span class="mk">avail<br>dc 1</span></div>
+    <div class="mslot"><span class="mk b">M2<br>dc 1</span></div>
+    <div class="mslot"></div>
+  </div>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th><code>cachedState</code> key (firstOffset)</th><th>Batch range</th><th>State</th><th>dc</th><th>Member · lock</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>100</code></td><td>100..119</td><td><code>batchState=ACKNOWLEDGED</code></td><td>1</td><td>—</td><td>whole-batch ack</td></tr>
+<tr><td><code>120</code></td><td>120..129</td><td><code>batchState=ACQUIRED</code></td><td>2</td><td>M1 · lock→t+30s</td><td>whole batch leased</td></tr>
+<tr><td rowspan="3"><code>130</code></td><td>130</td><td><code>offsetState: ACQUIRED</code></td><td>1</td><td>M2 · lock</td><td rowspan="3">partial ack split this batch into per-offset state</td></tr>
+<tr><td>131</td><td><code>offsetState: AVAILABLE</code></td><td>1</td><td>—</td></tr>
+<tr><td>132..139</td><td><code>offsetState: ACQUIRED</code></td><td>1</td><td>M2 · lock</td></tr>
+</tbody>
+</table></div>
+<figcaption>Example cache: batches keyed by first offset, with per-offset state only where batch <code>130</code> was partially acknowledged. The strip shows the live region <code>startOffset</code>=100 … <code>endOffset</code>=139; the first <code>AVAILABLE</code> offset (131) is where the next fetch resumes.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-storage"></span>committed cell — <code>ACKNOWLEDGED</code> (terminal)</span>
+  <span class="lgi"><span class="sw cat-control dash"></span>leased cell — <code>ACQUIRED</code> (held by a member)</span>
+  <span class="lgi"><span class="sw" style="background:repeating-linear-gradient(45deg,transparent,transparent 3px,var(--bg-sunken) 3px,var(--bg-sunken) 6px)"></span><code>AVAILABLE</code> — re-deliverable / next fetch</span>
+  <span class="lgi"><span class="mono">SPSO</span> / <span class="mono">next fetch</span> = offset markers</span>
+  <span class="lgi">▲ marker = member · delivery count under each offset</span>
+</div></figure>
+
+<h2>On-disk / on-wire data structures</h2>
+<h3>Wire: ShareFetch / ShareAcknowledge / AcquiredRecords</h3>
+<p>The client multiplexes fetch and acknowledge over two RPCs (<code>SHARE_FETCH</code>, <code>SHARE_ACKNOWLEDGE</code>) routed in <code>KafkaApis</code> (<code>core/src/main/scala/kafka/server/KafkaApis.scala:240,241</code>; membership over <code>SHARE_GROUP_HEARTBEAT</code> at :238). <code>ShareFetchRequest</code> carries <code>MaxWaitMs</code>, <code>MaxBytes</code> (default <code>0x7fffffff</code>), and, since v1, <code>MaxRecords</code> and <code>BatchSize</code>; acknowledgements piggyback on the same request as <code>AcknowledgementBatches</code> (<code>clients/.../message/ShareFetchRequest.json</code>). Each <code>AcknowledgementBatch</code> is a <code>(firstOffset, lastOffset, []acknowledgeType)</code> run, modelled client-side as <code>ShareAcknowledgementBatch</code>.</p>
+<p>The leader returns <code>AcquiredRecords</code> ranges and the lease deadline: <code>FirstOffset</code>, <code>LastOffset</code>, <code>DeliveryCount</code> (int16), and a per-response <code>AcquisitionLockTimeoutMs</code> (v1+) (<code>clients/.../message/ShareFetchResponse.json</code>). Note the records themselves ride inside the normal fetch <code>RecordBatch</code> payload — <code>AcquiredRecords</code> is just the offset-range overlay describing what was leased.</p>
+
+<h3>Persistent: ShareSnapshotValue / ShareUpdateValue</h3>
+<p>Durable state is two coordinator-value record types in <code>__share_group_state</code> (topic name <code>Topic.SHARE_GROUP_STATE_TOPIC_NAME = "__share_group_state"</code>, <code>clients/.../internals/Topic.java:29</code>). The snapshot is the complete state; the update is an incremental delta.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Type</th><th>In Snapshot</th><th>In Update</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>SnapshotEpoch</code></td><td>int32</td><td>✓</td><td>✓</td><td>Bumped per new snapshot; update reuses last snapshot's value.</td></tr>
+<tr><td><code>StateEpoch</code></td><td>int32</td><td>✓</td><td>—</td><td>Fencing epoch; updates carry no state epoch.</td></tr>
+<tr><td><code>LeaderEpoch</code></td><td>int32</td><td>✓</td><td>✓</td><td>Partition leader epoch at write time.</td></tr>
+<tr><td><code>StartOffset</code></td><td>int64</td><td>✓</td><td>✓</td><td>SPSO; <code>-1</code> in an update means "not changing".</td></tr>
+<tr><td><code>DeliveryCompleteCount</code></td><td>int32 (tag 0)</td><td>✓</td><td>✓</td><td>KIP-1226 lag input; default <code>-1</code> (uninitialized).</td></tr>
+<tr><td><code>CreateTimestamp</code>/<code>WriteTimestamp</code></td><td>int64</td><td>✓</td><td>—</td><td>For cold-partition snapshotting/pruning.</td></tr>
+<tr><td><code>StateBatches[]</code></td><td>array</td><td>✓</td><td>✓</td><td>Run-length state: see below.</td></tr>
+</tbody>
+</table></div>
+<p>Each <code>StateBatch</code> is <code>FirstOffset</code> (int64), <code>LastOffset</code> (int64), <code>DeliveryState</code> (int8 — <code>0:Available, 2:Acked, 4:Archived</code>), <code>DeliveryCount</code> (int16) (<code>share-coordinator/.../message/ShareSnapshotValue.json:38</code>). This run-length encoding is why whole-batch acknowledgement is cheap: a contiguous run of identically-stated offsets is one batch entry. In-memory these map to <code>PersisterStateBatch</code>, and to the immutable <code>ShareGroupOffset</code> container (<code>ShareGroupOffset.java:34</code>) which the coordinator keeps in its soft state.</p>
+
+<h2>Mechanics — the acquire algorithm</h2>
+<p><code>SharePartition.acquire</code> (<code>SharePartition.java:755</code>) runs under the write lock and works at <em>batch granularity</em>: it always acquires whole fetched batches, leaving the client to report intra-batch gaps. The high-level steps:</p>
+<ol>
+<li>Bail out if the partition is not <code>ACTIVE</code>, if <code>maxFetchRecords ≤ 0</code>, or if the fetched data is entirely below <code>startOffset</code> (<code>SharePartition.java:766,780</code>).</li>
+<li>Compute the cap via <code>lastOffsetAndMaxRecordsToAcquire</code> — this enforces the in-flight limit (see below).</li>
+<li><code>maybeArchiveStaleBatches(fetchOffset, baseOffset)</code>: for compacted topics, any cached batch between the fetch offset and the first returned base offset has vanished from the log and is archived so the SPSO can advance (<code>SharePartition.java:803</code>; rationale at :733).</li>
+<li>Find the overlapping region with <code>cachedState.floorEntry</code>/<code>subMap</code>. If there is no overlap, <code>acquireNewBatchRecords</code> leases the fresh batch (<code>SharePartition.java:858</code>).</li>
+<li>If there is overlap, iterate the sub-map: batches/offsets currently <code>AVAILABLE</code> are re-leased (delivery count incremented), and gaps inside the persister read-gap window are filled with new acquisitions (<code>SharePartition.java:874</code>).</li>
+</ol>
+<p><code>acquireNewBatchRecords</code> (<code>SharePartition.java:1767</code>) decides the acquired range, splits it on <code>BatchSize</code> in <code>BATCH_OPTIMIZED</code> mode (<code>createBatches</code>, :1838), inserts the new <code>InFlightBatch</code> (state <code>ACQUIRED</code>, delivery count 1) into <code>cachedState</code>, advances <code>endOffset</code>, schedules the acquisition-lock timer, and returns <code>ShareAcquiredRecords</code> with the count of offsets leased.</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Two acquire modes (client config <code>share.acquire.mode</code>, default <code>batch_optimized</code>, <code>clients/.../ShareAcquireMode.java:26</code>): <code>BATCH_OPTIMIZED</code> may split into <code>BatchSize</code>-sized <code>AcquiredRecords</code> for efficient acks but can over-deliver whole batches; <code>RECORD_LIMIT</code> honours <code>MaxRecords</code> precisely. Either way the <code>InFlightBatch</code> in the cache reflects whole batches.</p></div>
+
+<h3>The next-fetch-offset computation</h3>
+<p><code>nextFetchOffset</code> (<code>SharePartition.java:608</code>) returns where the leader should read next. The fast path returns <code>endOffset</code> (or <code>endOffset+1</code>) when nothing is re-deliverable. When <code>findNextFetchOffset</code> is set — by a RELEASE, a lock timeout, or a session close — it scans <code>cachedState</code> for the first <code>AVAILABLE</code> offset that has no in-progress transition, also accounting for gaps recorded during the initial persister read. If no available record is found, the flag is cleared and the offset reverts to <code>endOffset+1</code>.</p>
+
+<h2>Mechanics — acknowledgement &amp; the persist protocol</h2>
+<p><code>acknowledge</code> (<code>SharePartition.java:1016</code>) takes a list of <code>ShareAcknowledgementBatch</code>. Under the write lock it resolves each batch to its sub-map of <code>cachedState</code>, validates ownership/type, and for each affected batch/offset calls <code>startStateTransition</code> — which both attempts the new state <em>and</em> records a <code>rollbackState</code> snapshot (<code>InFlightState.java:203</code>). The actual durable write and final commit happen in <code>rollbackOrProcessStateUpdates</code> (<code>SharePartition.java:2528</code>):</p>
+<ol>
+<li>If local validation already failed, every started transition is rolled back via <code>completeStateTransition(false)</code> and the future fails (<code>SharePartition.java:2540</code>).</li>
+<li>Otherwise <code>writeShareGroupState(stateBatches)</code> is called — an RPC to the share coordinator (<code>SharePartition.java:2858</code>).</li>
+<li>On RPC success, every transition is committed with <code>completeStateTransition(true)</code>, the SPSO is advanced (<code>maybeUpdateCachedStateAndOffsets</code>), and any delayed share-fetch waiting on this partition is notified (<code>SharePartition.java:2597,2608</code>).</li>
+<li>On RPC failure, transitions roll back to <code>ACQUIRED</code> — unless the acquisition lock expired in the meantime, in which case the rollback target is <code>AVAILABLE</code>/<code>ARCHIVED</code> (<code>InFlightState.completeStateTransition</code>, :219; <code>SharePartition.java:2578</code>).</li>
+</ol>
+
+<div class="callout invariant"><span class="callout-title">Invariant — persist before commit</span><p>An acknowledgement is reflected in the in-memory cache as <em>committed</em> only after the share coordinator has durably persisted the new state. A coordinator write failure leaves the record back in <code>ACQUIRED</code> (still leased) or, if the lease lapsed concurrently, <code>AVAILABLE</code>. The cache and the durable log never silently diverge on the happy path.</p></div>
+
+<h3>Advancing the SPSO</h3>
+<p><code>maybeUpdateCachedStateAndOffsets</code> (<code>SharePartition.java:2643</code>) is the garbage collector. After checking <code>canMoveStartOffset</code> (the offset at SPSO is terminal and has no in-progress transition, :2728), it calls <code>findLastOffsetAcknowledgedAndMetadata</code> to find the highest contiguous terminal offset (:2794). If <em>all</em> cached records are terminal, the cache is cleared and <code>startOffset=endOffset=lastCachedOffset+1</code>. Otherwise only <em>full</em> terminal batches below the boundary are removed; a batch partially acknowledged keeps its entry while <code>startOffset</code> still advances into it. The terminal-record tally is decremented from <code>deliveryCompleteCount</code> as records leave the cache.</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>SPSO only advances over a <em>contiguous prefix</em> of terminal records. A single un-acknowledged record (e.g. acquired by a stuck consumer, or sitting in a compaction/initialization gap) at the head pins the SPSO and prevents the log from aging out beneath it — even though thousands of later records may be acknowledged. This is the share-group analogue of consumer-group "stuck lag".</p></div>
+
+<h2>Mechanics — the acquisition lock &amp; timeout</h2>
+<p>When records are acquired, <code>scheduleAcquisitionLockTimeout</code> (<code>SharePartition.java:2941</code>) adds an <code>AcquisitionLockTimerTask</code> to the timer with delay = the group's record-lock duration (dynamic <code>share.record.lock.duration.ms</code>, else the broker default; resolved in <code>configProvider.recordLockDurationMsOrDefault</code>, :2929). The task stores its absolute <code>expirationMs</code> and the <code>(memberId, firstOffset, lastOffset)</code> it covers.</p>
+<p>On expiry (<code>AcquisitionLockTimerTask.run</code>, <code>AcquisitionLockTimerTask.java:68</code>) it sets a volatile <code>hasExpired=true</code> <em>before</em> invoking the handler — so a racing acknowledgement can detect that the lease already lapsed — then calls <code>releaseAcquisitionLockOnTimeout</code> (<code>SharePartition.java:2961</code>). Under the write lock that handler walks the affected sub-map, transitions each still-<code>ACQUIRED</code> offset back to <code>AVAILABLE</code> (or <code>ARCHIVING</code>/<code>ARCHIVED</code> if the delivery count is exhausted), persists the change, then advances the SPSO and, for any <code>ARCHIVING</code> batches, kicks off the DLQ flow.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">acquire ⇒ ACQUIRED</span><span class="nd">member <span class="mono">M</span> · <span class="mono">lockTimerTask</span> set for <span class="mono">t + lockMs</span></span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord decision">ack before t + lockMs?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-data" data-label="ACCEPT / REJECT / RELEASE"></div>
+      <div class="node cat-broker"><span class="nt">ack handler runs</span><span class="nd">cancels timer task · state persisted</span></div>
+    </div>
+    <div class="col">
+      <div class="conn dashed ec-err" data-label="no ack (slow / crashed / lost session)"></div>
+      <div class="node cat-coord"><span class="nt">timer fires ⇒ hasExpired=true</span><span class="nd">handler runs under write lock</span></div>
+      <div class="conn"></div>
+      <div class="node cat-coord decision">deliveryCount ≥ max?</div>
+      <div class="row">
+        <div class="col">
+          <div class="conn" data-label="no"></div>
+          <div class="node"><span class="nt">AVAILABLE</span><span class="nd">re-deliverable to anyone</span></div>
+        </div>
+        <div class="col">
+          <div class="conn ec-err" data-label="yes · DLQ off"></div>
+          <div class="node cat-error"><span class="nt">ARCHIVED</span></div>
+        </div>
+        <div class="col">
+          <div class="conn ec-err" data-label="yes · DLQ on"></div>
+          <div class="node cat-error"><span class="nt">ARCHIVING ⇒ DLQ ⇒ ARCHIVED</span></div>
+        </div>
+      </div>
+      <div class="conn" data-label="all three converge"></div>
+      <div class="node cat-storage store"><span class="nt">writeShareGroupState</span><span class="nd">findNextFetchOffset=true · advance SPSO</span></div>
+    </div>
+  </div>
+</div>
+<figcaption>Lifecycle of one acquisition lease. An acknowledgement before the lease expires cancels the timer and persists the chosen state; otherwise the timer fires, marks the lease expired, and — under the write lock — either returns the record to <code>AVAILABLE</code> (count below max) or archives it directly (DLQ off) or via the <code>ARCHIVING</code>→DLQ flow (DLQ on), then persists and advances the SPSO.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker / ack handler</span>
+  <span class="lgi"><span class="sw cat-coord"></span>timer · lease · waiting</span>
+  <span class="lgi"><span class="sw cat-storage cyl"></span>durable state write</span>
+  <span class="lgi"><span class="sw cat-error"></span>archive / drop path</span>
+  <span class="lgi"><span class="arr"></span>flow</span>
+  <span class="lgi"><span class="arr dashed"></span>lease expired (timeout)</span>
+  <span class="lgi"><b>rounded italic</b> = decision · <b>cylinder</b> = log/store</span>
+</div></figure>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>Because the lock timeout returns records to <code>AVAILABLE</code> for <em>any</em> member, a consumer that processes a record but is too slow to acknowledge before the lease lapses can cause a duplicate delivery to another consumer. Share groups are at-least-once: applications must tolerate redelivery (idempotent processing), and the lock duration should comfortably exceed worst-case per-record processing time.</p></div>
+
+<h2>Concurrency &amp; threading</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Thread / actor</th><th>Touches</th><th>Synchronization</th></tr></thead>
+<tbody>
+<tr><td>Request-handler (KafkaApis) threads calling <code>acquire</code>/<code>acknowledge</code></td><td><code>cachedState</code>, offsets, delivery count</td><td><code>SharePartition.lock</code> write lock; per-partition <code>fetchLock</code> serializes concurrent fetches</td></tr>
+<tr><td>Timer (hashed-wheel) thread firing lock timeouts</td><td>Same cache; transitions ACQUIRED→AVAILABLE/ARCHIVED</td><td>Re-checks <code>timerTask.isCancelled()</code> / <code>hasExpired</code> under the write lock</td></tr>
+<tr><td>Persister callback threads (RPC completion)</td><td>Commit/rollback of started transitions, SPSO advance</td><td><code>lock</code> write lock inside <code>whenComplete</code>; commit gated on <code>rollbackState</code></td></tr>
+<tr><td>Share coordinator runtime threads</td><td>Coordinator soft state (<code>shareStateMap</code>)</td><td>Single-writer per partition via <code>CoordinatorRuntime</code> event loop (<code>share.coordinator.threads</code>, default 1)</td></tr>
+<tr><td><code>ShareGroupDLQSendThread</code> (one per broker DLQ manager)</td><td>DLQ produce/create-topic RPC batching</td><td><code>InterBrokerSendThread</code>; <code>nodeMapLock</code> guards the coalescing map</td></tr>
+<tr><td>Client application thread (<code>poll</code>)</td><td><code>currentFetch</code>, acknowledgements</td><td><code>ShareConsumerImpl</code> single-threaded access guard (<code>acquireAndEnsureOpen</code>)</td></tr>
+<tr><td>Client background/network thread</td><td>Sends <code>ShareFetch</code>/<code>ShareAcknowledge</code>, heartbeats</td><td>Event queue between app and network threads (<code>ShareConsumeRequestManager</code>)</td></tr>
+</tbody>
+</table></div>
+<p>The two AtomicReference/AtomicInteger fields earn their keep: <code>fetchLock</code> stops the same share-partition entering the delayed-fetch purgatory twice concurrently, and <code>deliveryCompleteCount</code> is read for lag without taking the big lock. The <code>rollbackState</code> field plus the <code>hasOngoingStateTransition()</code> guard form a lightweight per-record mutex: a second acknowledgement of a record whose first transition has not yet committed is rejected (<code>InFlightState.java:153</code>) rather than corrupting state.</p>
+
+<h2>The share coordinator &amp; persister path</h2>
+<p>Share-partition leaders never write <code>__share_group_state</code> directly. They go through the <strong>persister SPI</strong> (<code>Persister</code> interface), whose production implementation is <code>DefaultStatePersister</code> (<code>server-common/.../persister/DefaultStatePersister.java:46</code>, configured by <code>group.share.persister.class.name</code>). It delegates to <code>PersisterStateManager</code>, an inter-broker RPC client that (a) finds the share coordinator for the key via a <code>FindCoordinator</code>-style lookup, then (b) issues <code>WriteShareGroupState</code>/<code>ReadShareGroupState</code>/<code>InitializeShareGroupState</code>/<code>DeleteShareGroupState</code> RPCs, batching by destination node and RPC type (<code>PersisterStateManager.java:90,110</code>). A <code>NoOpStatePersister</code> exists for tests/disabled state.</p>
+<p>The owning coordinator is chosen by hashing the share-partition key onto the state topic: <code>ShareCoordinatorService.partitionFor</code> returns <code>Utils.abs(key.asCoordinatorKey().hashCode()) % numPartitions</code> (<code>ShareCoordinatorService.java:284</code>), and the request lands on the leader of that <code>__share_group_state</code> partition. The state topic defaults to 50 partitions, replication factor 3, min ISR 2 (<code>ShareCoordinatorConfig.java:38,42,47</code>).</p>
+
+<h3>Snapshot/update compaction inside the coordinator</h3>
+<p><code>ShareCoordinatorShard.writeState</code> (<code>ShareCoordinatorShard.java:316</code>) handles a single key per call. <code>generateShareStateRecord</code> (:648) chooses the record type: if the number of update records written since the last snapshot has reached <code>share.coordinator.snapshot.update.records.per.snapshot</code> (default 500, <code>ShareCoordinatorConfig.java:58</code>) it writes a fresh <code>ShareSnapshotValue</code> with <code>snapshotEpoch+1</code>, merging the accumulated batches; otherwise it writes a lightweight <code>ShareUpdateValue</code> delta. On replay, <code>handleShareSnapshot</code> replaces the soft state and <code>handleShareUpdate</code> merges the delta and bumps the per-key update counter (<code>ShareCoordinatorShard.java:245,272</code>).</p>
+<p>Overlapping/adjacent state batches are normalized by <code>PersisterStateBatchCombiner</code> before persistence (<code>ShareCoordinatorShard.java:729</code>), keeping the run-length encoding minimal — without it, repeated partial acks would fragment the batch list unboundedly. Two background mechanisms keep the log healthy: cold-partition force-snapshotting (<code>share.coordinator.cold.partition.snapshot.interval.ms</code>, default 5 min) and state-topic pruning of records below the SPSO (<code>share.coordinator.state.topic.prune.interval.ms</code>, default 5 min).</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">share consumer</span></div>
+  <div class="conn ec-data" data-label="ShareFetch / ShareAcknowledge"></div>
+  <div class="node cat-broker"><span class="nt">SharePartition</span><span class="nd">leader broker · in-flight state engine</span></div>
+  <div class="conn" data-label="writeState (persister RPC)"></div>
+  <div class="node cat-broker"><span class="nt">DefaultStatePersister</span><span class="nd">PersisterStateManager — leader broker</span></div>
+  <div class="conn" data-label="FindCoordinator ⇒ WriteShareGroupState"></div>
+  <div class="node cat-coord"><span class="nt">ShareCoordinatorShard.writeState</span><span class="nd">leader of <span class="mono">__share_group_state[partitionFor(key)]</span></span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord decision">Nth write since snapshot?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="yes"></div>
+      <div class="node cat-control"><span class="nt">ShareSnapshotValue</span><span class="nd">full state, snapshotEpoch+1</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-control"><span class="nt">ShareUpdateValue</span><span class="nd">incremental delta</span></div>
+    </div>
+  </div>
+  <div class="conn" data-label="append"></div>
+  <div class="node cat-storage store"><span class="nt">__share_group_state log</span></div>
+</div>
+<figcaption>The durable-state write path. A share-partition leader never writes the state topic itself: it calls the persister SPI, which finds the owning <code>ShareCoordinator</code> and issues <code>WriteShareGroupState</code>. The coordinator then appends either a full <code>ShareSnapshotValue</code> (every Nth write) or a lightweight <code>ShareUpdateValue</code> delta to the <code>__share_group_state</code> log.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker (SharePartition · persister)</span>
+  <span class="lgi"><span class="sw cat-coord"></span>share coordinator</span>
+  <span class="lgi"><span class="sw cat-control"></span>coordinator record (snapshot / update)</span>
+  <span class="lgi"><span class="sw cat-storage cyl"></span>internal log topic</span>
+  <span class="lgi"><span class="arr"></span>data flow</span>
+  <span class="lgi"><b>rounded italic</b> = decision · <b>cylinder</b> = log/store</span>
+</div></figure>
+
+<div class="callout invariant"><span class="callout-title">Invariant — recovery</span><p>On (re)assignment the leader rebuilds <code>SharePartition</code> by calling <code>persister.readState</code> in <code>maybeInitialize</code> (<code>SharePartition.java:426</code>), seeding <code>startOffset</code>, <code>stateEpoch</code> and the in-flight batches from the latest snapshot + replayed updates. Records that were merely <code>ACQUIRED</code> (leased, not acknowledged) are not persisted as such — after a leader change they reappear as <code>AVAILABLE</code> and may be redelivered. Acknowledged/archived terminal states survive.</p></div>
+
+<h2>Dead-letter queue (KIP-1191)</h2>
+<p>When DLQ support is enabled (the broker's <code>share.version</code> feature reaches <code>SV_2</code>) <em>and</em> the group has a DLQ topic configured (<code>isDLQEnabledForGroup</code>, <code>SharePartition.java:3356</code>), records that would otherwise be archived for exceeding the delivery limit instead pass through <code>ARCHIVING</code> and are produced to a DLQ topic. The group config keys are <code>errors.deadletterqueue.topic.name</code> (default empty = no DLQ) and <code>errors.deadletterqueue.copy.record.enable</code> (default <code>false</code>) (<code>GroupConfig.java:113,117</code>).</p>
+<p><code>ShareGroupDLQStateManager</code> (<code>server/.../dlq/ShareGroupDLQStateManager.java:88</code>) owns the write path on its own <code>InterBrokerSendThread</code>. For each <code>ShareGroupDLQRecordParameter</code> (offset range, group, delivery count, cause) it: validates/creates the DLQ topic (a <code>CreateTopics</code> RPC if absent and auto-create is enabled), then produces records to <code>partition % numDlqPartitions</code> with <code>acks=-1</code>. It coalesces multiple pending produce handlers destined for the same node into one <code>ProduceRequest</code> (<code>coalesceProduceRequests</code>, :922). Each DLQ record gets headers describing the original location: <code>__dlq.errors.topic</code>, <code>...partition</code>, <code>...offset</code>, <code>...group</code>, <code>...delivery.count</code>, <code>...message</code> (<code>ShareGroupDLQStateManager.java:242</code>). When copy-record is enabled the original key/value are fetched from the source log (<code>maybeFetchRecordData</code>, :690) and copied; otherwise only the context headers are written. Only after the DLQ produce succeeds does the source record move <code>ARCHIVING → ARCHIVED</code>; the DLQ manager retries with exponential backoff up to <code>MAX_REQUEST_ATTEMPTS = 5</code> (:98).</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The two-phase <code>ARCHIVING → ARCHIVED</code> design (KIP-1191) is resumable: a leader that restarts mid-DLQ reads back batches in <code>ARCHIVING</code> state and restarts phase 2 (<code>SharePartition.java:457</code>, the <code>dlqBatches</code> handling in <code>maybeInitialize</code>). This avoids losing a record that was destined for the DLQ but not yet produced, at the cost of a possible duplicate DLQ write after a crash.</p></div>
+
+<h2>The share consumer client</h2>
+<p><code>ShareConsumerImpl.poll</code> (<code>clients/.../ShareConsumerImpl.java:597</code>) drives the cycle on the application thread: process background errors, handle completed acknowledgements, then — depending on mode — either implicitly acknowledge the previously returned batch or assert all in-flight records were explicitly acknowledged, before fetching the next batch. Acknowledgements are <em>not</em> a separate user step in the default mode; they piggyback on the next fetch.</p>
+<p>The acknowledgement mode is client config <code>share.acknowledgement.mode</code> with values <code>implicit</code> (default behaviour: poll auto-acks the prior batch as ACCEPT) or <code>explicit</code> (the app must call <code>acknowledge(record, type)</code> for every record before the next poll) (<code>ShareAcknowledgementMode.java:29</code>; <code>ShareConsumerImpl.java:796,804,817</code>). In explicit mode, <code>commitSync</code>/<code>commitAsync</code> flush acknowledgements to the broker (<code>ShareConsumerImpl.java:831,886</code>).</p>
+<p><code>ShareConsumeRequestManager</code> (<code>ShareConsumeRequestManager.java:76</code>) on the network thread keeps a per-node map <code>fetchAcknowledgementsToSend</code> and attaches pending acks to the next <code>ShareFetch</code> to that node, or sends a standalone <code>ShareAcknowledge</code> when there is no fetch to ride on (:181,1285). Share-group membership is a separate concern over the <code>SHARE_GROUP_HEARTBEAT</code> RPC handled by <code>ShareMembershipManager</code>/<code>ShareHeartbeatRequestManager</code> — there is no eager rebalance; members come and go and the assignment is computed server-side (the modern protocol of chapter <a href="13-group-coordination.html">13</a>).</p>
+
+<h2>Configuration reference</h2>
+<p>Broker/group-level (<code>ShareGroupConfig</code>, with per-group dynamic overrides in <code>GroupConfig</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>group.share.record.lock.duration.ms</code></td><td>30000</td><td>Acquisition-lock lease length; dynamic per-group override <code>share.record.lock.duration.ms</code>.</td></tr>
+<tr><td><code>group.share.min/max.record.lock.duration.ms</code></td><td>15000 / 60000</td><td>Bounds on the per-group override.</td></tr>
+<tr><td><code>group.share.delivery.count.limit</code></td><td>5</td><td>Max delivery attempts before archive/DLQ (range 2–10).</td></tr>
+<tr><td><code>group.share.min/max.delivery.count.limit</code></td><td>2 / 10</td><td>Bounds on the per-group override (override max range 5–25).</td></tr>
+<tr><td><code>group.share.partition.max.record.locks</code></td><td>2000</td><td>Max in-flight (locked) records per share-partition — the concurrency cap.</td></tr>
+<tr><td><code>group.share.min/max.partition.max.record.locks</code></td><td>100 / 4000</td><td>Bounds on the per-group override.</td></tr>
+<tr><td><code>group.share.max.share.sessions</code></td><td>2000</td><td>Max share sessions per broker.</td></tr>
+<tr><td><code>group.share.persister.class.name</code></td><td><code>DefaultStatePersister</code></td><td>Persister SPI implementation (internal).</td></tr>
+<tr><td><code>share.auto.offset.reset</code> (group)</td><td><code>latest</code></td><td>Initial SPSO strategy when none persisted.</td></tr>
+<tr><td><code>share.isolation.level</code> (group)</td><td><code>read_uncommitted</code></td><td>Whether to skip aborted transactional records when acquiring.</td></tr>
+<tr><td><code>errors.deadletterqueue.topic.name</code> (group)</td><td>"" (off)</td><td>DLQ topic; empty disables the DLQ.</td></tr>
+<tr><td><code>errors.deadletterqueue.copy.record.enable</code> (group)</td><td>false</td><td>Copy original key/value to DLQ vs. headers only.</td></tr>
+</tbody>
+</table></div>
+<p>Share-coordinator level (<code>ShareCoordinatorConfig</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>share.coordinator.state.topic.num.partitions</code></td><td>50</td><td>Partitions of <code>__share_group_state</code> (fixed after deploy).</td></tr>
+<tr><td><code>share.coordinator.state.topic.replication.factor</code> / <code>.min.isr</code></td><td>3 / 2</td><td>Durability of the state topic.</td></tr>
+<tr><td><code>share.coordinator.snapshot.update.records.per.snapshot</code></td><td>500</td><td>Update records between full snapshots (range 0–500).</td></tr>
+<tr><td><code>share.coordinator.threads</code></td><td>1</td><td>Coordinator runtime threads.</td></tr>
+<tr><td><code>share.coordinator.write.timeout.ms</code></td><td>5000</td><td>Timeout for a state write.</td></tr>
+<tr><td><code>share.coordinator.cold.partition.snapshot.interval.ms</code></td><td>300000</td><td>Force-snapshot idle share-partitions.</td></tr>
+<tr><td><code>share.coordinator.state.topic.prune.interval.ms</code></td><td>300000</td><td>Prune state-topic records below SPSO.</td></tr>
+</tbody>
+</table></div>
+<p>Client (<code>ConsumerConfig</code> for the share consumer): <code>share.acknowledgement.mode</code> (default <code>implicit</code>), <code>share.acquire.mode</code> (default <code>batch_optimized</code>) (<code>ConsumerConfig.java:375,386,391</code>).</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+<li><strong>Consumer crash / slow ack.</strong> The acquisition lock expires; records return to <code>AVAILABLE</code> and are redelivered (or archived/DLQ'd if exhausted). No manual intervention; this is the queue's liveness mechanism.</li>
+<li><strong>Coordinator write fails.</strong> The acknowledgement is not committed; the record stays <code>ACQUIRED</code> (or <code>AVAILABLE</code> if the lease lapsed). The persister surfaces coordinator errors as retryable (<code>CoordinatorNotAvailableException</code>, <code>NotLeaderOrFollowerException</code> for fenced epochs) via <code>fetchPersisterError</code> (<code>SharePartition.java:2906</code>).</li>
+<li><strong>Leader change.</strong> The new leader re-reads durable state; non-terminal leases evaporate to <code>AVAILABLE</code>; partially-acknowledged batches with gaps are reconstructed and may produce an initial read-gap window that the engine fills before advancing the SPSO (<code>SharePartition.java:288,2691</code>).</li>
+<li><strong>Compaction.</strong> Batches that vanish from the log are detected on the next acquire and archived so the SPSO is not pinned (<code>maybeArchiveStaleBatches</code>); intra-batch holes are reported by the client.</li>
+<li><strong>Fenced state epoch.</strong> A stale leader/persister write is rejected by the coordinator; the partition transitions toward <code>FENCED</code> and is re-initialized.</li>
+<li><strong>Duplicate acknowledgement.</strong> A second ack for an offset with an in-progress transition is dropped (<code>hasOngoingStateTransition()</code>), preventing double state changes from a misbehaving or retrying client.</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<ul>
+<li><strong>At-least-once.</strong> Every record below the SPSO has reached a terminal state; every record above may be (re)delivered. There is no exactly-once for share-group <em>consumption</em> — contrast chapter <a href="14-transactions-eos.html">14</a>.</li>
+<li><strong>No ordering guarantee across consumers.</strong> Cooperative consumption of one partition by many members means records are processed out of partition order; per-key ordering is not preserved.</li>
+<li><strong>Bounded in-flight.</strong> At most <code>partition.max.record.locks</code> records are simultaneously leased per share-partition.</li>
+<li><strong>Bounded redelivery.</strong> At most <code>delivery.count.limit</code> deliveries per record before archive/DLQ.</li>
+<li><strong>Durable terminal state.</strong> Acknowledged/archived decisions survive broker and leader restarts via <code>__share_group_state</code>.</li>
+</ul>
+
+<h2>Share groups vs. consumer groups vs. transactions</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Dimension</th><th>Consumer group (ch 13/17)</th><th>Share group (this chapter)</th><th>Transactions / EOS (ch 14)</th></tr></thead>
+<tbody>
+<tr><td>Partition → consumer</td><td>1:1 (exclusive)</td><td>N:M (cooperative on same partition)</td><td>n/a (producer concern)</td></tr>
+<tr><td>Progress unit</td><td>One committed offset / partition</td><td>Per-record state + delivery count</td><td>Producer txn markers + offsets</td></tr>
+<tr><td>Delivery semantics</td><td>At-least / at-most-once (commit timing)</td><td>At-least-once with redelivery</td><td>Exactly-once</td></tr>
+<tr><td>Redelivery control</td><td>Manual rewind of offset</td><td>Lock timeout + RELEASE + max attempts + DLQ</td><td>Abort / retry whole txn</td></tr>
+<tr><td>Durable state topic</td><td><code>__consumer_offsets</code></td><td><code>__share_group_state</code></td><td><code>__transaction_state</code></td></tr>
+<tr><td>Broker memory model</td><td>Offset map</td><td>In-flight record state cache (<code>SharePartition</code>)</td><td>Producer/txn state</td></tr>
+</tbody>
+</table></div>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Share groups (KIP-932, "Queues for Kafka") add point-to-point queue semantics without abandoning Kafka's log: records stay in the normal topic log, and only lightweight per-record delivery state lives in a compacted internal topic. Keeping the in-flight state on the partition leader (not in the client) is what allows more consumers than partitions and centralized, fenced redelivery. KIP-1226 added <code>DeliveryCompleteCount</code> to the persisted state so operators can compute share-partition lag. KIP-1191 introduced the transient <code>ARCHIVING</code> state and the dead-letter-queue flow so that records exhausting their delivery budget can be inspected rather than silently dropped.</p></div>
+<p>The feature shipped as a preview in 4.1 and matured through 4.2; this 4.4-SNAPSHOT tree contains the full set including DLQ, lag, and the batch-vs-record acquire modes.</p>
+
+<h2>Gotchas &amp; operational notes</h2>
+<ul>
+<li><strong>Lock duration vs. processing time.</strong> Set <code>share.record.lock.duration.ms</code> above the p99 processing time per record; too short causes spurious redelivery, too long delays recovery from a dead consumer.</li>
+<li><strong>SPSO pinning.</strong> Monitor share-partition lag (KIP-1226): a non-advancing SPSO indicates a head-of-line record stuck in repeated redelivery, often a poison record that should land in the DLQ.</li>
+<li><strong>State-topic sizing.</strong> The <code>__share_group_state</code> topic's partition count is effectively fixed; size it for the number of share-partitions and ack throughput, since every ack flush is a coordinator write.</li>
+<li><strong>DLQ topic must not start with <code>__</code></strong> and, if not auto-created, must exist with DLQ enabled — otherwise the DLQ flow fails validation (<code>ShareGroupDLQStateManager.java:417,424</code>).</li>
+<li><strong>Implicit vs. explicit acks.</strong> In the default implicit mode, simply re-polling acknowledges the prior batch as ACCEPT; to RELEASE/REJECT individual records you must switch to explicit mode and call <code>acknowledge(...)</code>.</li>
+<li><strong>Not exactly-once.</strong> Do not treat share groups as a drop-in for transactional consume-process-produce; design consumers to be idempotent.</li>
+</ul>

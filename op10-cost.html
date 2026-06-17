@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cost Engineering · Kafka Internals</title>
+<meta name="description" content="Storage/network/cross-AZ cost drivers and the levers: compression, fetch-from-follower, tiered storage, RF.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="op10-cost">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>II · 10 · Cost Engineering</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">In the cloud, a Kafka bill is rarely what an engineer expects. The instinct is "more brokers = more money," and compute is real — but on a well-utilised cluster it is usually the <em>smallest</em> of the three line items. The two giants are <strong>storage</strong> (ingress × retention × replication factor, sitting on local disk that the RF multiplies) and, almost always the largest, <strong>cross-AZ network transfer</strong> — because Kafka's replication protocol copies every byte <code>RF&minus;1</code> times between brokers, and in a multi-AZ deployment those copies, plus the producer write to a leader in another zone and every consumer fetch from a leader in another zone, all cross zone boundaries that the cloud provider meters per gigabyte in each direction. Confluent's own teardown of a 100&nbsp;MBps cluster splits it roughly <strong>$2.3k compute / $14.5k storage / $24.2k networking</strong> per month — networking "likely over 50%," rising to ~90% once tiered storage shrinks storage (Confluent, <em>empirical</em>). This chapter roots every cost driver in a concrete mechanism you have already met in Part I, gives each lever its dial and its tradeoff, and ends with a worked cost model and an effort/impact-ranked lever table. The cardinal rule here is unusually literal: each dollar has a <em>why</em>, and the why is a byte that some piece of source code decided to copy, store, or compress.</p>
+
+<h2>The three cost drivers, each rooted in a mechanism</h2>
+
+<p>Kafka's architecture fixes the shape of the bill before you tune anything. Three mechanisms — log persistence, ISR replication, and broker-owned compute — each generate one of the three line items. Internalise the mechanism and the cost becomes predictable arithmetic rather than a surprise.</p>
+
+<figure class="diagram">
+  <div class="dstack">
+    <div class="layer cat-control">
+      <div class="ln">NETWORK — usually the largest in the cloud</div>
+      <div class="ld">cross-AZ replication (<code>ingress × (RF&minus;1)</code>) + cross-AZ produce (~⅔ of writes) + cross-AZ consumer fetch (~⅔ × #groups). Metered per GB, each direction. The replication term dominates at RF=3.</div>
+      <div class="row"><span class="chip">$0.01/GB ea. way (AWS)</span><span class="chip">RF=3 ⇒ 2× ingress copied</span><span class="chip">ISR — Part I 08</span></div>
+    </div>
+    <div class="sep">+</div>
+    <div class="layer cat-storage">
+      <div class="ln">STORAGE — local disk, multiplied by RF</div>
+      <div class="ld"><code>ingress × retention × RF</code> on broker-attached block storage (EBS/SSD). Every produced byte is written to disk and the log keeps it for the retention window; RF copies it on RF brokers.</div>
+      <div class="row"><span class="chip">EBS ~$0.08/GB-mo</span><span class="chip">log engine — Part I 03</span><span class="chip">tiered — Part I 05</span></div>
+    </div>
+    <div class="sep">+</div>
+    <div class="layer cat-broker">
+      <div class="ln">COMPUTE — brokers (CPU, RAM, NIC)</div>
+      <div class="ld">CPU for compression/decompression, TLS handshakes + record encryption, request handling, replication fetch. RAM split heap (~6&nbsp;GB) vs page cache. Usually the smallest line item on a well-utilised cluster.</div>
+      <div class="row"><span class="chip">heap ~6 GB</span><span class="chip">page cache = read accelerator</span><span class="chip">net/threads — Part I 06</span></div>
+    </div>
+  </div>
+  <figcaption>The bill decomposes by mechanism. The order shown — network ≥ storage ≥ compute — is the typical cloud ordering for a multi-AZ RF=3 cluster at meaningful throughput.</figcaption>
+  <div class="legend">
+    <span class="sw cat-control"></span> network / cross-AZ transfer&nbsp;&nbsp;
+    <span class="sw cat-storage"></span> storage / local disk&nbsp;&nbsp;
+    <span class="sw cat-broker"></span> compute / brokers&nbsp;&nbsp;
+    <span class="mono">chip</span> = a key number or the Part&nbsp;I chapter that explains the mechanism
+  </div>
+</figure>
+
+<h3>Driver 1 — Storage: ingress × retention × RF</h3>
+
+<p>Every byte a producer sends is appended to the leader's log and, because Kafka persists to disk by design (Part I <a href="03-storage-log-engine.html">Storage &amp; the Log Engine</a>), written to broker-attached block storage. The log retains it for the configured window, and the replication factor copies the whole log onto <code>RF</code> brokers. The storage bill is therefore the cleanest formula in the chapter:</p>
+
+<dl class="kv">
+  <dt>Storage (GB on disk)</dt><dd><code>ingress (MB/s) × 86,400 (s/day) × retention (days) × 0.001 (GB/MB) × RF</code> — the two literals are pure unit conversions: <strong>86,400&nbsp;s/day</strong> = 60×60×24 (turns a per-second rate into bytes/day), and <strong>0.001&nbsp;GB/MB</strong> converts MB→GB. Units cancel to GB: <code>(MB/s)·(s/day)·(days)·(GB/MB)</code> = GB.</dd>
+  <dt>Storage cost/mo</dt><dd><code>(GB on disk) × $/GB-month</code> — at the assumed <strong>$0.08/GB-mo</strong> EBS gp3 rate (Confluent, <em>empirical</em>; an illustrative cloud price — check your bill).</dd>
+</dl>
+
+<p>The three multipliers are all operator-controlled, and each maps to a config with a source-verified default:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Multiplier</th><th>Config (default)</th><th>Source</th><th>Cost effect</th></tr></thead>
+  <tbody>
+    <tr><td>Retention (time)</td><td><code>retention.ms</code> = <strong>604800000</strong> (7&nbsp;days)</td><td><code>storage/.../LogConfig.java:134,212</code> (<code>DEFAULT_RETENTION_MS = 24*7*60*60*1000</code>)</td><td>Linear: halve retention → halve storage.</td></tr>
+    <tr><td>Retention (size)</td><td><code>retention.bytes</code> = <strong>&minus;1</strong> (unbounded)</td><td><code>server-common/.../ServerLogConfigs.java:81</code> (<code>LOG_RETENTION_BYTES_DEFAULT = -1</code>)</td><td>A hard per-partition cap; the binding limit when both are set.</td></tr>
+    <tr><td>Replication factor</td><td><code>default.replication.factor</code> = <strong>1</strong></td><td><code>server/.../ReplicationConfigs.java:42,153</code> (<code>REPLICATION_FACTOR_DEFAULT = 1</code>)</td><td>Direct multiplier: RF=3 stores 3× the bytes of RF=1.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout gotcha"><span class="callout-title">The default RF is 1 — and that is a cost trap in disguise</span><p><code>default.replication.factor=1</code> is the source default, but it is <em>not</em> a production setting: RF=1 means a single broker loss permanently loses data, and (see Part I <a href="08-replication.html">Replication &amp; the ISR</a>) it silently breaks <code>min.insync.replicas=2</code> because the effective in-sync requirement is capped at the replica count. Every durable deployment overrides RF to 3, which <strong>triples both the storage and the cross-AZ replication bill</strong>. The cost of durability is not a footnote; it is a factor-of-3 on your two largest line items, and it is why RF is the first dial to revisit on non-critical topics (RF=3→2 cuts both by ⅓). Set durability deliberately in <a href="op06-durability.html">Durability Engineering</a> — do not let it be an accident of the default.</p></div>
+
+<h3>Driver 2 — Network: replication amplification + cross-AZ transfer</h3>
+
+<p>This is the one that surprises people, and it is structural. Two distinct things make up the network bill, and both come straight from how Kafka moves bytes.</p>
+
+<p><strong>(a) Replication amplification.</strong> When a producer writes 1&nbsp;GB to a partition leader, the ISR mechanism (Part I <a href="08-replication.html">Replication &amp; the ISR</a>) copies that GB to each of the <code>RF&minus;1</code> followers via their replica-fetcher threads. So <code>RF&minus;1</code> GB of <em>inter-broker</em> traffic is generated per GB ingested — at RF=3, <strong>2&nbsp;GB of replication per 1&nbsp;GB written</strong>. This shows up on the brokers as <code>kafka.server:type=BrokerTopicMetrics,name=ReplicationBytesInPerSec</code> / <code>ReplicationBytesOutPerSec</code> (<code>storage/.../BrokerTopicMetrics.java:37&ndash;38</code>) — watch those to see the amplification directly.</p>
+
+<p><strong>(b) Cross-AZ billing.</strong> Inside a single AZ, inter-broker traffic is free. The cloud meters traffic that <em>crosses</em> AZ boundaries — and Kafka's placement guarantees a lot of it crosses:</p>
+
+<ul>
+  <li>Clients (producers and consumers) talk only to the partition <strong>leader</strong>. With brokers spread across 3 AZs, a leader is in a different AZ from the client ~⅔ of the time. So ~⅔ of produce bytes and ~⅔ of consumer-fetch bytes cross a zone boundary.</li>
+  <li><strong>All</strong> replication crosses zones when RF spans AZs (the whole point of multi-AZ RF is that the replicas are in different failure domains). That is the <code>ingress × (RF&minus;1)</code> term, and it dominates.</li>
+</ul>
+
+<dl class="kv">
+  <dt>Cross-AZ throughput (3 AZ)</dt><dd><code>(ingress × ⅔) + (egress × ⅔) + (ingress × (RF&minus;1))</code> — Confluent / AutoMQ formula (<em>empirical</em>). The <strong>⅔</strong> is a probability, not a tunable: with brokers evenly spread over <strong>3</strong> AZs, a randomly placed client shares the leader's AZ <strong>1 of 3</strong> times, so <code>1 &minus; ⅓ = ⅔</code> of produce and of fetch bytes cross a zone boundary. The <strong>(RF&minus;1)</strong> replication term carries no ⅔ because <em>every</em> follower copy is placed in a different AZ on purpose (that is the point of multi-AZ RF).</dd>
+  <dt>Effective AWS rate</dt><dd><strong>$0.01/GB in EACH direction → ~$0.02/GB</strong> effective (AutoMQ, 2minutestreaming, <em>empirical</em>; illustrative — verify against your cloud bill). GCP ≈ $0.01/GB once; Azure inter-AZ historically free.</dd>
+</dl>
+
+<figure class="diagram">
+  <div class="dseq" style="--cols:4">
+    <div class="lanes">
+      <span class="actor cat-client">Producer (AZ-a)</span>
+      <span class="actor cat-broker">Leader (AZ-b)</span>
+      <span class="actor cat-broker">Follower (AZ-c)</span>
+      <span class="actor cat-client">Consumer (AZ-a)</span>
+    </div>
+    <div class="body">
+      <div class="lifelines"><i></i><i></i><i></i><i></i></div>
+      <div class="m r" style="--from:1;--to:2"><span class="ml">produce 1&nbsp;GB — crosses AZ ($)</span><span class="ln"></span></div>
+      <div class="m r" style="--from:2;--to:3"><span class="ml">replicate 1&nbsp;GB — crosses AZ ($) [×(RF&minus;1)]</span><span class="ln"></span></div>
+      <div class="m l dashed" style="--from:3;--to:2"><span class="ml">ack (ISR)</span><span class="ln"></span></div>
+      <div class="m l" style="--from:2;--to:4"><span class="ml">consumer fetch 1&nbsp;GB from leader — crosses AZ ($)</span><span class="ln"></span></div>
+    </div>
+  </div>
+  <figcaption>One 1&nbsp;GB write, naive placement, RF=3, one consumer group: ~1&nbsp;GB produce (cross-AZ ~⅔ of the time) + 2&nbsp;GB replication (cross-AZ) + ~1&nbsp;GB fetch (cross-AZ ~⅔). The replication term is the structural floor.</figcaption>
+  <div class="legend">
+    <span class="sw cat-client"></span> client&nbsp;&nbsp;
+    <span class="sw cat-broker"></span> broker&nbsp;&nbsp;
+    <span class="arr"></span> data transfer (billed if it crosses AZ)&nbsp;&nbsp;
+    <span class="arr dashed"></span> ack / control&nbsp;&nbsp;
+    <span class="mono">($)</span> = a metered cross-AZ hop
+  </div>
+</figure>
+
+<div class="callout rationale"><span class="callout-title">Why network beats compute and storage</span><p>Compute scales with <em>broker count</em>, which scales with peak throughput — and modern instances are cheap per MB/s. Storage scales with <em>bytes at rest</em>. But cross-AZ network scales with <em>bytes in motion × an amplification factor</em> that, for one consumer group, is roughly <code>(RF&minus;1) + ⅔ + ⅔ = (RF&minus;1) + 4/3</code> — the <code>RF&minus;1</code> replication copies, plus ⅔ of produce and ⅔ of fetch crossing zones (the <code>4/3</code> is just those two ⅔ terms added) — and every gigabyte is charged twice (each direction) at a non-trivial rate. AutoMQ's worked example: a 3-node, 100&nbsp;MiB/s, 3-consumer-group cluster moves ~173&nbsp;TB/mo of producer writes (~$3,460) but ~$10,360 of replication and ~$10,360 of consumer reads — landing at <strong>$14k&ndash;$24k/mo</strong> in cross-AZ alone, vs a VM bill an order of magnitude smaller (AutoMQ, <em>empirical</em>). Even with fetch-from-follower eliminating the consumer term, a produce+replication floor of ~$13.8k/mo remains. This is why the cost levers below are ordered with the networking levers high.</p></div>
+
+<h3>Driver 3 — Compute: brokers</h3>
+
+<p>Compute is CPU, RAM, and NIC on the broker fleet. The CPU-heavy paths are compression/decompression (Part I <a href="01-record-format.html">The Record &amp; Batch Format</a>), TLS handshakes and per-record encryption (Part I <a href="18-security.html">Security</a>), request handling across the network/IO thread pools (Part I <a href="06-network-and-threading.html">Network &amp; Threading</a>), and replication fetch. RAM is split: keep the JVM heap small — ~<strong>6&nbsp;GB</strong> — and leave the rest of the box to the OS page cache, which is the real read/write accelerator via zero-copy <code>sendfile</code> (Confluent, <em>empirical</em>; the page-cache fetch path is Part I <a href="09-fetch-path.html">The Fetch Path</a>). On a well-utilised, well-batched cluster, compute is usually the smallest of the three line items; it becomes material only when TLS + high message rates + heavy compression saturate cores, or when over-provisioned brokers sit idle. Right-sizing compute is the subject of <a href="op04-capacity-planning.html">Capacity Planning</a>; here we note only that throwing brokers at a throughput problem is cheap, while throwing them at a network-cost problem does nothing — cross-AZ is per-GB, not per-broker.</p>
+
+<h2>The levers — each with its mechanism, dial, and tradeoff</h2>
+
+<p>Five levers, in roughly increasing order of effort and architectural disruption. The first is nearly free; the last restructures the cost model. Each is grounded in a specific Kafka feature you can point to in source.</p>
+
+<h3>Lever 1 — Compression: <code>compression.type</code> (cuts storage AND network at CPU cost)</h3>
+
+<p>Compression is the highest-leverage, lowest-effort move, because Kafka compresses <strong>per record batch on the producer</strong> and then <strong>stores and replicates the batch still compressed</strong> — the broker does not recompress on the happy path, and zero-copy fetch ships the compressed bytes to consumers untouched. So a single producer config simultaneously shrinks storage, replication bytes, cross-AZ transfer, <em>and</em> consumer-fetch bytes. The cost is CPU on the producer (and on any consumer that decompresses).</p>
+
+<p>The source enumerates exactly five codecs and their level ranges in <code>clients/.../record/internal/CompressionType.java</code>:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Codec (<code>id</code>)</th><th>Level range / default</th><th>Source line</th><th>Ratio (HTTP data)</th><th>Speed</th></tr></thead>
+  <tbody>
+    <tr><td><code>none</code> (0)</td><td>—</td><td><code>CompressionType.java:30</code></td><td>1.0×</td><td>n/a</td></tr>
+    <tr><td><code>gzip</code> (1)</td><td>1&ndash;9, default <code>-1</code> (Deflater.DEFAULT)</td><td><code>CompressionType.java:33&ndash;36</code></td><td>3.58×</td><td>slowest — usually avoided</td></tr>
+    <tr><td><code>snappy</code> (2)</td><td>— (no levels)</td><td><code>CompressionType.java:71</code></td><td>2.35×</td><td>fast</td></tr>
+    <tr><td><code>lz4</code> (3)</td><td>1&ndash;17, default <strong>9</strong></td><td><code>CompressionType.java:72,75&ndash;77</code></td><td>1.81×</td><td>fastest decompress (2,428&nbsp;MB/s)</td></tr>
+    <tr><td><code>zstd</code> (4)</td><td>&minus;131072&ndash;22, default <strong>3</strong></td><td><code>CompressionType.java:99,105&ndash;109</code></td><td><strong>4.5×</strong> (lvl 6)</td><td>moderate (409/844&nbsp;MB/s)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Ratios and speeds above are Cloudflare's production measurements on ~1&nbsp;MB / 600-record HTTP-request batches (<em>empirical</em>) — they are <strong>data-dependent</strong>, not guarantees: text/JSON compresses ~10&ndash;12×, pre-compressed or binary payloads barely at all. The operational defaults that fall out:</p>
+
+<ul>
+  <li><strong><code>compression.type=lz4</code></strong> when CPU/latency matter most — fastest codec, ~1.8&ndash;2× shrink, smallest CPU tax. The throughput recipe's default.</li>
+  <li><strong><code>compression.type=zstd</code></strong> when bytes (and therefore cross-AZ + storage cost) matter most — markedly better ratio for moderately more CPU. Cloudflare chose zstd and saved "hundreds of gigabits of internal traffic and terabytes of flash storage," cancelling a hardware expansion (<em>empirical</em>); Trendyol reported ~70% message-size reduction at zstd level 3 (<em>empirical</em>). Tune the level via <code>compression.zstd.level</code> (added with fine-grained level control, <span class="pill kip">KIP-390</span>/<span class="pill kip">KIP-780</span>).</li>
+</ul>
+
+<div class="callout gotcha"><span class="callout-title">Compression is per batch — tiny batches barely compress</span><p>Because the unit of compression is the record batch, a producer that flushes one record at a time gets almost no ratio regardless of codec. Compression therefore composes with batching: raise <code>batch.size</code> (default 16384) and set a non-zero <code>linger.ms</code> so batches fill before they ship — only then does "zstd gives 4.5×" materialise. See <a href="op05-performance-tuning.html">Performance Tuning</a> for the batching dials. Also: the producer default is <code>compression.type=none</code> (<code>ProducerConfig.java:245,409</code>; the doc literally says "The default is none"), and the broker default is <code>compression.type=producer</code> — meaning the broker keeps whatever the producer sent (<code>server-common/.../ServerLogConfigs.java:178</code> → <code>BrokerCompressionType.PRODUCER</code>, <code>BrokerCompressionType.java:33</code>). So if no one sets it, <strong>nothing is compressed</strong>. "zstd is the default" is a common and costly myth.</p></div>
+
+<h3>Lever 2 — Fetch-from-follower: rack-aware replica selection <span class="pill kip">KIP-392</span> (kills consumer cross-AZ)</h3>
+
+<p>By default, a consumer always fetches from the partition leader — which is in another AZ ~⅔ of the time, generating the cross-AZ consumer-read term. <span class="pill kip">KIP-392</span> lets a consumer instead read from a <em>same-AZ follower replica</em>, eliminating that term entirely. It is a configuration change, not an architectural one, and on consumer-read-heavy clusters it is the single biggest networking win after compression.</p>
+
+<p>Three configs turn it on; all are source-verified:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Side</th><th>Config</th><th>Value</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Broker</td><td><code>broker.rack</code></td><td>this broker's AZ id (e.g. <code>us-east-1a</code>)</td><td><code>server-common/.../ServerConfigs.java:92</code></td></tr>
+    <tr><td>Broker</td><td><code>replica.selector.class</code></td><td><code>org.apache.kafka.common.replica.RackAwareReplicaSelector</code></td><td><code>server/.../ReplicationConfigs.java:140,173</code> (default <code>null</code> = "returns the leader")</td></tr>
+    <tr><td>Consumer</td><td><code>client.rack</code></td><td>the consumer's AZ id (must match a <code>broker.rack</code>)</td><td><code>clients/.../CommonClientConfigs.java:77&ndash;79</code> (default <code>""</code>)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The mechanism is worth seeing in source, because its constraints are the tradeoff. The broker resolves the preferred replica in <code>ReplicaManager.findPreferredReadReplica</code> (<code>core/.../ReplicaManager.scala:1964&ndash;2013</code>), which builds the candidate set and hands it to the selector. Two guards in that code define the behaviour:</p>
+
+<ul>
+  <li>A follower is a candidate <strong>only if it is in the ISR</strong> and its <code>logEndOffset ≥ fetchOffset ≥ logStartOffset</code> (<code>ReplicaManager.scala:1985&ndash;1987</code>). The comment is explicit: excluding out-of-sync replicas prevents the leader from "continuously pick[ing] the lagging follower … indefinitely."</li>
+  <li><code>RackAwareReplicaSelector</code> then filters to replicas whose <code>endpoint().rack()</code> equals the client's <code>rackId</code>; if the leader is in-rack it returns the leader, otherwise the <strong>most caught-up</strong> in-rack replica; if none are in-rack it falls back to the leader (<code>clients/.../replica/RackAwareReplicaSelector.java:35&ndash;52</code>).</li>
+</ul>
+
+<div class="callout rationale"><span class="callout-title">The latency tradeoff is the high-watermark, and it is real</span><p>A follower can only serve records up to the <strong>high-watermark</strong> (the offset replicated to the full ISR; see Part I <a href="09-fetch-path.html">The Fetch Path</a> and <a href="08-replication.html">Replication &amp; the ISR</a>) — it cannot hand out data the leader has but the ISR has not yet confirmed. Consumers that switch to a follower therefore see data slightly later than the leader's log end. Grab measured "up to 500&nbsp;ms" of added consumer latency from this, and observed broker <em>load skew</em> because fetch traffic now follows replica placement rather than leader placement (Grab/InfoQ, <em>empirical</em>). What it does <strong>not</strong> touch: produce and replication bytes still cross AZ. Grab's result — reconfigured-consumer cross-AZ cost driven to <strong>zero</strong>, at +500&nbsp;ms — is the canonical outcome (<em>empirical</em>).</p></div>
+
+<h3>Lever 3 — RF and retention as cost dials</h3>
+
+<p>Before reaching for new architecture, the two oldest dials give linear savings with no latency penalty — only a durability/availability tradeoff:</p>
+
+<ul>
+  <li><strong>Replication factor.</strong> RF multiplies <em>both</em> storage and cross-AZ replication. RF=3 is the durable standard (tolerates one broker loss with <code>min.insync.replicas=2</code>, two losses before unavailability). RF=2 cuts both costs by ⅓ but leaves zero headroom: a single failure drops you to one replica, and <code>min.insync.replicas=2</code> then blocks all writes to that partition (Part I <a href="08-replication.html">Replication &amp; the ISR</a>). Reserve RF=2 for explicitly non-critical, reproducible topics. Set via <code>default.replication.factor</code> (default 1) or per-topic.</li>
+  <li><strong>Retention.</strong> <code>retention.ms</code> (default 7&nbsp;days, <code>LogConfig.java:134</code>) cuts storage linearly — 3-day retention is half the disk of 6-day. Use <code>retention.bytes</code> (default &minus;1) to cap per-partition size as a hard backstop. Shorter retention is free until someone needs to replay further back than the window allows — which is exactly the gap that Lever 4 fills.</li>
+</ul>
+
+<h3>Lever 4 — Tiered storage <span class="pill kip">KIP-405</span> (cheap object store for cold data)</h3>
+
+<p>Tiered storage (Part I <a href="05-tiered-storage.html">Tiered Storage</a>) lets a topic keep only a small <em>local</em> tail on broker disk while offloading older segments to object storage (S3/GCS/ABS) via the <code>RemoteLogManager</code> (<code>storage/.../RemoteLogManager.java</code>). Because the RF-multiplied copy lives only on the cheap, single-copy object store, this attacks the <strong>storage</strong> line item hard — object storage runs ~$0.02/GiB-mo vs ~$0.08&ndash;0.10/GiB-mo for EBS, ~4&ndash;5× cheaper, and decouples retention from broker disk (so you can keep weeks or months without growing the fleet). Enable it cluster-wide with <code>remote.log.storage.system.enable=true</code> (default <strong>false</strong>, <code>RemoteLogManagerConfig.java:55,58</code>) and per-topic with <code>remote.storage.enable=true</code> (default <strong>false</strong>, <code>LogConfig.java:142,253</code>); set the local tail with <code>local.retention.ms</code> / <code>local.retention.bytes</code> (default <strong>&minus;2</strong> = "derive from <code>retention.ms</code>/<code>retention.bytes</code>", <code>LogConfig.java:145,146,255,257</code>).</p>
+
+<div class="callout warning"><span class="callout-title">Tiered storage does NOT reduce cross-AZ networking</span><p>This is the most common and most expensive misconception about KIP-405. It moves <em>bytes at rest</em> to a cheaper tier; it does nothing to <em>bytes in motion</em>. Replication still copies <code>RF&minus;1</code> times across AZs, producers and consumers still cross zones. In fact, by shrinking storage it raises networking's <em>share</em> of the bill — Aiven's figure: with tiered storage, "Networking is 83%+ of cost ($882k/yr out of $1.05M/yr)" (<em>empirical</em>). If networking is your problem, the levers are 2 (fetch-from-follower) and 5 (diskless), not 4. Watch the offload working via <code>kafka.server:type=BrokerTopicMetrics,name=RemoteCopyBytesPerSec</code> / <code>RemoteFetchBytesPerSec</code> and the backlog gauge <code>RemoteCopyLagBytes</code> (<code>storage/api/.../RemoteStorageMetrics.java:35&ndash;36,48</code>); remote reads are served by a pool of <code>remote.log.reader.threads</code> (default <strong>10</strong>, <code>RemoteLogManagerConfig.java:150,152</code>).</p></div>
+
+<h3>Lever 5 — Diskless / object-store-native designs <span class="pill kip">KIP-1150</span> (restructure the model)</h3>
+
+<p>The newest direction attacks the networking <em>floor</em> directly. Diskless designs (WarpStream and AutoMQ commercially; <span class="pill kip">KIP-1150</span> "Diskless Topics" in Apache Kafka) write produce batches <strong>directly to object storage</strong> instead of replicating between brokers. With no inter-broker replication and no local-disk RF, the <code>ingress × (RF&minus;1)</code> cross-AZ term — the dominant one — drops to ~0, and durability comes from the object store's own cross-AZ replication (which the provider does not bill back to you as inter-AZ transfer). KIP-1150 was <strong>accepted ~March 2026</strong>, but acceptance is not a production-ready OSS implementation — treat it as a roadmap item, not a deployable feature, in mid-2026.</p>
+
+<div class="callout note"><span class="callout-title">Diskless trades latency for cost — it is not a drop-in</span><p>Writing to S3 means waiting on a commit interval (~250&nbsp;ms or an 8&nbsp;MiB batch) plus an S3 PUT (~200&ndash;400&nbsp;ms p99 for 2&ndash;8&nbsp;MB), so produce latency moves from sub-100&nbsp;ms to ~200&ndash;400&nbsp;ms typical, up to ~2.4&nbsp;s end-to-end (WarpStream/Aiven, <em>empirical</em>). S3 Express One Zone narrows produce p99 to ~169&nbsp;ms. The cost case is dramatic where it fits: WarpStream's own TCO benchmark put 3-AZ OSS Kafka at <strong>$20,252/mo</strong> (inter-zone networking alone $14,765) vs WarpStream at <strong>$2,961/mo</strong> for the same 268&nbsp;MiB/s workload (<em>vendor-reported, directional</em>). KIP-1150 is explicitly designed to coexist with classic sub-100&nbsp;ms topics in one cluster, not replace them — use diskless for high-throughput, latency-tolerant streams and classic topics for the rest. Vendor % savings (80&ndash;90%) assume high fanout, retail pricing, and RF=3; the mechanism is real, the percentage is workload-dependent.</p></div>
+
+<h2>A worked cost model</h2>
+
+<p>Put it together on one concrete workload so the arithmetic — and the dominance of networking — is unmistakable. Every number below is introduced first as a labeled assumption, then used; the rates are the empirical reference's cited cloud figures (AWS, RF=3, 3 AZs); treat them as <em>illustrative and version-dependent</em>, not a quote — substitute your own measured ingress and your own cloud bill's transfer rates.</p>
+
+<p><strong>Assumptions.</strong> Each constant carries its value with units, a one-line why/source, and its kind (workload / config / illustrative cloud rate). Nothing in the derivation uses a number that is not listed here.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Symbol</th><th>Value (with units)</th><th>Why / source</th><th>Kind</th></tr></thead>
+  <tbody>
+    <tr><td>ingress</td><td><strong>100&nbsp;MiB/s</strong> sustained</td><td>The workload we are pricing — pick the peak sustained produce rate <em>your</em> cluster measures (<code>BytesInPerSec</code>).</td><td>workload (illustrative)</td></tr>
+    <tr><td>fanout</td><td><strong>3</strong> consumer groups (3× read)</td><td>Each group re-reads the full stream once, so total consumer egress = 3 × ingress.</td><td>workload (illustrative)</td></tr>
+    <tr><td>RF</td><td><strong>3</strong> replicas</td><td>The durable standard; set via <code>default.replication.factor</code> (source default is 1 — see Driver&nbsp;1). RF=3 ⇒ <code>RF&minus;1 = 2</code> follower copies.</td><td>config</td></tr>
+    <tr><td>AZs</td><td><strong>3</strong> availability zones</td><td>Brokers spread evenly ⇒ a client shares the leader's AZ ⅓ of the time, so <code>⅔</code> of produce &amp; fetch crosses zones (Driver&nbsp;2).</td><td>workload / topology</td></tr>
+    <tr><td>retention</td><td><strong>3&nbsp;days</strong></td><td>How long the log is kept on disk; <code>retention.ms</code> (source default 7&nbsp;days, <code>LogConfig.java:134</code>). 3&nbsp;days chosen to keep the example small.</td><td>config (illustrative)</td></tr>
+    <tr><td>compression</td><td><strong>none</strong> (1.0×) for the baseline</td><td>We price the untuned wire volume first, then apply compression as Lever&nbsp;1. Producer &amp; broker defaults compress nothing (Driver&nbsp;1 gotcha).</td><td>config (baseline)</td></tr>
+    <tr><td>$<sub>storage</sub></td><td><strong>$0.08 / GiB-month</strong></td><td>AWS EBS gp3 (Confluent, <em>empirical</em>) — illustrative; check your bill.</td><td>cloud rate (illustrative)</td></tr>
+    <tr><td>$<sub>xAZ</sub></td><td><strong>$0.02 / GiB</strong> effective</td><td>AWS cross-AZ = $0.01/GiB <em>each direction</em> → ~$0.02 effective (AutoMQ / 2minutestreaming, <em>empirical</em>). GCP ≈ $0.01 once; Azure historically free.</td><td>cloud rate (illustrative)</td></tr>
+    <tr><td>$<sub>compute</sub></td><td><strong>≈ $2,300 / month</strong> for the fleet</td><td>Broker instances sized to absorb <code>ingress × RF</code> ingress-replication plus fan-out reads; matches Confluent's published 100&nbsp;MBps teardown compute line (<em>empirical</em>). Right-sizing is <a href="op04-capacity-planning.html">Capacity Planning</a>; here it is a single illustrative line, not a per-broker derivation.</td><td>cloud rate (illustrative)</td></tr>
+    <tr><td>sec/month</td><td><strong>2,592,000&nbsp;s</strong> = 60×60×24×30</td><td>Unit conversion: seconds in a 30-day month (turns a per-second rate into bytes/month).</td><td>constant (exact)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>Derived: monthly ingress volume.</strong> This single quantity feeds every line below, so derive it once:</p>
+
+<div class="callout key"><span class="callout-title">Monthly ingress (derived from the assumptions)</span><p><code>ingress × sec/month ÷ 1024</code> = <code>100&nbsp;MiB/s × 2,592,000&nbsp;s ÷ 1024&nbsp;MiB/GiB</code> = <code>259,200,000&nbsp;MiB ÷ 1024</code> ≈ <strong>253,125&nbsp;GiB ≈ 247&nbsp;TiB/month</strong>. (Units cancel: <code>(MiB/s)·s = MiB</code>, then <code>MiB ÷ (MiB/GiB) = GiB</code>.) Call this <code>I = 253,125&nbsp;GiB/mo</code> in the table below.</p></div>
+
+<p><strong>Derivation.</strong> Each row takes the formula from its Driver section, substitutes the assumptions above (so every literal traces to the Assumptions table), and multiplies by the relevant rate. Storage is a <em>stock</em> (bytes resident on disk), so it uses ingress-per-day × retention × RF; the cross-AZ rows are <em>flows</em> over the month, so they scale the monthly volume <code>I</code>. Units are shown so they cancel to dollars.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Line item</th><th>Derivation (formula → substitute assumptions → with units)</th><th>Bytes</th><th>× Rate</th><th>≈ Cost/mo</th></tr></thead>
+  <tbody>
+    <tr><td>Storage (on disk)</td><td><code>ingress/day × retention × RF</code>. ingress/day = <code>100&nbsp;MiB/s × 86,400&nbsp;s/day ÷ 1024 = 8,438&nbsp;GiB/day</code>; resident = <code>8,438&nbsp;GiB/day × 3&nbsp;days × 3&nbsp;(RF) = 75,938&nbsp;GiB</code> (days &amp; RF are dimensionless ⇒ result in GiB)</td><td>~76&nbsp;TiB resident</td><td><code>× $0.08/GiB-mo</code></td><td><code>75,938 × $0.08</code> = <strong>~$6,100</strong></td></tr>
+    <tr><td>Cross-AZ: replication</td><td><code>I × (RF&minus;1)</code> = <code>253,125&nbsp;GiB × 2</code> (each of the 2 followers is in another AZ ⇒ all of it crosses)</td><td>~506,250&nbsp;GiB (~494&nbsp;TiB)</td><td><code>× $0.02/GiB</code></td><td><code>506,250 × $0.02</code> = <strong>~$10,100</strong></td></tr>
+    <tr><td>Cross-AZ: produce</td><td><code>I × ⅔</code> = <code>253,125&nbsp;GiB × 0.67</code> (⅔ of writes hit a leader in another AZ — see Driver&nbsp;2)</td><td>~169,594&nbsp;GiB (~166&nbsp;TiB)</td><td><code>× $0.02/GiB</code></td><td><code>169,594 × $0.02</code> = <strong>~$3,400</strong></td></tr>
+    <tr><td>Cross-AZ: consumer fetch</td><td><code>I × fanout × ⅔</code> = <code>253,125&nbsp;GiB × 3 × 0.67</code> (3 groups, each reading from a leader that is cross-AZ ⅔ of the time)</td><td>~508,781&nbsp;GiB (~497&nbsp;TiB)</td><td><code>× $0.02/GiB</code></td><td><code>508,781 × $0.02</code> = <strong>~$10,200</strong></td></tr>
+    <tr><td>Compute (brokers)</td><td>fleet sized to absorb <code>ingress × RF</code> ingress+replication and serve <code>fanout × ingress</code> reads — taken directly as the <code>$<sub>compute</sub></code> assumption (not re-derived here; see <a href="op04-capacity-planning.html">Capacity Planning</a>)</td><td>—</td><td>fleet</td><td><strong>~$2,300</strong></td></tr>
+    <tr><td colspan="4" style="text-align:right"><strong>Sum of the rows ≈</strong></td><td><strong>~$32,100/mo</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Adding the three cross-AZ rows: <code>$10,100 + $3,400 + $10,200 ≈ $23,700</code> of networking. So networking is <code>$23,700 ÷ $32,100 ≈ <strong>74%</strong></code> of the bill; compute is <code>$2,300 ÷ $32,100 ≈ 7%</code>; storage is the remaining ~19%. <strong>Why networking dominates:</strong> the cross-AZ multiplier <code>(RF&minus;1) + ⅔ + (fanout × ⅔) = 2 + 0.67 + 2.01 ≈ 4.7</code> applies to the monthly volume at $0.02/GiB <em>each</em>, whereas storage applies a 3× RF to only the resident <em>tail</em> (3 days, not the whole month) at $0.08/GiB-mo — so bytes-in-motion × ~4.7 beats bytes-at-rest × 3 even though the per-GiB storage rate is 4× higher. These figures align with Confluent's published 100&nbsp;MBps teardown (~$24.2k networking / ~$14.5k storage / ~$2.3k compute); our storage line is lower only because this example assumes 3-day rather than longer retention. (Small differences from the round empirical figures — e.g. ~$10,100 vs the often-quoted ~$10,360 — are pure rounding of the ⅔ probability and the $0.02 rate; carry more decimals if you need them to match a vendor sheet.) Now apply the levers in order and watch the bill collapse:</p>
+
+<figure class="diagram">
+  <div class="dflow">
+    <div class="node cat-error"><span class="nt">Baseline ≈ $32.1k/mo (networking ~74%): storage $6.1k + cross-AZ $23.7k + compute $2.3k</span></div>
+    <div class="conn" data-label="Lever 1: zstd, assume ~3× ratio on JSON*"></div>
+    <div class="node cat-broker">divide every <em>byte-volume</em> item by the 3× ratio (compute is unchanged): storage <code>$6.1k÷3 ≈ $2.0k</code>, cross-AZ <code>$23.7k÷3 ≈ $7.9k</code>, +compute $2.3k → total ≈ <strong>$12.2k</strong></div>
+    <div class="conn" data-label="Lever 2: fetch-from-follower"></div>
+    <div class="node cat-coord">consumer cross-AZ term → ~$0 (was <code>$10.2k÷3 ≈ $3.4k</code> after L1): <code>$12.2k &minus; $3.4k</code> → total ≈ <strong>$8.8k</strong></div>
+    <div class="conn" data-label="Lever 3: RF 3→2 on non-critical topics"></div>
+    <div class="node cat-storage store">on those topics, storage &amp; replication scale <code>×(RF&minus;1)</code>: <code>2→1</code> ⇒ ×½ each (linear in RF)</div>
+    <div class="conn" data-label="Lever 4: tiered storage for cold tail"></div>
+    <div class="node cat-storage store">storage tier <code>$0.08→$0.02/GiB-mo</code> (~4&ndash;5× cheaper); networking now &gt;80% of remainder</div>
+    <div class="conn ec-async" data-label="Lever 5: diskless (if latency-tolerant)"></div>
+    <div class="node cat-control">replication cross-AZ <code>I×(RF&minus;1)</code> → ~0; new floor = produce + metadata</div>
+  </div>
+  <figcaption>Levers compound. Compression multiplies <em>everything</em> down first (so apply it before computing the others), fetch-from-follower removes the consumer term, RF/retention trim linearly, tiered storage cheapens the at-rest bytes, and diskless removes the replication floor at a latency cost. <strong>*The 3× ratio is an illustrative assumption</strong> for JSON/text — between Cloudflare's measured zstd-6 4.5× and lz4 1.8× on HTTP data (<em>empirical</em>) and Trendyol's ~70% reduction (≈3.3×); it is <em>data-dependent</em>, so substitute your codec's measured ratio on your payloads. Only the byte-volume rows scale by it; the compute line does not.</figcaption>
+  <div class="legend">
+    <span class="sw cat-error"></span> baseline (untuned)&nbsp;&nbsp;
+    <span class="sw cat-broker"></span> compute / compression&nbsp;&nbsp;
+    <span class="sw cat-coord"></span> network lever&nbsp;&nbsp;
+    <span class="sw cat-storage"></span> storage lever&nbsp;&nbsp;
+    <span class="sw cat-control"></span> architectural lever&nbsp;&nbsp;
+    <span class="arr"></span> apply lever&nbsp;&nbsp;<span class="arr dashed"></span> roadmap (KIP-1150, not yet GA)
+  </div>
+</figure>
+
+<div class="callout gotcha"><span class="callout-title">Apply compression first, then recompute</span><p>Compression shrinks the byte volume that <em>every other lever and formula</em> operates on. If you compute cross-AZ cost on uncompressed ingress and then "save 50% with fetch-from-follower," you have double-counted. The correct order is: (1) measure <em>compressed</em> ingress (or model it with your codec's real ratio on your data), (2) compute the cross-AZ terms from that, (3) then subtract the consumer term that fetch-from-follower removes. The single biggest modelling error is pricing the bill on wire-format bytes that compression already eliminated.</p></div>
+
+<h2>The lever table, ranked by effort vs impact</h2>
+
+<p>Decision rule for picking the next lever: identify which line item dominates <em>your</em> bill (measure <code>BytesInPerSec</code>, <code>ReplicationBytesInPerSec</code>, and your cloud cross-AZ transfer report), then pick the lowest-effort lever that targets it.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Lever</th><th>Targets</th><th>Effort</th><th>Impact</th><th>Tradeoff / dial</th><th>Feature</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>compression.type</code> = lz4/zstd</td><td>storage + ALL network + fetch</td><td><strong>Low</strong> (one producer config)</td><td><strong>High</strong> (~2&ndash;3× on JSON; ~10× on text)</td><td>Producer/consumer CPU; per-batch (needs batching). Dial: codec + <code>compression.zstd.level</code>.</td><td>Part I 01; <span class="pill kip">KIP-390</span></td></tr>
+    <tr><td>2</td><td>Fetch-from-follower (rack-aware)</td><td>consumer cross-AZ (the ⅔×fanout term)</td><td><strong>Low&ndash;Med</strong> (3 configs + correct rack ids)</td><td><strong>High</strong> on read-heavy/multi-group clusters (Grab → $0)</td><td>+up to ~500&nbsp;ms consumer latency (HW-bounded); broker load skew. Dial: on/off.</td><td>Part I 09; <span class="pill kip">KIP-392</span></td></tr>
+    <tr><td>3</td><td>RF 3→2 / shorter retention</td><td>storage + replication cross-AZ (linear)</td><td><strong>Low</strong> (per-topic config)</td><td><strong>Med</strong> (−⅓ per RF step; linear in retention)</td><td>Durability/availability ↓ (RF=2 = no failure headroom); replay window ↓. Dials: <code>replication.factor</code>, <code>retention.ms</code>.</td><td>Part I 08</td></tr>
+    <tr><td>4</td><td>Tiered storage</td><td>storage only (cold bytes → object store)</td><td><strong>Med</strong> (cluster + object-store setup)</td><td><strong>Med&ndash;High</strong> on storage (~4&ndash;5× cheaper tier; 30&ndash;90% storage cut)</td><td>Remote-read latency for cold reads; object-store ops. <strong>No network effect.</strong> Dials: <code>remote.storage.enable</code>, <code>local.retention.ms</code>.</td><td>Part I 05; <span class="pill kip">KIP-405</span></td></tr>
+    <tr><td>5</td><td>Diskless / object-store-native</td><td>replication + produce cross-AZ (the floor)</td><td><strong>High</strong> (new topic type / vendor; not GA in OSS)</td><td><strong>Very High</strong> on network (replication cross-AZ → ~0)</td><td>+200&ndash;400&nbsp;ms produce latency, up to ~2.4&nbsp;s e2e. Coexists with classic topics. Dial: per-topic.</td><td><span class="pill kip">KIP-1150</span> (accepted ~Mar 2026)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout key"><span class="callout-title">The one-paragraph cost playbook</span><p>Turn on <strong>compression</strong> everywhere (lz4 if latency-sensitive, zstd if bytes-sensitive) with sane batching — it is nearly free and cuts every byte-volume line item. Then, if cross-AZ dominates (it usually does), enable <strong>fetch-from-follower</strong> to kill the consumer term and revisit <strong>RF</strong> on non-critical topics. If storage is large, add <strong>tiered storage</strong> — but do not expect it to touch networking. Only reach for <strong>diskless</strong> when the produce+replication cross-AZ floor is the dominant cost <em>and</em> the workload tolerates 200&ndash;400&nbsp;ms latency. Measure first: <code>ReplicationBytesInPerSec</code> tells you the amplification, your cloud transfer bill tells you the cross-AZ reality, and <code>RemoteCopyBytesPerSec</code> tells you tiering is working. Every number in this chapter is directional and version/region-dependent — re-check cloud transfer rates and vendor TCO claims against live pricing before you commit a budget.</p></div>
+
+<div class="callout note"><span class="callout-title">Where this connects in Part II</span><p>This chapter is the economics layer over the rest of the operations manual. <a href="op04-capacity-planning.html">Capacity Planning</a> sizes the fleet whose compute you are pricing here; <a href="op03-partitioning.html">Partitioning</a> governs the per-partition counts that drive replica placement and therefore cross-AZ flows; <a href="op05-performance-tuning.html">Performance Tuning</a> owns the batching/compression dials Lever 1 depends on; <a href="op06-durability.html">Durability Engineering</a> owns the RF/<code>min.insync.replicas</code>/<code>acks</code> choices behind Lever 3; <a href="op09-topologies.html">Topologies</a> decides the AZ/cluster layout that sets the cross-AZ baseline; and <a href="op08-metrics-signals.html">Metrics &amp; Signals</a> gives the byte-rate gauges that turn this model from estimate into measurement. Cost is not a separate concern — it is the shadow every architectural choice casts on the invoice.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

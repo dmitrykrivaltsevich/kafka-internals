@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network &amp; Threading Model · Kafka Internals</title>
+<meta name="description" content="SocketServer, the Acceptor/Processor reactor, the handler pool, Selector, purgatory &amp; timing wheels.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="06-network-and-threading">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>06 · Network Layer &amp; Threading Model</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">A Kafka broker is, at its core, a hand-rolled single-reactor-per-thread NIO server bolted onto a bounded hand-off queue and a pool of worker threads. This chapter dissects that machine end to end: the <code>SocketServer</code> with its per-listener <code>Acceptor</code> and <code>Processor</code> threads, the shared <code>common.network.Selector</code>/<code>KafkaChannel</code> reactor that performs size-delimited reads and writes, the <code>RequestChannel</code> that decouples the network threads from the <code>KafkaRequestHandler</code> I/O-thread pool, <code>ConnectionQuotas</code> (per-IP / per-listener / broker caps plus a connection-creation-rate throttle), and the request <em>purgatory</em> — a <code>DelayedOperationPurgatory</code> backed by a hierarchical <code>TimingWheel</code> with sharded watcher lists. It closes with the full request-lifecycle timeline and a census of every broker thread.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The network layer owns the broker's TCP sockets and the thread anatomy that turns bytes on the wire into in-flight <code>Request</code> objects and back into responses. Its responsibilities:</p>
+<ul>
+  <li><strong>Accept connections</strong> on each configured listener and configure each socket (non-blocking, <code>TCP_NODELAY</code>, <code>SO_KEEPALIVE</code>), subject to connection quotas (<code>kafka/network/SocketServer.scala:667</code>).</li>
+  <li><strong>Run the NIO reactor</strong>: register channels, drive the TLS/SASL handshake, read complete size-delimited requests, write responses, expire idle connections — one <code>java.nio.channels.Selector</code> per <code>Processor</code> (<code>clients/.../network/Selector.java:445</code>).</li>
+  <li><strong>Decouple I/O from request handling</strong> via the bounded <code>RequestChannel</code> hand-off queue, so slow request processing back-pressures the network threads rather than dropping data (<code>kafka/network/RequestChannel.scala:90</code>).</li>
+  <li><strong>Dispatch</strong> dequeued requests to <code>KafkaApis</code> on the <code>KafkaRequestHandler</code> pool (<code>kafka/server/KafkaRequestHandler.scala:108</code>). See <a href="07-request-processing.html">Request Processing (KafkaApis)</a>.</li>
+  <li><strong>Park requests that cannot complete immediately</strong> (produce awaiting acks, fetch awaiting bytes, …) in a <em>purgatory</em> with an O(1) timer, and re-check them when triggering events occur (<code>server-common/.../purgatory/DelayedOperationPurgatory.java:122</code>).</li>
+  <li><strong>Enforce connection quotas and connection-creation-rate limits</strong> (<code>ConnectionQuotas</code>, <code>kafka/network/SocketServer.scala:1276</code>).</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Kafka deliberately does <em>not</em> use a servlet container or Netty. It implements a thin reactor (<code>Selector</code> + <code>KafkaChannel</code> + <code>TransportLayer</code>) shared verbatim between clients and the broker, plus a Scala <code>SocketServer</code> that wires N reactor threads to a bounded queue and M worker threads. The same <code>Selector</code> code path drives producers, consumers, replica fetchers and the broker's accept side, which is why the protocol framing lives in <code>clients/</code> and not <code>core/</code>.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Principal class</th><th>File</th></tr></thead>
+<tbody>
+<tr><td>Top-level socket server / lifecycle</td><td><code>SocketServer</code></td><td><code>core/src/main/scala/kafka/network/SocketServer.scala:75</code></td></tr>
+<tr><td>Accept thread (per listener)</td><td><code>Acceptor</code> / <code>DataPlaneAcceptor</code></td><td><code>core/src/main/scala/kafka/network/SocketServer.scala:462</code>, <code>:364</code></td></tr>
+<tr><td>NIO reactor thread</td><td><code>Processor</code></td><td><code>core/src/main/scala/kafka/network/SocketServer.scala:801</code></td></tr>
+<tr><td>Bounded hand-off queue</td><td><code>RequestChannel</code></td><td><code>core/src/main/scala/kafka/network/RequestChannel.scala:80</code></td></tr>
+<tr><td>In-flight request (timing fields)</td><td><code>Request</code></td><td><code>server/src/main/java/org/apache/kafka/network/Request.java:54</code></td></tr>
+<tr><td>I/O worker thread + pool</td><td><code>KafkaRequestHandler</code> / <code>...Pool</code></td><td><code>core/src/main/scala/kafka/server/KafkaRequestHandler.scala:91</code>, <code>:227</code></td></tr>
+<tr><td>NIO multiplexer (reactor core)</td><td><code>Selector</code></td><td><code>clients/src/main/java/org/apache/kafka/common/network/Selector.java:88</code></td></tr>
+<tr><td>Per-connection state machine</td><td><code>KafkaChannel</code></td><td><code>clients/src/main/java/org/apache/kafka/common/network/KafkaChannel.java:67</code></td></tr>
+<tr><td>Plaintext / TLS byte transport</td><td><code>PlaintextTransportLayer</code> / <code>SslTransportLayer</code></td><td><code>clients/.../network/PlaintextTransportLayer.java:32</code></td></tr>
+<tr><td>Size-delimited receive</td><td><code>NetworkReceive</code></td><td><code>clients/.../network/NetworkReceive.java:32</code></td></tr>
+<tr><td>Outbound send wrapper</td><td><code>NetworkSend</code></td><td><code>clients/.../network/NetworkSend.java:21</code></td></tr>
+<tr><td>Connection quotas</td><td><code>ConnectionQuotas</code></td><td><code>core/src/main/scala/kafka/network/SocketServer.scala:1276</code></td></tr>
+<tr><td>Delayed-operation purgatory</td><td><code>DelayedOperationPurgatory</code></td><td><code>server-common/.../purgatory/DelayedOperationPurgatory.java:38</code></td></tr>
+<tr><td>Hierarchical timing wheel</td><td><code>TimingWheel</code> / <code>SystemTimer</code></td><td><code>server-common/.../util/timer/TimingWheel.java:97</code>, <code>SystemTimer.java:30</code></td></tr>
+<tr><td>Socket-server config keys</td><td><code>SocketServerConfigs</code></td><td><code>server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java:43</code></td></tr>
+</tbody></table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+<dt>Listener / endpoint</dt><dd>A <code>(name, securityProtocol, host, port)</code> tuple from <code>listeners</code>. Each gets its own <code>Acceptor</code> + pool of <code>Processor</code>s and its own metric tags (<code>SocketServer.scala:217</code>).</dd>
+<dt>Acceptor thread</dt><dd>One non-daemon thread per listener that owns the <code>ServerSocketChannel</code>, accepts new sockets, and round-robins each to a <code>Processor</code> (<code>SocketServer.scala:462</code>).</dd>
+<dt>Processor (network) thread</dt><dd>One of <code>num.network.threads</code> threads per listener; runs a private <code>Selector</code> reactor loop. Reads requests, enqueues them, writes responses (<code>SocketServer.scala:893</code>).</dd>
+<dt>Request handler (I/O) thread</dt><dd>One of <code>num.io.threads</code> daemon threads pulling from <code>RequestChannel</code> and calling <code>KafkaApis.handle</code> (<code>KafkaRequestHandler.scala:108</code>).</dd>
+<dt>Connection id</dt><dd>String <code>localAddr:localPort-remoteAddr:remotePort-index</code>; the trailing monotonically-incrementing <code>index</code> prevents id reuse while old requests are still in flight (<code>SocketServer.scala:888</code>, <code>:1202</code>).</dd>
+<dt>Muting</dt><dd>A channel is "muted" (read interest dropped) the instant a request is enqueued, and un-muted only after its response is sent. This is how single-request-per-connection ordering is guaranteed across many handler threads (<code>SocketServer.scala:1044</code>).</dd>
+<dt>Purgatory</dt><dd>A holding area for operations that block until a condition or timeout. Backed by a hierarchical timing wheel for O(1) insert/cancel (<code>DelayedOperationPurgatory.java</code>).</dd>
+<dt>Privileged listener</dt><dd>The inter-broker listener (or, historically, a control-plane listener). A flag on the <code>RequestContext</code> that <code>KafkaApis</code> uses to decide whether forwarding/envelope handling is permitted (<code>SocketServer.scala:224</code>, <code>:1027</code>).</dd>
+</dl>
+
+<div class="callout note"><span class="callout-title">Note · request planes in KRaft 4.x</span><p>Earlier Kafka exposed two "request planes": a data plane and an optional <em>control plane</em> listener (<span class="pill kip">KIP-291</span>). In this KRaft-only build the control-plane <em>listener</em> is gone — <code>SocketServer</code> models only <code>dataPlaneAcceptors</code> (<code>SocketServer.scala:103</code>). Controller traffic is isolated instead by the <em>process</em> boundary: the controller runs its own <code>SocketServer</code> over <code>controller.listener.names</code> with <code>ListenerType.CONTROLLER</code> (<code>SocketServer.scala:150</code>) and its own request-handler pool named <code>"controller"</code> (<code>ControllerServer.scala:300</code>). The string "control plane" survives only in a doc comment about request forwarding (<code>SocketServer.scala:796</code>).</p></div>
+
+<h2>Architecture &amp; control/data flow</h2>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">TCP clients / peer brokers</span><span class="nd">one TCP connection per peer</span></div>
+  <div class="conn" data-label="connect"></div>
+  <div class="node cat-broker"><span class="nt">Acceptor thread · 1/listener</span><span class="nd">ServerSocket · OP_ACCEPT · e.g. PLAINTEXT://:9092</span></div>
+  <div class="conn" data-label="round-robin · newConnections ABQ(20)"></div>
+  <div class="node cat-broker"><span class="nt">Processor threads · num.network.threads</span><span class="nd">Processor0 · Processor1 · Processor2 … — each: java.nio Selector + KafkaChannel reactor</span></div>
+  <div class="conn ec-data" data-label="sendRequest(req) · MUTE channel"></div>
+  <div class="node cat-broker store"><span class="nt">RequestChannel · one per request plane</span><span class="nd">requestQueue ABQ(500) · callbackQueue ABQ(500) · per-Processor responseQueue (linked deque)</span></div>
+  <div class="conn" data-label="receiveRequest(300ms)"></div>
+  <div class="node cat-broker"><span class="nt">Handler pool · num.io.threads (daemon)</span><span class="nd">data-plane-kafka-request-handler-N · Handler0/1/2… · KafkaApis.handle()</span></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn dashed ec-async" data-label="park / re-check"></div>
+      <div class="node cat-coord pill"><span class="nt">Purgatory</span><span class="nd">may park here</span></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-data" data-label="sendResponse ⇒ responseQueue(Processor)"></div>
+      <div class="node cat-broker"><span class="nt">Processor responseQueue</span><span class="nd">Selector write · unmute → back to client</span></div>
+    </div>
+  </div>
+  <div class="conn dashed ec-err" data-label="back-pressure: full requestQueue blocks network threads (RequestChannel → Processors)"></div>
+</div><figcaption>Broker request path: Acceptor &rarr; Processor (reactor) &rarr; RequestChannel &rarr; handler pool &rarr; response queue &rarr; Processor; a bounded queue back-pressures the network threads.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client / peer broker</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker network &amp; handler threads</span>
+  <span class="lgi"><span class="sw cat-broker dash"></span>cylinder = RequestChannel hand-off queue</span>
+  <span class="lgi"><span class="sw cat-coord round"></span>purgatory (waiting)</span>
+  <span class="lgi"><span class="arr ec-data"></span>request / response data</span>
+  <span class="lgi"><span class="arr dashed ec-async"></span>park / re-check (async)</span>
+  <span class="lgi"><span class="arr dashed ec-err"></span>back-pressure</span>
+</div></figure>
+
+<h3>Construction and start-up ordering</h3>
+<p>The <code>SocketServer</code> constructor only <em>opens the ports and builds the data structures</em>; it does not start any thread (<code>SocketServer.scala:146</code>). Acceptors and their processors are created eagerly per endpoint (<code>createDataPlaneAcceptorAndProcessors</code>, <code>:217</code>), but thread start is deferred to <code>enableRequestProcessing</code> (<code>:177</code>), which chains each acceptor's start to a per-endpoint <em>authorizer future</em> so that no listener accepts traffic until its authorizer is initialized. Each acceptor exposes a <code>startedFuture</code>; the aggregate future returned lets the broker know when all listeners are live (<code>:212</code>).</p>
+
+<h2>Detailed mechanics</h2>
+
+<h3>The Acceptor loop</h3>
+<p>The acceptor registers <code>OP_ACCEPT</code> and loops while <code>shouldRun</code> (an <code>AtomicBoolean</code>) is true (<code>SocketServer.scala:576</code>). Each iteration calls <code>nioSelector.select(500)</code> then drains ready keys. For each acceptable key it calls <code>accept()</code>, which:</p>
+<ol>
+  <li>Accepts the <code>SocketChannel</code> and calls <code>connectionQuotas.inc(...)</code> — this may <em>block</em> the acceptor when a connection slot is unavailable or throw on quota violation (<code>:672</code>).</li>
+  <li>Configures the socket: <code>configureBlocking(false)</code>, <code>setTcpNoDelay(true)</code>, <code>setKeepAlive(true)</code>, optional <code>SO_SNDBUF</code> (<code>:693</code>).</li>
+  <li>Assigns the channel to the next processor by round-robin over <code>currentProcessorIndex</code>. If a processor's <code>newConnections</code> queue is full it tries the next; if all are full it blocks on the last one (<code>mayBlock=true</code>) so no accepted socket is dropped (<code>:638</code>).</li>
+</ol>
+<p>On <code>TooManyConnectionsException</code> the socket is closed; on <code>ConnectionThrottledException</code> the socket is parked in a per-acceptor <code>throttledSockets</code> priority queue and closed later by <code>closeThrottledConnections</code> after the throttle delay (<code>:680</code>, <code>:704</code>). The acceptor catches all <code>Throwable</code>s (except <code>ControlThrowable</code>) to avoid dying on a single bad connection (<code>:585</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>The <code>Acceptor → Processor</code> hand-off never silently drops an accepted connection. <code>assignNewConnection</code> retries across all processors and, on the final attempt, performs a blocking <code>newConnections.put</code> (<code>SocketServer.scala:1143</code>). The cost is that a saturated reactor can stall the accept loop — visible as the <code>AcceptorBlockedPercent</code> meter (<code>:504</code>).</p></div>
+
+<h3>The Processor reactor loop</h3>
+<p>Each <code>Processor</code> owns a <code>common.network.Selector</code> built from a server-side <code>ChannelBuilder</code> (<code>SocketServer.scala:853</code>). Its <code>run()</code> performs a fixed pipeline every iteration (<code>:893</code>):</p>
+<pre><code>configureNewConnections()   // register queued sockets with Selector (≤ 20/iter)
+processNewResponses()       // pull responseQueue, hand Sends to Selector, mute/unmute
+poll()                      // selector.poll(timeout): NIO select + read/write
+processCompletedReceives()  // parse header, build Request, enqueue + MUTE channel
+processCompletedSends()     // drop inflightResponses entry, unmute channel
+processDisconnected()       // decrement quotas, fire disconnect listeners
+closeExcessConnections()    // if broker max.connections exceeded, close 1 LRU</code></pre>
+<p>The poll timeout is <code>0</code> when there are queued new connections, otherwise <code>300</code>ms (<code>:996</code>). Newly registered connections are capped at <code>ConnectionQueueSize = 20</code> per iteration so that existing-channel traffic and close notifications stay responsive (<code>:777</code>, <code>:1167</code>).</p>
+
+<h4>Reading a request: size-delimited framing</h4>
+<p>Inside <code>Selector.poll</code>, ready/readable channels are handled by <code>pollSelectionKeys → attemptRead → channel.read()</code> (<code>Selector.java:677</code>). <code>KafkaChannel.read()</code> lazily creates a <code>NetworkReceive</code> and delegates to <code>receive.readFrom(transportLayer)</code> (<code>KafkaChannel.java:407</code>). A <code>NetworkReceive</code> is a 4-byte big-endian size <code>N</code> followed by <code>N</code> payload bytes (<code>NetworkReceive.java:32</code>):</p>
+<figure class="diagram">
+  <div class="bytemap">
+    <div class="bf" style="--w:4"><span class="bf-name">size</span><span class="bf-meta">int32 BE · @0 · phase 1</span></div>
+    <div class="bf" style="--w:20"><span class="bf-name">payload = RequestHeader ++ request body</span><span class="bf-meta">N bytes · @4 · phase 2</span></div>
+  </div>
+  <div class="bytemap-legend">
+    <span>Phase 1: fill the 4-byte size buffer; validate 0 &le; N &le; socket.request.max.bytes</span>
+    <span>Phase 2: memoryPool.tryAllocate(N); read until buffer full &rArr; complete()</span>
+  </div>
+  <figcaption>The broker rejects N&lt;0 or N&gt;<code>socket.request.max.bytes</code> with <code>InvalidReceiveException</code> (<code>NetworkReceive.java:92-95</code>).</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw"></span>byte field on the wire</span>
+    <span class="lgi"><span class="mono">--w</span> = field width (proportional to bytes)</span>
+    <span class="lgi"><span class="mono">int32 BE · @off</span> = type · byte offset</span>
+    <span class="lgi">phase = read order (size first, then payload)</span>
+  </div>
+</figure>
+<p>Crucially the payload buffer is allocated from a <code>MemoryPool</code> (<code>memoryPool.tryAllocate</code>, <code>NetworkReceive.java:103</code>). If the pool is exhausted the allocation returns <code>null</code> and the channel <em>mutes itself</em> until memory is available (<code>KafkaChannel.java:414</code>; <code>Selector.attemptRead</code> sets <code>outOfMemory=true</code>, <code>Selector.java:691</code>). This is the back-pressure mechanism for <code>queued.max.request.bytes</code> (the pool size). <code>Selector.poll</code> re-checks <code>memoryPool</code> and un-mutes channels once pressure clears (<code>:457</code>), and shuffles the key-handling order under low memory to avoid read starvation (<code>determineHandlingOrder</code>, <code>:665</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant · at most one completed receive per channel per poll</span><p><code>Selector</code> adds at most one entry to <code>completedReceives</code> for any channel in a single <code>poll()</code> (<code>Selector.java:434-437</code>, enforced by <code>hasCompletedReceive</code> guarding <code>attemptRead</code> at <code>:580</code>). Combined with muting the channel on enqueue, this guarantees the broker processes requests from one connection strictly in send order even though they fan out to many handler threads.</p></div>
+
+<h4>From bytes to a Request</h4>
+<p><code>Processor.processCompletedReceives</code> parses the header (<code>parseRequestHeader</code> validates the API key/version against the <code>ApiVersionManager</code>, <code>SocketServer.scala:779</code>), checks for SASL re-authentication and session expiry, then builds a <code>RequestContext</code> and a <code>Request</code> (<code>:1027</code>, <code>:1031</code>). It intercepts <code>ApiVersionsRequest</code> here to record the client software name/version on the channel (<span class="pill kip">KIP-511</span>, <code>:1035</code>). It then calls <code>requestChannel.sendRequest(req)</code> and immediately <code>selector.mute(connectionId)</code> (<code>:1043</code>). The receive's <code>completedReceives</code> map is cleared right after, returning buffers promptly (<code>:1062</code>).</p>
+
+<h4>Writing a response</h4>
+<p>Handlers never touch sockets. They call <code>RequestChannel.sendResponse</code>, which routes the <code>Response</code> to the originating <code>Processor</code>'s <code>responseQueue</code> via <code>processor.enqueueResponse</code> and wakes its selector (<code>RequestChannel.scala:189</code>, <code>SocketServer.scala:1208</code>). On its next loop the processor's <code>processNewResponses</code> pattern-matches the response type (<code>SocketServer.scala:937</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Response type</th><th>Processor action</th></tr></thead>
+<tbody>
+<tr><td><code>SendResponse</code></td><td><code>selector.send(NetworkSend)</code>; record in <code>inflightResponses</code> (<code>:978</code>)</td></tr>
+<tr><td><code>NoOpResponse</code></td><td>no bytes sent (e.g. produce <code>acks=0</code>); just unmute to read pipelined requests (<code>:943</code>)</td></tr>
+<tr><td><code>CloseConnectionResponse</code></td><td>actively close the channel (used on errors with no client response) (<code>:956</code>)</td></tr>
+<tr><td><code>StartThrottlingResponse</code> / <code>EndThrottlingResponse</code></td><td>drive the channel mute state machine for quota throttling (<code>:960</code>)</td></tr>
+</tbody></table></div>
+<p>The send itself is a <code>NetworkSend</code> wrapping the connection id and the serialized payload (<code>NetworkSend.java:21</code>). The <code>Selector</code> registers <code>OP_WRITE</code> (<code>KafkaChannel.setSend</code>, <code>:389</code>), drains it across one or more polls, and on completion populates <code>completedSends</code>; <code>processCompletedSends</code> then removes the inflight entry and unmutes the channel (<code>SocketServer.scala:1065</code>).</p>
+
+<h3>The RequestChannel hand-off</h3>
+<p><code>RequestChannel</code> holds a bounded <code>requestQueue</code> of size <code>queued.max.requests</code> (default 500), a same-sized <code>callbackQueue</code>, and a <code>ConcurrentHashMap</code> of processor id → <code>Processor</code> (each owning its own response deque) (<code>RequestChannel.scala:90</code>). <code>sendRequest</code> does a blocking <code>put</code> — this is the back-pressure point: when handlers fall behind, network threads block here and stop reading sockets (<code>:117</code>).</p>
+<p><code>receiveRequest(timeout)</code> services the <code>callbackQueue</code> first (those requests already waited once), then polls the request queue. A special <code>WakeupRequest</code> sentinel placed on the request queue lets a callback enqueued from a foreign thread wake a blocked handler so it checks the callback queue (<code>:200</code>, <code>:235</code>). <code>ShutdownRequest.INSTANCE</code> is the poison pill that tells a handler to exit (<code>:233</code>).</p>
+
+<h3>The KafkaRequestHandler pool</h3>
+<p>A <code>KafkaRequestHandler</code> is a <code>Runnable</code> on a <em>daemon</em> thread named <code>data-plane-kafka-request-handler-N</code> (<code>KafkaRequestHandler.scala:275</code>). Its loop blocks on <code>receiveRequest(300)</code>, measures idle time into two meters (a per-pool meter and a shared aggregate meter — the denominators differ so combined-mode controllers report correctly, cf. <span class="pill kip">KIP-1207</span>), then dispatches by type (<code>:108</code>):</p>
+<ul>
+  <li><strong><code>Request</code></strong> → set <code>requestDequeueTimeNanos</code>, stash it in a <code>ThreadLocal</code>, call <code>apis.handle(request, requestLocal)</code>, then in <code>finally</code> release the request buffer (<code>:162</code>).</li>
+  <li><strong><code>CallbackRequest</code></strong> → re-schedule a previously-deferred completion on a handler thread, carefully (re)computing callback timing so multi-callback requests aggregate correctly (<code>:131</code>).</li>
+  <li><strong><code>ShutdownRequest</code></strong> → close the thread-local <code>RequestLocal</code> and exit (<code>:126</code>).</li>
+</ul>
+<p>A <code>FatalExitError</code> from a handler triggers <code>Exit.exit</code> — the broker treats it as unrecoverable (<code>:150</code>). The pool is built by <code>KafkaRequestHandlerPoolFactory</code> so that broker and controller pools share one aggregate-threads counter; <code>resizeThreadPool</code> supports the dynamic <code>num.io.threads</code> change (<code>:283</code>).</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Splitting <em>network</em> threads (reactor I/O) from <em>I/O / request-handler</em> threads (request processing, which may touch disk) lets each be sized and back-pressured independently: a small fixed reactor count multiplexes thousands of sockets, while a larger handler pool absorbs blocking work. The bounded <code>RequestChannel</code> converts handler slowness into TCP back-pressure rather than unbounded memory growth. Isolating controller traffic on its own pool descends from <span class="pill kip">KIP-291</span> (originally a control-plane listener; now a separate controller process/pool in KRaft).</p></div>
+
+<h3>Re-scheduling callbacks onto handler threads</h3>
+<p>Some APIs need to finish work on a request thread <em>after</em> an async action (e.g. a transaction-coordinator verification) completes on a foreign thread. <code>KafkaRequestHandler.wrapAsyncCallback</code> captures the current <code>RequestChannel</code> and <code>Request</code> from thread-locals; if the callback later fires on the <em>same</em> handler thread it runs inline, otherwise it is posted via <code>requestChannel.sendCallbackRequest</code>, which enqueues to the callback queue and drops a <code>WakeupRequest</code> on the main queue (<code>KafkaRequestHandler.scala:65</code>). This keeps <code>RequestLocal</code> thread-confinement intact. See <a href="14-transactions-eos.html">Transactions &amp; EOS</a>.</p>
+
+<h2>The request purgatory &amp; hierarchical timing wheel</h2>
+<p>Many requests cannot be answered synchronously: a produce with <code>acks=all</code> waits for ISR replication; a fetch with <code>fetch.min.bytes</code> waits for data or <code>fetch.max.wait.ms</code>. These become <code>DelayedOperation</code>s parked in a <code>DelayedOperationPurgatory</code>. The broker instantiates several, all keyed off <code>ReplicaManager</code> (<code>ReplicaManager.scala:184</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Purgatory name</th><th>Operation</th><th>Purge interval source</th></tr></thead>
+<tbody>
+<tr><td><code>Produce</code></td><td><code>DelayedProduce</code></td><td><code>producer.purgatory.purge.interval.requests</code></td></tr>
+<tr><td><code>Fetch</code></td><td><code>DelayedFetch</code></td><td><code>fetch.purgatory.purge.interval.requests</code></td></tr>
+<tr><td><code>DeleteRecords</code></td><td><code>DelayedDeleteRecords</code></td><td><code>delete.records.purgatory.purge.interval.requests</code></td></tr>
+<tr><td><code>RemoteFetch</code></td><td><code>DelayedRemoteFetch</code></td><td>0 (purge each cycle to free large buffers, <code>ReplicaManager.scala:196</code>)</td></tr>
+<tr><td><code>RemoteListOffsets</code></td><td><code>DelayedRemoteListOffsets</code></td><td>default 1000</td></tr>
+<tr><td><code>ShareFetch</code></td><td><code>DelayedShareFetch</code></td><td><code>share.fetch.purgatory.purge.interval.requests</code></td></tr>
+</tbody></table></div>
+<p>The transaction subsystem adds a <code>DelayedFuturePurgatory</code> (e.g. for async ACL/quota completion in <code>AclApis</code>). The new (KIP-848) group coordinator is <em>not</em> purgatory-based — it runs an event/timer-loop in its own threads rather than parking <code>DelayedOperation</code>s, so there are no <code>DelayedOperationPurgatory</code> instances under <code>group-coordinator/</code>. See <a href="08-replication.html">Replication, ISR &amp; HWM</a>, <a href="09-fetch-path.html">Fetch Path</a>, and <a href="13-group-coordination.html">Group Coordination</a>.</p>
+
+<h3>DelayedOperation contract</h3>
+<p>A <code>DelayedOperation</code> extends <code>TimerTask</code> and carries a <code>completed</code> flag plus a protected <code>ReentrantLock</code> (<code>DelayedOperation.java:42</code>). Subclasses implement <code>tryComplete()</code>, <code>onComplete()</code>, and <code>onExpiration()</code>. <code>forceComplete()</code> is the single chokepoint: it double-checks <code>completed</code> under the lock, cancels the timer task, and calls <code>onComplete()</code> exactly once — concurrent callers race, but only the winner returns <code>true</code> (<code>:60</code>). When the timer fires, <code>run()</code> calls <code>forceComplete()</code> then <code>onExpiration()</code> (<code>:146</code>).</p>
+
+<h3>tryCompleteElseWatch</h3>
+<p>The core enqueue path is <code>tryCompleteElseWatch(op, watchKeys)</code> (<code>DelayedOperationPurgatory.java:122</code>). The algorithm, with its careful locking:</p>
+<ol>
+  <li>Under the operation's lock (<code>safeTryCompleteOrElse</code>), call <code>tryComplete()</code>. If it succeeds, done — return <code>true</code>.</li>
+  <li>Otherwise add the operation to the watcher list for <em>each</em> key (a key can be e.g. a <code>TopicPartitionOperationKey</code>), then call <code>tryComplete()</code> once more. Holding the lock across "add to watchlist + final tryComplete" guarantees the op cannot miss a concurrent triggering event after it is watched (<code>:155</code>).</li>
+  <li>If still not complete, add it to the timeout timer (<code>timeoutTimer.add(op)</code>). If it completed in the race, cancel the timer task (<code>:167</code>).</li>
+</ol>
+<p>The source carries a long comment dissecting a potential deadlock between <code>tryCompleteElseWatch</code> and <code>checkAndComplete</code>, and recommends that <code>checkAndComplete</code> be called <em>without</em> holding any external exclusive lock (<code>:133-154</code>).</p>
+
+<h3>Watcher lists, sharding, and purge</h3>
+<p>Watchers are sharded into <code>SHARDS = 512</code> <code>WatcherList</code>s; a key maps to a shard by <code>abs(key.hashCode() % 512)</code> to reduce lock contention (<code>DelayedOperationPurgatory.java:41</code>, <code>:105</code>). Each shard has a <code>ConcurrentHashMap&lt;DelayedOperationKey, Watchers&gt;</code> guarded by a <code>ReentrantLock</code>; each <code>Watchers</code> holds a <code>ConcurrentLinkedQueue</code> of operations (<code>:292</code>, <code>:311</code>). When a triggering event happens, <code>checkAndComplete(key)</code> looks up the watchers and runs <code>tryCompleteWatched</code>, removing completed entries as it walks (<code>:184</code>, <code>:333</code>).</p>
+<p>Because a completed op may linger on watcher lists for keys it never reached, the purgatory tracks <code>estimatedTotalOperations</code> and, in <code>advanceClock</code>, purges all shards when <code>estimatedTotalOperations - numDelayed() &gt; purgeInterval</code> (<code>:386</code>). This is the GC for orphaned watcher entries that <span class="pill kip">KAFKA-1989</span> was designed to make cheap.</p>
+
+<h3>The timing wheel</h3>
+<p>The timeout side is a <code>SystemTimer</code> wrapping a <code>TimingWheel</code> (<code>SystemTimer.java:30</code>). A timing wheel is a circular array of <code>wheelSize</code> buckets, each a <code>TimerTaskList</code> (a doubly-linked list with a dummy root), spanning <code>tickMs</code> each. The broker's <code>SystemTimer</code> default is <code>tickMs=1</code>, <code>wheelSize=20</code> → a 20 ms span per level (<code>SystemTimer.java:45</code>). Overflows spill into a lazily-created <em>overflow wheel</em> whose tick is the parent's full interval, giving coarser resolution as you go up — hence "hierarchical" (<code>TimingWheel.java:131</code>, <code>:174</code>).</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-coord"><span class="nt">add(entry)</span><span class="nd">expiration E · currentTimeMs C · interval = tickMs &times; wheelSize</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord decision">where does E fall?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-err" data-label="too early"></div>
+      <div class="node cat-error"><span class="nt">already expired</span><span class="nd">E &lt; C+tickMs &rArr; return false (run immediately)</span></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-data" data-label="in range"></div>
+      <div class="node cat-storage store"><span class="nt">own bucket — O(1)</span><span class="nd">E &lt; C+interval · bucket = (E / tickMs) mod wheelSize · list.add(entry)</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="too late"></div>
+      <div class="node cat-coord"><span class="nt">overflow — O(m)</span><span class="nd">E &ge; C+interval &rArr; overflowWheel.add(entry) (create on demand)</span></div>
+    </div>
+  </div>
+</div><figcaption>Where an entry lands when added: run-immediately if already expired, this level's bucket if in range, else recurse up into the overflow wheel.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-coord"></span>timer / wheel logic</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = bucket (TimerTaskList)</span>
+  <span class="lgi"><span class="sw cat-error"></span>already-expired path</span>
+  <span class="lgi">rounded = decision</span>
+  <span class="lgi"><span class="arr ec-data"></span>placed in this wheel</span>
+  <span class="lgi"><span class="arr"></span>recurse to overflow wheel</span>
+</div></figure>
+
+<figure class="diagram"><div class="dstack">
+  <div class="layer cat-coord"><div class="ln">level 0 · tick 1 ms · 20 buckets · span 20 ms</div><div class="ld">finest resolution; each bucket = TimerTaskList (doubly-linked, root sentinel)</div><div class="row"><span class="chip">bucket[0]</span><span class="chip">bucket[1]</span><span class="chip">…</span><span class="chip">bucket[19]</span></div></div>
+  <div class="sep">↑ flush on tick · overflow when E &ge; C+20 ms ↓</div>
+  <div class="layer cat-coord"><div class="ln">level 1 · tick 20 ms · 20 buckets · span 400 ms</div><div class="ld">coarser; created lazily on first overflow</div></div>
+  <div class="sep">↑ flush on tick · overflow ↓</div>
+  <div class="layer cat-coord"><div class="ln">level 2 … coarser still</div><div class="ld">one shared DelayQueue&lt;TimerTaskList&gt; drives every level</div></div>
+</div><figcaption>Hierarchical timing wheels: each level's tick is the level-below's full span, so resolution coarsens as you climb. Insert/cancel are O(1) (delete just unlinks the entry and decrements an <code>AtomicInteger</code> counter); insert may recurse O(m) over m wheel levels (<code>TimingWheel.java:147</code>).</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-coord"></span>timing-wheel level</span>
+  <span class="lgi"><span class="mono">chip</span> = a bucket (TimerTaskList)</span>
+  <span class="lgi">separator = overflow / flush between levels</span>
+  <span class="lgi">higher level = coarser tick, wider span</span>
+</div></figure>
+<p>Buckets are driven by a single <code>DelayQueue&lt;TimerTaskList&gt;</code> shared across all wheel levels; a bucket enqueues itself when its expiration is (re)set (<code>TimingWheel.java:164</code>). <code>SystemTimer.advanceClock(timeoutMs)</code> polls that delay queue; on a due bucket it advances the wheel clock and <em>flushes</em> the bucket, re-inserting each entry — which either lands in a finer bucket or, being now expired, is submitted to the executor (<code>SystemTimer.java:89</code>, <code>addTimerTaskEntry</code> at <code>:76</code>). Expired tasks run on a single-thread executor named <code>executor-&lt;purgatoryName&gt;</code> (<code>SystemTimer.java:54</code>). The actual ticking is performed by the purgatory's own background reaper.</p>
+
+<div class="callout key"><span class="callout-title">Key idea · why a timing wheel</span><p>A <code>DelayQueue</code>/priority-queue timer is O(log n) per insert and delete, and (in old Kafka) leaked completed operations until a sweep ran, risking OOM. The hierarchical timing wheel makes <em>insert</em> O(1) amortized and <em>cancel</em> O(1) exactly, decoupling timer cost from the number of in-flight delayed operations — most of which complete before they ever expire (<span class="pill kip">KAFKA-1989</span>).</p></div>
+
+<h2>Connection quotas</h2>
+<p><code>ConnectionQuotas</code> enforces three count limits and a creation-rate limit, all guarded by synchronizing on a single <code>counts</code> mutable map (<code>SocketServer.scala:1276</code>):</p>
+<ul>
+  <li><strong>Per-IP cap</strong> — <code>max.connections.per.ip</code> (default <code>Integer.MAX_VALUE</code>), overridable per host via <code>max.connections.per.ip.overrides</code>. Exceeding it throws <code>TooManyConnectionsException</code> and the socket is closed (<code>:1306</code>).</li>
+  <li><strong>Per-listener cap</strong> — <code>listener.name.X.max.connections</code>, tracked in <code>listenerCounts</code> (<code>:1490</code>).</li>
+  <li><strong>Broker-wide cap</strong> — <code>max.connections</code>. The inter-broker listener is "protected": it may exceed the broker cap, and an LRU connection on another listener is closed to make room (<code>maxConnectionsExceeded</code> + <code>closeExcessConnections</code>, <code>:1474</code>, <code>SocketServer.scala:1110</code>).</li>
+  <li><strong>Creation-rate</strong> — <code>max.connection.creation.rate</code> (broker-wide and per-listener), and per-IP rates via dynamic <code>ip-connection-rate</code> quotas. Exceeding the rate yields a throttle delay (<code>ConnectionThrottledException</code>) computed from the quota window (<code>recordConnectionAndGetThrottleTimeMs</code>, <code>:1501</code>).</li>
+</ul>
+<p>When a slot is unavailable, <code>waitForConnectionSlot</code> blocks the acceptor on <code>counts.wait(...)</code> and is woken by <code>counts.notifyAll()</code> on every <code>dec</code>, listener add/remove, or dynamic limit increase (<code>:1453</code>, <code>:1425</code>). Throttle time spent blocked is folded into the <code>AcceptorBlockedPercent</code> meter.</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>connectionQuotas.inc</code> runs <em>on the acceptor thread</em> and can block it for the full throttle window. Because there is exactly one acceptor per listener, an aggressive client hammering a single IP can stall accepts for that whole listener (not just that IP). Rate-limit overrides per IP exist precisely to bound this, and the inter-broker listener is explicitly protected so cluster traffic is never starved by client churn.</p></div>
+
+<h2>Concurrency &amp; threading</h2>
+<p>The state-ownership model is strict and is what makes this lock-light design correct:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Owner / guard</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>Selector.channels</code>, <code>completedReceives</code>, all reactor state</td><td>Its single <code>Processor</code> thread — <em>no lock</em></td><td><code>Selector</code> is documented "not thread safe" (<code>Selector.java:86</code>)</td></tr>
+<tr><td><code>newConnections</code> (Acceptor → Processor)</td><td><code>ArrayBlockingQueue(20)</code></td><td>cross-thread hand-off (<code>SocketServer.scala:831</code>)</td></tr>
+<tr><td><code>responseQueue</code> (handlers → Processor)</td><td><code>LinkedBlockingDeque</code></td><td>plus <code>selector.wakeup()</code> (<code>:833</code>, <code>:1208</code>)</td></tr>
+<tr><td><code>requestQueue</code> / <code>callbackQueue</code></td><td><code>ArrayBlockingQueue(queued.max.requests)</code></td><td>many writers (processors) / many readers (handlers)</td></tr>
+<tr><td><code>Request</code> timing fields</td><td><code>volatile</code> longs</td><td>written by handler/purgatory threads, read by network thread (<code>Request.java:70</code>)</td></tr>
+<tr><td><code>processors</code> map in <code>RequestChannel</code></td><td><code>ConcurrentHashMap</code></td><td>resized on dynamic thread changes</td></tr>
+<tr><td><code>ConnectionQuotas.counts</code></td><td><code>synchronized(counts)</code> + <code>wait/notifyAll</code></td><td>plus <code>@volatile</code> limit fields (<code>:1278</code>)</td></tr>
+<tr><td>Purgatory <code>completed</code> flag</td><td><code>volatile</code> + per-op <code>ReentrantLock</code></td><td>(<code>DelayedOperation.java:40</code>, <code>:42</code>)</td></tr>
+<tr><td>Watcher shard map</td><td>per-shard <code>ReentrantLock</code> (512 shards)</td><td>(<code>DelayedOperationPurgatory.java:295</code>)</td></tr>
+<tr><td><code>SystemTimer</code> wheel mutation</td><td><code>ReentrantReadWriteLock</code></td><td>read lock on <code>add</code>, write lock while ticking (<code>SystemTimer.java:40</code>)</td></tr>
+<tr><td><code>TimerTaskList</code> linkage</td><td>nested <code>synchronized</code> + <code>AtomicInteger</code> counter</td><td>(<code>TimerTaskList.java:72</code>)</td></tr>
+</tbody></table></div>
+
+<h3>Broker thread census</h3>
+<p>The principal threads on a running broker (and their naming) relevant to this subsystem:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Thread name pattern</th><th>Count</th><th>Daemon?</th><th>Role</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>data-plane-kafka-socket-acceptor-&lt;listener&gt;-&lt;proto&gt;-&lt;port&gt;</code></td><td>1 per listener</td><td>non-daemon</td><td>accept + round-robin</td><td><code>SocketServer.scala:510</code></td></tr>
+<tr><td><code>data-plane-kafka-network-thread-&lt;node&gt;-&lt;listener&gt;-&lt;proto&gt;-&lt;id&gt;</code></td><td><code>num.network.threads</code> per listener</td><td>non-daemon</td><td>NIO reactor</td><td><code>SocketServer.scala:750</code>, <code>:829</code></td></tr>
+<tr><td><code>data-plane-kafka-request-handler-&lt;id&gt;</code></td><td><code>num.io.threads</code></td><td>daemon</td><td>KafkaApis dispatch</td><td><code>KafkaRequestHandler.scala:275</code></td></tr>
+<tr><td><code>ExpirationReaper-&lt;brokerId&gt;-&lt;Purgatory&gt;</code></td><td>1 per purgatory</td><td>non-daemon</td><td>ticks the timer (<code>advanceClock(200)</code>)</td><td><code>DelayedOperationPurgatory.java:409</code></td></tr>
+<tr><td><code>executor-&lt;Purgatory&gt;</code></td><td>1 per <code>SystemTimer</code></td><td>non-daemon</td><td>runs expired <code>TimerTask</code>s</td><td><code>SystemTimer.java:31</code>, <code>:54</code></td></tr>
+</tbody></table></div>
+<p>(A KRaft broker also runs replica-fetcher threads, log cleaner/flusher threads, the Raft I/O thread, controller-side network/handler/reaper threads when in combined mode, and various scheduler/metadata threads — those belong to <a href="09-fetch-path.html">the fetch path</a>, <a href="04-storage-management.html">storage management</a>, <a href="10-kraft-consensus.html">KRaft consensus</a> and <a href="11-kraft-controller.html">the controller</a>.) Note the reaper and timer-executor threads are non-daemon (<code>ShutdownableThread</code> sets <code>daemon=false</code>, <code>ShutdownableThread.java:56</code>); they are stopped explicitly on shutdown via a no-op task that wakes the blocked <code>DelayQueue.poll</code> (<code>DelayedOperationPurgatory.java:278</code>).</p>
+
+<h2>The request lifecycle timeline</h2>
+<p><code>Request</code> records five lifecycle timestamps (all in nanoseconds) that decompose end-to-end latency. They are populated at well-defined handoff points and rendered into the per-API request metrics by <code>updateRequestMetrics</code> (<code>Request.java:325</code>):</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">T0 · startTimeNanos</span><span class="nd">request fully received on network thread (Request ctor)</span></div>
+  <div class="conn" data-label="requestQueueTime = requestDequeue − start · waiting in RequestChannel"></div>
+  <div class="node cat-broker"><span class="nt">T1 · requestDequeueTimeNanos</span><span class="nd">handler picked it up</span></div>
+  <div class="conn ec-data" data-label="localTime = apiLocalComplete − requestDequeue (+cb) · CPU/disk in KafkaApis"></div>
+  <div class="node cat-broker"><span class="nt">T2 · apiLocalCompleteTimeNanos</span><span class="nd">KafkaApis done with synchronous part</span></div>
+  <div class="conn dashed ec-async" data-label="remoteTime = responseComplete − apiLocalComplete (−callback) · time in PURGATORY"></div>
+  <div class="node cat-coord"><span class="nt">T3 · responseCompleteTimeNanos</span><span class="nd">response object handed to RequestChannel</span></div>
+  <div class="conn" data-label="responseQueueTime = responseDequeue − responseComplete · waiting in Processor queue"></div>
+  <div class="node cat-broker"><span class="nt">T4 · responseDequeueTimeNanos</span><span class="nd">Processor pulled response to write</span></div>
+  <div class="conn ec-data" data-label="responseSendTime = endTime − responseDequeue · socket write time"></div>
+  <div class="node cat-broker"><span class="nt">T5 · endTime (now)</span><span class="nd">totalTime = endTime − startTimeNanos</span></div>
+  <div class="conn dashed" data-label="orthogonal"></div>
+  <div class="node pill"><span class="nt">plus (orthogonal)</span><span class="nd">throttleTime (quota, ms) · messageConversionsTime · temporaryMemoryBytes</span></div>
+</div><figcaption>The "remote time" bucket is where purgatory waiting shows up — a large RemoteTime on Fetch is normal, on Produce it indicates slow ISR replication.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>timestamp on a broker thread</span>
+  <span class="lgi"><span class="sw cat-coord"></span>response ready after purgatory wait</span>
+  <span class="lgi"><span class="arr ec-data"></span>active CPU / disk / socket work</span>
+  <span class="lgi"><span class="arr dashed ec-async"></span>remote / purgatory wait</span>
+  <span class="lgi"><span class="arr"></span>queue-wait between hand-offs</span>
+  <span class="lgi"><span class="mono">label</span> = derived latency bucket</span>
+</div></figure>
+<p>Each timestamp is written by a different actor: <code>startTimeNanos</code> by the network thread (<code>Request.java:89</code>); <code>requestDequeueTimeNanos</code> by the handler (<code>KafkaRequestHandler.scala:164</code>); <code>apiLocalCompleteTimeNanos</code> and <code>responseCompleteTimeNanos</code> by <code>RequestChannel.sendResponse</code> when the response is produced (<code>RequestChannel.scala:179</code>); <code>responseDequeueTimeNanos</code> by the processor's <code>dequeueResponse</code> (<code>SocketServer.scala:1213</code>). The network-thread time accumulated on the <code>KafkaChannel</code> (auth, read, write) is read and reset when the send completes and fed into the client's request-quota accounting (<code>SocketServer.scala:1086</code>, <code>KafkaChannel.java:454</code>). See <a href="19-quotas.html">Quotas &amp; Throttling</a>.</p>
+
+<h2>Configuration reference</h2>
+<p>All keys below are defined in <code>SocketServerConfigs.java</code> unless noted; <code>num.io.threads</code>/<code>background.threads</code> live in <code>ServerConfigs</code>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>num.network.threads</code></td><td>3</td><td>Processors (reactor threads) <em>per listener</em>; dynamically reconfigurable, bounded to [½×, 2×] current (<code>SocketServerConfigs.java:151</code>, <code>SocketServer.scala:413</code>)</td></tr>
+<tr><td><code>num.io.threads</code></td><td>8</td><td>Request-handler threads; processing + disk I/O (<code>ServerConfigs.java:50</code>)</td></tr>
+<tr><td><code>queued.max.requests</code></td><td>500</td><td>Size of the <code>RequestChannel</code> request queue; full queue blocks network threads (<code>:143</code>)</td></tr>
+<tr><td><code>queued.max.request.bytes</code></td><td>-1 (off)</td><td>If &gt;0, sizes the <code>SimpleMemoryPool</code>; pool exhaustion mutes channels and stops reads (<code>:147</code>, <code>SocketServer.scala:101</code>)</td></tr>
+<tr><td><code>socket.request.max.bytes</code></td><td>104857600 (100 MiB)</td><td>Max single receive size; <code>NetworkReceive</code> rejects larger frames (<code>:95</code>)</td></tr>
+<tr><td><code>socket.send.buffer.bytes</code></td><td>102400 (100 KiB)</td><td><code>SO_SNDBUF</code>; -1 = OS default (<code>:87</code>)</td></tr>
+<tr><td><code>socket.receive.buffer.bytes</code></td><td>102400 (100 KiB)</td><td><code>SO_RCVBUF</code>; -1 = OS default (<code>:91</code>)</td></tr>
+<tr><td><code>socket.listen.backlog.size</code></td><td>50</td><td>Server-socket accept backlog (<code>:99</code>)</td></tr>
+<tr><td><code>connections.max.idle.ms</code></td><td>600000 (10 min)</td><td>Idle connections closed by the <code>Selector</code>'s LRU idle-expiry manager (<code>:134</code>, <code>Selector.java:1427</code>)</td></tr>
+<tr><td><code>connection.failed.authentication.delay.ms</code></td><td>100</td><td>Delay before closing a connection that failed auth (slows brute-force) (<code>:138</code>, <code>Selector.java:1389</code>)</td></tr>
+<tr><td><code>max.connections.per.ip</code></td><td>2147483647</td><td>Per-IP connection cap (<code>:110</code>)</td></tr>
+<tr><td><code>max.connections.per.ip.overrides</code></td><td>"" (none)</td><td>Per-host overrides, e.g. <code>10.0.0.1:200</code> (<code>:105</code>)</td></tr>
+<tr><td><code>max.connections</code></td><td>2147483647</td><td>Broker-wide cap; inter-broker listener is exempt (closes LRU elsewhere) (<code>:115</code>)</td></tr>
+<tr><td><code>max.connection.creation.rate</code></td><td>2147483647</td><td>Conn-creation rate cap (broker &amp; listener); exceeding throttles new accepts (<code>:126</code>)</td></tr>
+<tr><td><code>producer.purgatory.purge.interval.requests</code></td><td>1000</td><td>Watcher-list purge threshold for the Produce purgatory (<code>ReplicationConfigs.java:111</code>; wired at <code>ReplicaManager.scala:186</code>)</td></tr>
+<tr><td><code>fetch.purgatory.purge.interval.requests</code></td><td>1000</td><td>Same, for the Fetch purgatory (<code>ReplicaManager.scala:190</code>)</td></tr>
+</tbody></table></div>
+<p>The reconfigurable set is <code>SocketServer.RECONFIGURABLE_CONFIGS</code>; <code>reconfigure</code> live-applies <code>max.connections*</code> and the creation rate, while per-listener <code>num.network.threads</code> resizes the processor pool (<code>SocketServer.scala:323</code>, <code>:438</code>). See <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a> for how dynamic config reaches here.</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Bad frame / disabled API.</strong> <code>parseRequestHeader</code> throws <code>InvalidRequestException</code>/<code>UnsupportedVersionException</code>; the processor closes just that channel via <code>processChannelException</code> and keeps serving others (<code>SocketServer.scala:929</code>, <code>:779</code>).</li>
+  <li><strong>Oversize receive.</strong> <code>receiveSize &gt; socket.request.max.bytes</code> → <code>InvalidReceiveException</code>, channel closed (<code>NetworkReceive.java:94</code>).</li>
+  <li><strong>Memory pressure.</strong> Pool-exhausted reads mute the channel; the broker recovers and un-mutes once memory frees, shuffling key order to avoid starving any one channel (<code>Selector.java:457</code>, <code>:668</code>).</li>
+  <li><strong>Idle / expired connections.</strong> The <code>IdleExpiryManager</code> closes the least-recently-active connection past <code>connections.max.idle.ms</code> on each poll (<code>Selector.java:795</code>).</li>
+  <li><strong>SASL session expiry / re-auth.</strong> A receive arriving on an expired session closes the channel and increments <code>expired-connections-killed-count</code> (<code>SocketServer.scala:1019</code>).</li>
+  <li><strong>acks=0 produce.</strong> The handler returns a <code>NoOpResponse</code> (or <code>CloseConnectionResponse</code> on error); no bytes are written but the channel is still unmuted to read pipelined requests (<code>SocketServer.scala:943</code>, <code>RequestChannel.scala:121</code>).</li>
+  <li><strong>Response for a dead connection.</strong> If the channel vanished, <code>sendResponse</code> logs a warning and updates metrics with zero network time rather than throwing (<code>SocketServer.scala:982</code>).</li>
+  <li><strong>Processor shutdown with queued responses.</strong> <code>RequestChannel.sendResponse</code> tolerates a <code>null</code> processor (shut down) and silently drops the response — the socket is already closed (<code>RequestChannel.scala:191</code>).</li>
+  <li><strong>Graceful close with outstanding receives.</strong> The <code>Selector</code> keeps a remotely-closed channel in <code>closingChannels</code> until its buffered requests are processed (so <code>acks=0</code> records aren't lost), then closes it (<code>Selector.java:929</code>, <code>:849</code>).</li>
+  <li><strong>Connection storm.</strong> Per-IP/listener/broker caps and rate limits throttle or reject; the inter-broker listener is protected so replication survives (<code>SocketServer.scala:1474</code>).</li>
+  <li><strong>Purgatory deadlock avoidance.</strong> Operation locks are held across watch+recheck; callers are advised not to call <code>checkAndComplete</code> under an external exclusive lock (<code>DelayedOperationPurgatory.java:133</code>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<ul>
+  <li><strong>Per-connection ordering.</strong> One completed receive per channel per poll + mute-until-response ⇒ requests on a single TCP connection are processed in send order despite multi-threaded handling (<code>Selector.java:434</code>, <code>SocketServer.scala:1044</code>).</li>
+  <li><strong>No accepted connection is dropped on hand-off.</strong> The acceptor blocks rather than discard (<code>SocketServer.scala:1143</code>).</li>
+  <li><strong>Exactly-once completion.</strong> A <code>DelayedOperation</code>'s <code>onComplete()</code> runs exactly once, racing callers notwithstanding (<code>DelayedOperation.java:60</code>).</li>
+  <li><strong>O(1) timer insert/cancel.</strong> Cancel just unlinks an entry; insert is O(1) within a wheel level, O(m) across overflow levels (<code>TimingWheel.java:147</code>, <code>TimerTaskList.java:98</code>).</li>
+  <li><strong>Connection-id uniqueness during overlap.</strong> The incrementing index prevents reuse while old in-flight requests reference the id (<code>SocketServer.scala:888</code>).</li>
+  <li><strong>Bounded request memory.</strong> The request queue is bounded and (optionally) the receive memory pool is bounded; together they cap how much un-processed request data the broker holds.</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="07-request-processing.html">Request Processing (KafkaApis)</a> — the handler pool's <code>apis.handle</code> target; <code>ApiRequestHandler</code> is defined alongside the handler (<code>KafkaRequestHandler.scala:37</code>).</li>
+  <li><a href="02-wire-protocol.html">Wire Protocol &amp; RPC Framework</a> — <code>RequestHeader</code>, <code>RequestContext</code>, <code>NetworkReceive</code> framing, and the <code>ApiVersionManager</code> gate used in <code>parseRequestHeader</code>.</li>
+  <li><a href="18-security.html">Security</a> — the <code>ChannelBuilder</code>/<code>TransportLayer</code>/<code>Authenticator</code> trio runs inside <code>Selector.poll</code>; SASL re-auth is intercepted in <code>processCompletedReceives</code>.</li>
+  <li><a href="19-quotas.html">Quotas &amp; Throttling</a> — throttle responses drive the channel mute state machine; network-thread time feeds request-quota accounting; <code>ConnectionQuotas</code> rate-limits accepts.</li>
+  <li><a href="08-replication.html">Replication</a>, <a href="09-fetch-path.html">Fetch Path</a>, <a href="13-group-coordination.html">Group Coordination</a>, <a href="14-transactions-eos.html">Transactions</a>, <a href="05-tiered-storage.html">Tiered Storage</a> — owners of the various purgatories.</li>
+  <li><a href="11-kraft-controller.html">KRaft Controller</a> &amp; <a href="12-metadata-propagation.html">Metadata Propagation</a> — the controller runs an analogous <code>SocketServer</code>/handler pool over its own listeners.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<ul>
+  <li><span class="pill kip">KAFKA-1989</span> Replaced the O(log n) <code>DelayQueue</code> purgatory with hierarchical timing wheels for O(1) insert/cancel and bounded purge cost — the design captured in <code>TimingWheel</code>/<code>SystemTimer</code>.</li>
+  <li><span class="pill kip">KIP-291</span> Separated controller from data-plane traffic (originally via a control-plane listener). In KRaft 4.x the listener is removed; isolation is achieved by the controller's own process/<code>SocketServer</code>/handler pool.</li>
+  <li><span class="pill kip">KIP-511</span> ApiVersions carries client software name/version; the broker harvests it in the processor for the per-client connection metrics (<code>SocketServer.scala:1035</code>).</li>
+  <li><span class="pill kip">KIP-1207</span> Motivates the dual per-pool vs aggregate idle meters in the handler pool so combined-mode <code>RequestHandlerAvgIdlePercent</code> is not skewed (<code>KafkaRequestHandler.scala:111</code>).</li>
+  <li>The receive <code>MemoryPool</code> (<code>queued.max.request.bytes</code>) lets operators cap request-side memory independently of the queue depth — a defense against many large in-flight requests (<code>SocketServer.scala:101</code>).</li>
+</ul>
+
+<h2>Gotchas &amp; operational notes</h2>
+<div class="callout warning"><span class="callout-title">Caution</span><p><code>num.network.threads</code> is <em>per listener</em>, not global (<code>SocketServerConfigs.java:153</code>). A broker with three listeners and the default 3 runs nine reactor threads. Dynamic decreases are clamped: you cannot drop below half (or above double) the current value in one step (<code>SocketServer.scala:421</code>).</p></div>
+<ul>
+  <li><strong>High RemoteTimeMs is normal on Fetch</strong> (consumers long-poll in purgatory) but on Produce signals slow ISR; use the per-API histograms emitted by <code>updateRequestMetrics</code>.</li>
+  <li><strong><code>NetworkProcessorAvgIdlePercent</code> near 0</strong> means reactor saturation — accepts may stall (watch <code>AcceptorBlockedPercent</code>); scale <code>num.network.threads</code>. <strong><code>RequestHandlerAvgIdlePercent</code> near 0</strong> means handler saturation — the request queue will fill and back-pressure the network; scale <code>num.io.threads</code> (<code>SocketServer.scala:120</code>, <code>KafkaRequestHandler.scala:253</code>).</li>
+  <li><strong><code>queued.max.request.bytes</code> defaults off (-1).</strong> Without it the only request-memory bound is queue depth × request size; on memory-tight brokers consider enabling it.</li>
+  <li><strong>The <code>RemoteFetch</code> purgatory uses purgeInterval 0</strong> on purpose, to release potentially-50 MiB <code>RemoteLogReadResult</code> buffers immediately for GC (<code>ReplicaManager.scala:196</code>).</li>
+  <li><strong>Failed-auth close delay must be &lt; idle timeout</strong> (<code>connection.failed.authentication.delay.ms</code> &lt; <code>connections.max.idle.ms</code>) or the connection may be reaped before the delayed close fires (<code>SocketServerConfigs.java:140</code>).</li>
+  <li><strong>Acceptor and reaper threads are non-daemon; handler threads are daemon.</strong> Clean shutdown depends on the explicit poison-pill/no-op mechanisms, not on JVM exit.</li>
+</ul>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

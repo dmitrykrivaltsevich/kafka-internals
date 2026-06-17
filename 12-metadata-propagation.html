@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Metadata &amp; Broker Lifecycle · Kafka Internals</title>
+<meta name="description" content="MetadataImage/Delta, the loader &amp; publishers, KRaftMetadataCache, registration, heartbeats, fencing.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="12-metadata-propagation">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>12 · Metadata Propagation &amp; Broker Lifecycle</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">In a KRaft cluster the single source of truth for cluster state is an ordered, Raft-replicated record stream stored in the <code>__cluster_metadata</code> topic. This chapter follows committed records from the local <code>RaftClient</code> through the <code>MetadataLoader</code>, which folds them into immutable <code>MetadataImage</code> snapshots via incremental <code>MetadataDelta</code> objects and fans each new image out to a chain of <code>MetadataPublisher</code>s. On the broker side <code>BrokerMetadataPublisher</code> turns image deltas into concrete actions on <code>ReplicaManager</code>, the coordinators, and the <code>KRaftMetadataCache</code> that answers Metadata requests. In parallel, <code>BrokerLifecycleManager</code> registers the broker, drives the fenced &rarr; active &rarr; controlled-shutdown state machine via periodic heartbeats, and <code>AssignmentsManager</code> reports JBOD directory placement back to the controller. We trace every data structure, algorithm, thread, and failure mode involved.</p>
+
+<h2>Role &amp; responsibilities</h2>
+
+<p>The metadata-propagation subsystem is the read side of the controller's write side. The <a href="11-kraft-controller.html">KRaft controller</a> appends records to the metadata log; <a href="10-kraft-consensus.html">KRaft consensus</a> replicates and commits them. Everything in <em>this</em> chapter is about how a node — broker or controller — turns that committed log into usable in-memory state and reacts to it. Concretely the subsystem must:</p>
+
+<ul>
+<li><strong>Consume committed records and snapshots</strong> from the <code>RaftClient</code> in offset order, on a single dedicated thread, and never expose partial state.</li>
+<li><strong>Maintain a complete, immutable <code>MetadataImage</code></strong> — the materialized view of all topics, partitions, brokers, configs, quotas, ACLs, SCRAM credentials, delegation tokens, producer-id blocks, and feature levels.</li>
+<li><strong>Publish each new image plus the delta</strong> describing what changed to an ordered list of publishers, so that subsystems can apply only the differences.</li>
+<li><strong>Gate record formats and behavior on <code>metadata.version</code></strong> and other feature levels (KIP-584), and react when they change.</li>
+<li><strong>Register the broker and keep it alive</strong> through <code>BrokerRegistration</code> + periodic <code>BrokerHeartbeat</code>, transitioning the broker through its lifecycle states and reporting offline/cordoned directories.</li>
+<li><strong>Block serving until caught up</strong>: a starting broker must replay metadata up to the cluster's high-water mark before it answers clients or is unfenced.</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Metadata is propagated as an <em>ordered log of records</em>, not as point-to-point RPC pushes. Each broker independently replays the same log to build byte-for-byte identical images. The controller never sends a broker its leadership assignments directly; it writes <code>PartitionChangeRecord</code>s to the log, and the broker discovers the change when it replays them. This is the fundamental shift from the ZooKeeper era's <code>LeaderAndIsrRequest</code>/<code>UpdateMetadataRequest</code> push model.</p></div>
+
+<h2>Where it lives in the code</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Principal class</th><th>File</th></tr></thead>
+<tbody>
+<tr><td>Complete immutable snapshot</td><td><code>MetadataImage</code></td><td><code>metadata/src/main/java/org/apache/kafka/image/MetadataImage.java</code></td></tr>
+<tr><td>Incremental change set</td><td><code>MetadataDelta</code></td><td><code>metadata/src/main/java/org/apache/kafka/image/MetadataDelta.java</code></td></tr>
+<tr><td>Image source descriptor</td><td><code>MetadataProvenance</code></td><td><code>metadata/.../image/MetadataProvenance.java</code></td></tr>
+<tr><td>Topic / partition sub-images</td><td><code>TopicsImage</code>, <code>TopicImage</code>, <code>TopicDelta</code></td><td><code>metadata/.../image/TopicsImage.java</code>, <code>TopicDelta.java</code></td></tr>
+<tr><td>Broker / controller sub-image</td><td><code>ClusterImage</code>, <code>ClusterDelta</code></td><td><code>metadata/.../image/ClusterImage.java</code>, <code>ClusterDelta.java</code></td></tr>
+<tr><td>Feature levels</td><td><code>FeaturesImage</code>, <code>FeaturesDelta</code></td><td><code>metadata/.../image/FeaturesImage.java</code>, <code>FeaturesDelta.java</code></td></tr>
+<tr><td>Log consumer / image builder</td><td><code>MetadataLoader</code></td><td><code>metadata/.../image/loader/MetadataLoader.java</code></td></tr>
+<tr><td>Batch &amp; transaction folding</td><td><code>MetadataBatchLoader</code></td><td><code>metadata/.../image/loader/MetadataBatchLoader.java</code></td></tr>
+<tr><td>Publisher SPI</td><td><code>MetadataPublisher</code></td><td><code>metadata/.../image/publisher/MetadataPublisher.java</code></td></tr>
+<tr><td>Broker-side applier</td><td><code>BrokerMetadataPublisher</code></td><td><code>core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala</code></td></tr>
+<tr><td>Re-registration watcher</td><td><code>BrokerRegistrationTracker</code></td><td><code>metadata/.../image/publisher/BrokerRegistrationTracker.java</code></td></tr>
+<tr><td>Read-path metadata cache</td><td><code>KRaftMetadataCache</code></td><td><code>metadata/src/main/java/org/apache/kafka/metadata/KRaftMetadataCache.java</code></td></tr>
+<tr><td>Broker registration record</td><td><code>BrokerRegistration</code></td><td><code>metadata/.../metadata/BrokerRegistration.java</code></td></tr>
+<tr><td>Partition registration record</td><td><code>PartitionRegistration</code></td><td><code>metadata/.../metadata/PartitionRegistration.java</code></td></tr>
+<tr><td>Lifecycle / heartbeat state machine</td><td><code>BrokerLifecycleManager</code></td><td><code>server/src/main/java/org/apache/kafka/server/BrokerLifecycleManager.java</code></td></tr>
+<tr><td>JBOD directory-assignment reporting</td><td><code>AssignmentsManager</code></td><td><code>server/src/main/java/org/apache/kafka/server/AssignmentsManager.java</code></td></tr>
+<tr><td>Wiring (loader, publishers)</td><td><code>SharedServer</code>, <code>BrokerServer</code></td><td><code>core/src/main/scala/kafka/server/SharedServer.scala</code>, <code>BrokerServer.scala</code></td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+
+<dl class="kv">
+<dt>__cluster_metadata</dt><dd>The single-partition internal topic holding the metadata log. The name is <code>Topic.CLUSTER_METADATA_TOPIC_NAME = "__cluster_metadata"</code> and the partition is <code>CLUSTER_METADATA_TOPIC_PARTITION</code> (partition 0) <span class="cite">clients/.../common/internals/Topic.java:30</span>. <code>KafkaRaftServer</code> aliases these as <code>MetadataPartition</code> and <code>MetadataTopicId = Uuid.METADATA_TOPIC_ID</code> <span class="cite">core/.../KafkaRaftServer.scala:119</span>.</dd>
+<dt>MetadataImage</dt><dd>An immutable Java <code>record</code> bundling one sub-image per metadata domain plus a <code>MetadataProvenance</code>. Reads are lock-free because each image is fully published before it becomes visible.</dd>
+<dt>MetadataDelta</dt><dd>A mutable builder accumulating per-domain sub-deltas (<code>topicsDelta</code>, <code>clusterDelta</code>, &hellip;); calling <code>apply(provenance)</code> produces the next image, reusing unchanged sub-images by reference.</dd>
+<dt>Provenance</dt><dd><code>(lastContainedOffset, lastContainedEpoch, lastContainedLogTimeMs, isOffsetBatchAligned)</code> — where in the log this image ends.</dd>
+<dt>Publisher</dt><dd>An implementation of <code>MetadataPublisher</code> registered with the loader; receives <code>onMetadataUpdate(delta, image, manifest)</code> callbacks in install order.</dd>
+<dt>Manifest</dt><dd>Describes what was published: a <code>LogDeltaManifest</code> (loaded from the log) or a <code>SnapshotManifest</code> (loaded from a snapshot).</dd>
+<dt>Broker epoch</dt><dd>A monotonically increasing per-incarnation lease handle returned by the controller at registration; every heartbeat and most controller RPCs carry it for fencing.</dd>
+<dt>Incarnation ID</dt><dd>A random <code>Uuid</code> generated once per broker process start <span class="cite">server/.../BrokerLifecycleManager.java:103</span>, letting the controller distinguish a restarted broker from the old one.</dd>
+<dt>Fenced</dt><dd>A registered-but-not-serving state: the broker is in the metadata but excluded from leadership/ISR and from Metadata responses to clients.</dd>
+</dl>
+
+<h2>Data structures</h2>
+
+<h3>MetadataImage — the materialized view</h3>
+
+<p><code>MetadataImage</code> is a record with ten components <span class="cite">metadata/.../image/MetadataImage.java:31</span>:</p>
+
+<pre><code>record MetadataImage(
+    MetadataProvenance provenance,   // where in the log this image ends
+    FeaturesImage      features,     // metadata.version + finalized feature levels
+    ClusterImage       cluster,      // BrokerRegistration + ControllerRegistration maps
+    TopicsImage        topics,       // topicsById + topicsByName (immutable persistent maps)
+    ConfigurationsImage configs,     // dynamic configs by ConfigResource
+    ClientQuotasImage  clientQuotas,
+    ProducerIdsImage   producerIds,  // next producer-id block
+    AclsImage          acls,
+    ScramImage         scram,
+    DelegationTokenImage delegationTokens)</code></pre>
+
+<p>The class documents itself as thread-safe; <code>MetadataImage.EMPTY</code> composes the <code>EMPTY</code> of every sub-image <span class="cite">metadata/.../image/MetadataImage.java:35</span>. <code>isEmpty()</code> is the logical AND of every sub-image being empty, used by the loader to decide whether it has ever seen a record. <code>highestOffsetAndEpoch()</code> and <code>offset()</code> derive from the provenance. <code>write(writer, options)</code> serializes the whole image back to records (used to produce snapshots and to "catch up" a new publisher), and crucially writes <code>features</code> <em>first</em> so the <code>metadata.version</code> record precedes every record whose decoding depends on it <span class="cite">metadata/.../image/MetadataImage.java:67</span>.</p>
+
+<h3>TopicImage / PartitionRegistration — partition state</h3>
+
+<p><code>TopicsImage</code> holds two <code>ImmutableMap</code>s, <code>topicsById</code> (by <code>Uuid</code>) and <code>topicsByName</code> <span class="cite">metadata/.../image/TopicsImage.java:37</span>. Each <code>TopicImage</code> maps partition index &rarr; <code>PartitionRegistration</code>. <code>PartitionRegistration</code> is the on-image form of a partition and exposes its fields as public finals:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>replicas</code></td><td><code>int[]</code></td><td>Replica broker IDs, in assignment order.</td></tr>
+<tr><td><code>directories</code></td><td><code>Uuid[]</code></td><td>JBOD log-directory ID per replica (parallel to <code>replicas</code>); <code>DirectoryId.MIGRATING</code> until known.</td></tr>
+<tr><td><code>isr</code></td><td><code>int[]</code></td><td>In-sync replica set.</td></tr>
+<tr><td><code>removingReplicas</code> / <code>addingReplicas</code></td><td><code>int[]</code></td><td>Reassignment deltas.</td></tr>
+<tr><td><code>elr</code> / <code>lastKnownElr</code></td><td><code>int[]</code></td><td>Eligible-leader-replica set and last-known ELR (KIP-966).</td></tr>
+<tr><td><code>leader</code></td><td><code>int</code></td><td>Current leader broker ID (<code>NO_LEADER_CHANGE</code> sentinel handling on merge).</td></tr>
+<tr><td><code>leaderRecoveryState</code></td><td><code>LeaderRecoveryState</code></td><td><code>RECOVERED</code> or <code>RECOVERING</code> (after unclean election).</td></tr>
+<tr><td><code>leaderEpoch</code></td><td><code>int</code></td><td>Bumped on every leader change.</td></tr>
+<tr><td><code>partitionEpoch</code></td><td><code>int</code></td><td>Bumped on every change to the partition (leader, ISR, replicas&hellip;).</td></tr>
+</tbody>
+</table></div>
+
+<p>The fields are declared at <span class="cite">metadata/.../metadata/PartitionRegistration.java:153</span>. A <code>PartitionRegistration</code> is built fresh from a <code>PartitionRecord</code> or evolved by <code>merge(PartitionChangeRecord)</code>, which copies forward unset fields (a null array in the record means "unchanged") <span class="cite">metadata/.../metadata/PartitionRegistration.java:238</span>. The split between <code>leaderEpoch</code> and <code>partitionEpoch</code> is what lets the broker tell "I became leader" (leader epoch bump) from "my ISR changed while I am leader" (partition epoch bump only) — see the local-change classification below.</p>
+
+<h3>BrokerRegistration — liveness &amp; placement</h3>
+
+<p><code>BrokerRegistration</code> is immutable <span class="cite">metadata/.../metadata/BrokerRegistration.java:45</span> and built from a <code>RegisterBrokerRecord</code> via <code>fromRecord</code> <span class="cite">metadata/.../metadata/BrokerRegistration.java:204</span>. Its fields:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>id</code>, <code>epoch</code></td><td>Broker ID and the controller-assigned broker epoch (lease).</td></tr>
+<tr><td><code>incarnationId</code></td><td>Random per-process UUID.</td></tr>
+<tr><td><code>listeners</code></td><td>Map of listener name &rarr; <code>Endpoint</code> (host/port/security protocol). Listeners must be named or construction throws.</td></tr>
+<tr><td><code>supportedFeatures</code></td><td>Map of feature name &rarr; <code>VersionRange</code> the broker supports.</td></tr>
+<tr><td><code>rack</code></td><td>Optional rack string.</td></tr>
+<tr><td><code>fenced</code></td><td>Whether the broker is currently fenced.</td></tr>
+<tr><td><code>inControlledShutdown</code></td><td>Whether the broker is performing controlled shutdown (KIP-841).</td></tr>
+<tr><td><code>directories</code></td><td>Sorted list of online JBOD log-directory UUIDs.</td></tr>
+<tr><td><code>cordonedDirectories</code></td><td>Cordoned directories (KIP for cordoned log dirs, gated by MV &ge; 4.3-IV0); <code>null</code> until the broker first reports them.</td></tr>
+</tbody>
+</table></div>
+
+<p>Helper predicates used elsewhere: <code>hasOnlineDir(dir)</code>, <code>hasUncordonedDirs()</code> (true if some directory is not cordoned), and <code>node(listenerName)</code> which constructs a <code>Node</code> carrying the <code>fenced</code> flag <span class="cite">metadata/.../metadata/BrokerRegistration.java:246</span>. The <code>fenced</code>/<code>inControlledShutdown</code> booleans are never mutated in place — a fencing change clones a new registration via <code>cloneWith(...)</code> in <code>ClusterDelta</code>.</p>
+
+<h3>FeaturesImage — metadata.version &amp; feature gating</h3>
+
+<p><code>FeaturesImage</code> holds <code>Map&lt;String,Short&gt; finalizedVersions</code> and an <code>Optional&lt;MetadataVersion&gt; metadataVersion</code> <span class="cite">metadata/.../image/FeaturesImage.java:45</span>. <code>metadata.version</code> is stored as a <code>FeatureLevelRecord</code> like any other feature but is materialized into a typed <code>MetadataVersion</code>; <code>metadataVersionOrThrow()</code> fails loudly if it is somehow absent. <code>isElrEnabled()</code> reads the <code>eligible.leader.replicas.version</code> finalized level <span class="cite">metadata/.../image/FeaturesImage.java:80</span>. When the image is written out, the <code>metadata.version</code> <code>FeatureLevelRecord</code> is emitted first and explicitly at record version 0 so that any older reader can still parse it <span class="cite">metadata/.../image/FeaturesImage.java:89</span>.</p>
+
+<h2>Architecture &amp; control flow</h2>
+
+<figure class="diagram"><div class="dstack">
+  <div class="layer cat-control"><div class="ln">Controller &middot; Raft layer</div><div class="ld">the active controller writes records; the local <code>RaftClient</code> commits batches of <code>__cluster_metadata-0</code> up to the high-water mark and serves snapshots</div><div class="row"><span class="chip">QuorumController</span><span class="chip">RaftClient</span><span class="chip">__cluster_metadata-0</span></div></div>
+  <div class="sep">&darr; handleCommit / handleLoadSnapshot / handleLeaderChange (RaftClient.Listener)</div>
+  <div class="layer cat-broker"><div class="ln">MetadataLoader &middot; single <code>metadata-loader-</code> event-queue thread</div><div class="ld"><code>image : MetadataImage</code> is mutated only here; <code>MetadataBatchLoader</code> folds N committed batches &rArr; one <code>MetadataDelta</code> (KIP-866 transactions); the <code>catchingUp</code> gate stays closed until offset &ge; highWaterMark&minus;1</div></div>
+  <div class="sep">&darr; onMetadataUpdate(delta, image, manifest) &mdash; in install order</div>
+  <div class="layer cat-broker"><div class="ln">Publisher chain</div><div class="ld">each new image + delta is fanned out to an ordered list of <code>MetadataPublisher</code>s</div><div class="row"><span class="chip">SnapshotGenerator</span><span class="chip">BrokerMetadataPublisher</span><span class="chip">BrokerRegistrationTracker</span><span class="chip">AclPublisher</span><span class="chip">ScramPublisher &hellip;</span></div></div>
+  <div class="sep">&darr; setImage &middot; applyDelta &middot; updateCoordinator &middot; startup</div>
+  <div class="layer cat-broker"><div class="ln">Broker subsystems</div><div class="ld">publishers turn image deltas into concrete actions on the read path, replication, and the coordinators</div><div class="row"><span class="chip">KRaftMetadataCache (reads)</span><span class="chip">ReplicaManager.applyDelta(&hellip;)</span><span class="chip mono">Group / Txn / Share coordinators</span><span class="chip">LogManager &middot; DynamicConfig &hellip;</span></div></div>
+</div><figcaption>The metadata read path, top to bottom: from committed Raft records, through the single-threaded <code>MetadataLoader</code>, out to the ordered publisher chain, and into materialized broker state. Each separator names the callback that crosses the boundary.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>controller / Raft layer (metadata source)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker-side loader / publishers / subsystems</span>
+  <span class="lgi"><span class="mono">chip</span> = a component within a plane</span>
+  <span class="lgi">separator = the callback that crosses the boundary (top &rarr; bottom)</span>
+  <span class="lgi">lower plane = further from the log, closer to served state</span>
+</div></figure>
+
+<p>Separately, the lifecycle path runs over a <code>NodeToControllerChannelManager</code> directly to the active controller:</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:3">
+  <div class="lanes"><span class="actor cat-broker">BrokerLifecycleManager<br><span class="mono">lifecycle-manager- thread</span></span><span class="actor cat-control">Active Controller</span><span class="actor cat-storage">Metadata log</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i><i></i></div>
+    <div class="note">currentMetadataOffset comes from <code>highestMetadataOffsetProvider = loader.lastAppliedOffset()</code></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">BrokerRegistrationRequest(incarnationId, listeners, features, logDirs)</span><span class="ln"></span></div>
+    <div class="m r ec-async" style="--from:2;--to:3"><span class="ml">write RegisterBrokerRecord &mdash; appears in the log later</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">BrokerRegistrationResponse(brokerEpoch)</span><span class="ln"></span></div>
+    <div class="note">loop &mdash; every <code>broker.heartbeat.interval.ms</code> (2000 ms)</div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">BrokerHeartbeatRequest(brokerEpoch, currentMetadataOffset, wantFence, wantShutDown, offlineLogDirs)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">BrokerHeartbeatResponse(isCaughtUp, isFenced, shouldShutDown)</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>The lifecycle path: registration then periodic heartbeats, sent over a dedicated <code>NodeToControllerChannelManager</code> straight to the active controller (not via the metadata log). The controller persists the registration as a record that the broker only later replays.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker (lifecycle manager)</span>
+  <span class="lgi"><span class="sw cat-control"></span>active controller</span>
+  <span class="lgi"><span class="sw cat-storage"></span>__cluster_metadata log</span>
+  <span class="lgi"><span class="arr"></span>request</span>
+  <span class="lgi"><span class="arr dashed"></span>response</span>
+  <span class="lgi"><span class="arr dashed"></span>(amber) async write &mdash; lands in the log out-of-band</span>
+  <span class="lgi">arrow points <span class="mono">from &rarr; to</span> over time (top &rarr; bottom)</span>
+</div></figure>
+
+<h2>Detailed mechanics</h2>
+
+<h3>From RaftClient callbacks to a published image</h3>
+
+<p><code>MetadataLoader</code> implements <code>RaftClient.Listener&lt;ApiMessageAndVersion&gt;</code> and is registered with <code>client.register(loader)</code> at <span class="cite">core/.../SharedServer.scala:358</span>. All three callbacks immediately <code>append</code> work to the loader's own event queue so that processing is serialized on one thread <span class="cite">metadata/.../image/loader/MetadataLoader.java:396</span>:</p>
+
+<ol>
+<li><strong><code>handleCommit(reader)</code></strong> drains every committed <code>Batch</code>. For each batch it calls <code>loadControlRecords</code> (which records the finalized <code>kraft.version</code> from a <code>KRaftVersionRecord</code> control record into metrics) and then <code>batchLoader.loadBatch(batch, currentLeaderAndEpoch)</code>. After the reader is exhausted it calls <code>batchLoader.maybeFlushBatches(currentLeaderAndEpoch, true)</code> to emit whatever was accumulated <span class="cite">metadata/.../image/loader/MetadataLoader.java:399</span>.</li>
+<li><strong><code>handleLoadSnapshot(reader)</code></strong> builds a delta on top of the <em>current</em> image, replays every snapshot record into it, calls <code>delta.finishSnapshot()</code>, computes a <code>SnapshotManifest</code>, applies the delta to get a new image, then <code>batchLoader.resetToImage(image)</code> and <code>maybePublishMetadata(...)</code> <span class="cite">metadata/.../image/loader/MetadataLoader.java:417</span>.</li>
+<li><strong><code>handleLeaderChange(leaderAndEpoch)</code></strong> updates <code>currentLeaderAndEpoch</code> and calls <code>publisher.onControllerChange(...)</code> on every active publisher <span class="cite">metadata/.../image/loader/MetadataLoader.java:498</span>.</li>
+</ol>
+
+<h3>Batch folding &amp; metadata transactions</h3>
+
+<p><code>MetadataBatchLoader</code> exists so that many Raft batches committed together produce a single publisher notification rather than one per batch <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:43</span>. It accumulates records into one <code>MetadataDelta</code> and tracks <code>lastOffset</code>, <code>lastEpoch</code>, <code>numBytes</code>, <code>numBatches</code>, and a <code>TransactionState</code>. It implements KIP-866 metadata transactions with a small state machine driven by control-ish records:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Record</th><th>From state</th><th>To state</th></tr></thead>
+<tbody>
+<tr><td><code>BeginTransactionRecord</code></td><td>NO_TRANSACTION</td><td>STARTED_TRANSACTION (throws if already in one)</td></tr>
+<tr><td>any data record</td><td>STARTED_TRANSACTION</td><td>CONTINUED_TRANSACTION</td></tr>
+<tr><td><code>EndTransactionRecord</code></td><td>STARTED/CONTINUED</td><td>ENDED_TRANSACTION</td></tr>
+<tr><td><code>AbortTransactionRecord</code></td><td>STARTED/CONTINUED</td><td>ABORTED_TRANSACTION</td></tr>
+<tr><td>any data record</td><td>ENDED/ABORTED</td><td>NO_TRANSACTION</td></tr>
+</tbody>
+</table></div>
+
+<p>The transition table lives in <code>replay</code> <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:226</span>. On <code>maybeFlushBatches</code> the loader publishes only when <em>not</em> inside a transaction: STARTED/CONTINUED suppress publishing; ABORTED publishes an <em>empty</em> delta built on the unchanged image (discarding the partial transaction); ENDED and NO_TRANSACTION publish the accumulated delta <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:190</span>. <code>applyDeltaAndUpdate</code> calls <code>delta.apply(provenance)</code>, invokes the loader's callback, and then <code>resetToImage(image)</code> so the next delta starts clean <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:274</span>.</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p><code>MetadataProvenance.isOffsetBatchAligned</code> records whether the image ends exactly on a Raft batch boundary. Snapshots may only be taken at batch-aligned offsets, so the snapshot generator must respect this flag. A delta emitted mid-batch (because a transaction started part-way through a batch) is marked not-aligned <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:154</span>.</p></div>
+
+<h3>Applying a delta to produce the next image</h3>
+
+<p><code>MetadataDelta.replay(ApiMessage)</code> is a big switch over <code>MetadataRecordType</code> that routes each record to the relevant sub-delta's <code>getOrCreateXDelta()</code> <span class="cite">metadata/.../image/MetadataDelta.java:194</span>. For example a <code>PartitionChangeRecord</code> goes to the topics delta; a <code>FenceBrokerRecord</code> to the cluster delta. <code>NoOpRecord</code> and the retained-but-inert <code>ZkMigrationStateRecord</code> are deliberate no-ops (the latter only matters for clusters that migrated from ZooKeeper under 3.x before upgrading to 4.x). <code>apply(provenance)</code> then walks each sub-delta: if a sub-delta is <code>null</code> the corresponding sub-image is carried forward by reference; otherwise its <code>apply()</code> produces a new sub-image. The result is a brand-new <code>MetadataImage</code> sharing all unchanged structure with its predecessor <span class="cite">metadata/.../image/MetadataDelta.java:387</span>.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Image construction is <em>structurally shared</em>: applying a delta that touches only one topic allocates a new <code>TopicsImage</code> and one new <code>TopicImage</code>, but every other topic, the entire cluster map, configs, ACLs, etc. are reused by reference. This is what makes per-record metadata propagation cheap enough to run on every broker.</p></div>
+
+<h3>Feature-level changes ripple through every sub-delta</h3>
+
+<p><code>FeaturesDelta.replay(FeatureLevelRecord)</code> decodes a <code>metadata.version</code> record into a typed <code>MetadataVersion</code> (throwing a helpful upgrade message if the level is unknown), records <code>kraft.version</code> changes as inert (KAFKA-18979), and otherwise stores/clears the feature level <span class="cite">metadata/.../image/FeaturesDelta.java:60</span>. When <code>metadata.version</code> itself changes, <code>MetadataDelta.replay(FeatureLevelRecord)</code> proactively calls <code>handleMetadataVersionChange(newVersion)</code> on <em>every</em> sub-delta so that any state that must be downgraded for an older MV is fixed immediately in the same delta <span class="cite">metadata/.../image/MetadataDelta.java:328</span>. <code>MetadataDelta.metadataVersionChanged()</code> surfaces this to publishers such as <code>BrokerRegistrationTracker</code>.</p>
+
+<h3>The catch-up gate</h3>
+
+<p><code>MetadataLoader</code> starts with <code>catchingUp = true</code> and refuses to publish to broker subsystems until it has reached the cluster high-water mark <span class="cite">metadata/.../image/loader/MetadataLoader.java:188</span>. <code>stillNeedToCatchUp(where, offset)</code> returns true while any of these hold: the high-water mark is unknown; the loaded <code>offset</code> is still behind <code>highWaterMark − 1</code>; or no controller record has been seen yet (<code>batchLoader.hasSeenRecord()</code> false). Once it crosses, it logs "finished catching up" and flips the flag permanently <span class="cite">metadata/.../image/loader/MetadataLoader.java:249</span>. <code>maybePublishMetadata</code> always stores the new image into <code>this.image</code> (so the loader's notion of "current" advances even while catching up) but returns early without notifying publishers while the gate is closed <span class="cite">metadata/.../image/loader/MetadataLoader.java:349</span>.</p>
+
+<h3>Installing publishers &amp; the catch-up snapshot</h3>
+
+<p>Publishers are installed via <code>loader.installPublishers(list)</code>, which enqueues them into <code>uninitializedPublishers</code> and schedules <code>initializeNewPublishers</code> <span class="cite">metadata/.../image/loader/MetadataLoader.java:523</span>. Initialization waits (rescheduling every 100 ms) until the loader is caught up, then synthesizes a delta <em>from the EMPTY image</em> by writing the entire current image into an <code>ImageReWriter</code>; that gives each new publisher a single "everything changed" delta and the full image in one shot, followed by an <code>onControllerChange</code> <span class="cite">metadata/.../image/loader/MetadataLoader.java:295</span>. Install order is preserved (<code>LinkedHashMap</code>): a publisher installed earlier always receives a given update before one installed later — the contract the loader's Javadoc promises.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A newly installed publisher never sees a partial view: it is either given the complete catch-up snapshot (after the loader is caught up) or nothing yet. Existing publishers continue to receive incremental deltas in strict offset order on the single loader thread, so no publisher can observe records out of order or skip an image.</p></div>
+
+<h3>BrokerMetadataPublisher — turning deltas into broker actions</h3>
+
+<p><code>BrokerMetadataPublisher.onMetadataUpdate</code> is the broker's central applier <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:111</span>. Per update it, in order:</p>
+
+<ol>
+<li><strong>Publishes the image to the cache</strong>: <code>metadataCache.setImage(newImage)</code> — a single volatile store that atomically makes the new image visible to all readers <span class="cite">metadata/.../metadata/KRaftMetadataCache.java:485</span>.</li>
+<li><strong>On the very first publish</strong>, calls <code>initializeManagers(newImage)</code> which starts <code>LogManager</code> (running unclean-shutdown recovery and identifying stray logs via <code>isStrayReplica</code>), recovers abandoned future logs (KAFKA-16082), then starts <code>ReplicaManager</code>, the group, transaction, and share coordinators <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:309</span>.</li>
+<li><strong>Applies topic deltas to replication</strong>: if <code>delta.topicsDelta()</code> is non-null, <code>replicaManager.applyDelta(topicsDelta, newImage)</code> creates/deletes/promotes partitions <span class="cite">core/.../server/ReplicaManager.scala:2360</span>.</li>
+<li><strong>Drives coordinator election/resignation</strong> for the <code>__consumer_offsets</code>, <code>__transaction_state</code>, and <code>__share_group_state</code> internal topics via <code>updateCoordinator</code> (detailed below).</li>
+<li><strong>Fans out to feature-specific publishers</strong>: dynamic configs, client quotas, topic/cluster quotas, SCRAM, delegation tokens, ACLs, then propagates the whole image to the group and share coordinators.</li>
+<li><strong>On first publish</strong>, calls <code>finishInitializingReplicaManager()</code> to start the high-water-mark checkpoint thread <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:378</span>.</li>
+<li><strong>Reacts to share-version toggles</strong> if the features delta changed the finalized <code>share.version</code> <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:226</span>.</li>
+<li>In a <code>finally</code> block, sets <code>_firstPublish = false</code> and completes <code>firstPublishFuture</code> — the signal <code>BrokerServer</code> waits on during startup <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:246</span>.</li>
+</ol>
+
+<h3>Classifying local replica changes</h3>
+
+<p><code>updateCoordinator</code> and <code>ReplicaManager.applyDelta</code> both rely on <code>TopicDelta.localChanges(brokerId)</code> to discover what changed for <em>this</em> broker <span class="cite">metadata/.../image/TopicDelta.java:176</span>. For each changed partition it sorts the broker into exactly one bucket:</p>
+
+<ul>
+<li><strong>deletes</strong>: the broker was a replica before but is not in the new replica set.</li>
+<li><strong>leaders</strong>: the broker is the new leader and the <code>partitionEpoch</code> changed.</li>
+<li><strong>electedLeaders</strong> (a subset of leaders): additionally the <code>leaderEpoch</code> changed — i.e. it newly became leader, not just had its ISR change.</li>
+<li><strong>followers</strong>: the broker is a non-leader replica and the <code>partitionEpoch</code> changed.</li>
+<li><strong>directoryIds</strong>: the partition's assigned directory for this broker changed.</li>
+</ul>
+
+<p><code>updateCoordinator</code> maps these to coordinator callbacks: deletions and follower transitions call <code>onResignation</code>, elected-leader transitions call <code>onElection(partition, leaderEpoch)</code>. Topic <em>deletion</em> is special-cased: it calls <code>onResignation(partition, None)</code> with no epoch bump because deletion does not increment the leader epoch <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:275</span>.</p>
+
+<h3>KRaftMetadataCache — the read path</h3>
+
+<p><code>KRaftMetadataCache</code> wraps a single <code>volatile MetadataImage currentImage</code> and replaces it wholesale in <code>setImage</code> <span class="cite">metadata/.../metadata/KRaftMetadataCache.java:74</span>. Its contract for readers is explicit in the source: because each image is immutable, a reader must grab <code>currentImage</code> <em>once</em> and operate on that snapshot for the duration of its work; re-reading the field risks mixing two image versions. The hot path is <code>partitionMetadata(...)</code> serving Metadata responses, and <code>maybeFilterAliveReplicas</code>, which drops brokers that are <code>fenced()</code> or that lack the requested listener <span class="cite">metadata/.../metadata/KRaftMetadataCache.java:92</span>. This is precisely where fencing becomes visible to clients: a fenced broker is filtered out of replica/ISR/leader lists, yielding <code>LEADER_NOT_AVAILABLE</code> / <code>REPLICA_NOT_AVAILABLE</code> rather than routing traffic to it.</p>
+
+<h2>Cluster bootstrap &amp; storage formatting</h2>
+
+<p>Before any broker can register or replay metadata, the cluster must be brought into existence. Unlike the ZooKeeper era, KRaft makes <em>formatting storage a mandatory first step</em>: a node refuses to start against an unformatted (or mis-formatted) log directory. Formatting is performed by the <code>kafka-storage</code> tool (<code>StorageTool</code>), and it is what writes the <code>cluster.id</code>, the per-directory identity, and the seed metadata that pins the cluster's initial <code>metadata.version</code>.</p>
+
+<ol>
+<li><strong>Generate a cluster ID.</strong> <code>kafka-storage random-uuid</code> prints a fresh <code>Uuid</code> (it simply emits <code>Uuid.randomUuid</code>) <span class="cite">core/.../tools/StorageTool.scala:99</span>. The same cluster ID must be supplied to every node when formatting.</li>
+<li><strong>Format each node's log dirs.</strong> <code>kafka-storage format --cluster-id &lt;ID&gt; --release-version &lt;MV&gt;</code> is required; <code>--cluster-id</code> is mandatory and the formatter throws "You must specify the cluster id." otherwise <span class="cite">metadata/.../storage/Formatter.java:250</span>. <code>--release-version</code> selects the initial feature settings — its minimum is <code>MINIMUM_VERSION</code> and the default is <code>LATEST_PRODUCTION</code> <span class="cite">core/.../tools/StorageTool.scala:336</span>. Formatting writes one <code>meta.properties</code> per directory and (for metadata dirs) a <code>bootstrap.checkpoint</code> snapshot.</li>
+<li><strong>Pick a quorum-formation mode (KIP-853 dynamic quorums).</strong> The format command exposes a mutually-exclusive group of controller-quorum options <span class="cite">core/.../tools/StorageTool.scala:347</span>.</li>
+</ol>
+
+<h3>What <code>format</code> writes per directory</h3>
+
+<p>For every empty log directory the formatter builds a <code>MetaProperties</code> (version <code>V1</code>) carrying the cluster ID, this node's ID, and a freshly generated <code>directory.id</code> UUID, then writes it as <code>meta.properties</code> <span class="cite">metadata/.../storage/Formatter.java:401</span>:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Property</th><th>Source</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>version</code></td><td><code>MetaPropertiesVersion.V1</code></td><td>meta.properties schema version.</td></tr>
+<tr><td><code>cluster.id</code></td><td><code>--cluster-id</code></td><td>Cluster-wide identity; verified against every other directory and every controller RPC.</td></tr>
+<tr><td><code>node.id</code></td><td><code>node.id</code> config</td><td>This node's broker/controller ID.</td></tr>
+<tr><td><code>directory.id</code></td><td><code>copier.generateValidDirectoryId()</code></td><td>Per-log-dir JBOD UUID; for a dynamic-metadata-voter dir it is taken from the <code>--initial-controllers</code> entry instead <span class="cite">metadata/.../storage/Formatter.java:438</span>.</td></tr>
+</tbody>
+</table></div>
+
+<p>For metadata directories the formatter also writes the binary bootstrap snapshot <code>bootstrap.checkpoint</code> (<code>BootstrapMetadata.BINARY_BOOTSTRAP_FILENAME</code>) <span class="cite">metadata/.../bootstrap/BootstrapMetadata.java:46</span>. Its records are computed by <code>BootstrapMetadata.fromVersions(releaseVersion, featureLevels, "format command")</code> and then any <code>--add-scram</code> credentials or extra records are appended via <code>fromRecords</code> <span class="cite">metadata/.../storage/Formatter.java:384</span>. The crucial payload is a <code>FeatureLevelRecord</code> for <code>metadata.version</code> at the chosen release version: on first start, "if the metadata log is empty, we will populate the log with these records" so that <code>metadata.version</code> is set before any other record is ever appended <span class="cite">metadata/.../bootstrap/BootstrapMetadata.java:41</span>. This is what makes the very first record in <code>__cluster_metadata</code> a <code>metadata.version</code> level — the same ordering invariant the loader relies on when it writes <code>features</code> first.</p>
+
+<h3>KIP-853 quorum-formation options</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Option</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>--standalone</code> / <code>-s</code></td><td>Initialize a controller as a single-node dynamic quorum. <code>controller.quorum.voters</code> must be unset; <code>controller.quorum.bootstrap.servers</code> is used instead <span class="cite">core/.../tools/StorageTool.scala:348</span>.</td></tr>
+<tr><td><code>--initial-controllers</code> / <code>-I</code></td><td>Initialize with a specified dynamic quorum: a comma-separated list of <code>id@host:port:directory</code>. The same values must be used to format all nodes <span class="cite">core/.../tools/StorageTool.scala:357</span>.</td></tr>
+<tr><td><code>--no-initial-controllers</code> / <code>-N</code></td><td>Initialize a server without committing to a dynamic quorum (joins later via <code>controller.quorum.bootstrap.servers</code>) <span class="cite">core/.../tools/StorageTool.scala:352</span>.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout note"><span class="callout-title">Note</span><p>These three are mutually exclusive (an <code>addMutuallyExclusiveGroup</code>). The classic alternative is the static <code>controller.quorum.voters</code> config, in which case none of these flags is passed. The directory UUID embedded in an <code>--initial-controllers</code> entry is exactly the <code>directory.id</code> that the matching node will write into its metadata <code>meta.properties</code>, tying voter identity to on-disk identity.</p></div>
+
+<h2>Broker lifecycle &amp; heartbeats</h2>
+
+<h3>The state machine</h3>
+
+<p><code>BrokerLifecycleManager</code> owns the <code>volatile BrokerState state</code> and the <code>volatile long brokerEpoch</code>, both written only from its event-queue thread <span class="cite">server/.../BrokerLifecycleManager.java:125</span>. The state machine, implemented across <code>StartupEvent</code> and <code>BrokerHeartbeatResponseEvent</code>:</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">(constructed)</span><span class="ta"></span></span>
+  <span class="st">NOT_RUNNING</span>
+  <span class="tr"><span class="tl">start()</span><span class="ta"></span></span>
+  <span class="st">STARTING</span>
+  <span class="tr"><span class="tl">heartbeat isCaughtUp false &#8634; retry ~10 ms</span><span class="ta"></span></span>
+  <span class="tr"><span class="tl">heartbeat isCaughtUp true &rArr; complete initialCatchUpFuture</span><span class="ta"></span></span>
+  <span class="st">RECOVERY</span>
+  <span class="tr"><span class="tl">heartbeat isFenced false &rArr; complete initialUnfenceFuture</span><span class="ta"></span></span>
+  <span class="st accent">RUNNING</span>
+  <span class="tr"><span class="tl">beginControlledShutdown()</span><span class="ta"></span></span>
+  <span class="st">PENDING_CONTROLLED_SHUTDOWN</span>
+  <span class="tr"><span class="tl">heartbeat wantShutDown true &#8634; (await controller)</span><span class="ta"></span></span>
+  <span class="tr"><span class="tl">response shouldShutDown true</span><span class="ta"></span></span>
+  <span class="st">SHUTTING_DOWN</span>
+  <span class="tr"><span class="tl">ShutdownEvent completes controlledShutdownFuture</span><span class="ta"></span></span>
+  <span class="term end"></span>
+  <div class="note"><strong>RECOVERY</strong> is where local log recovery runs; the broker stays fenced (<code>wantFence=true</code>) until <code>setReadyToUnfence()</code>, so the controller only reports <code>isFenced=false</code> &mdash; promoting it to <code>RUNNING</code> &mdash; once metadata is current.</div>
+</div><figcaption><code>BrokerState</code> transitions, driven by heartbeat-response booleans (<code>isCaughtUp</code>, <code>isFenced</code>, <code>shouldShutDown</code>) and implemented across <code>StartupEvent</code> and <code>BrokerHeartbeatResponseEvent</code> <span class="cite">server/.../BrokerLifecycleManager.java:645</span>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw round"></span><b>pill</b> = broker lifecycle state</span>
+  <span class="lgi"><span class="sw round cat-storage"></span><b>accent</b> = RUNNING (caught up, unfenced, serving)</span>
+  <span class="lgi"><span class="sw round"></span>&#9737; = initial (NOT_RUNNING entry) &middot; terminal (process exit)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger)</span>
+  <span class="lgi"><span class="mono">&#8634;</span> = self-transition (heartbeat retry / wait)</span>
+</div></figure>
+
+<h3>Registration</h3>
+
+<p><code>start(...)</code> enqueues a <code>StartupEvent</code> that starts the channel manager, moves to <code>STARTING</code>, schedules a registration-timeout deadline, and calls <code>sendBrokerRegistration()</code> <span class="cite">server/.../BrokerLifecycleManager.java:458</span>. The <code>BrokerRegistrationRequest</code> carries the broker ID, cluster ID, incarnation ID, advertised listeners, supported feature ranges, sorted log-directory UUIDs, and <code>previousBrokerEpoch</code> (read from clean-shutdown files, to speed re-registration after a clean restart) <span class="cite">server/.../BrokerLifecycleManager.java:475</span>. The response handler runs on a network thread, so it merely <code>prepend</code>s a <code>BrokerRegistrationResponseEvent</code> onto the event queue rather than touching state directly. On <code>Errors.NONE</code> it stores the assigned <code>brokerEpoch</code>, marks <code>registered = true</code> and <code>initialRegistrationSucceeded = true</code>, and immediately schedules the first heartbeat <span class="cite">server/.../BrokerLifecycleManager.java:548</span>.</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>If registration does not succeed within <code>initial.broker.registration.timeout.ms</code> (default 60000), the <code>RegistrationTimeoutEvent</code> fires and the broker <em>shuts itself down</em> — "Shutting down because we were unable to register with the controller quorum" <span class="cite">server/.../BrokerLifecycleManager.java:732</span>. A misconfigured controller listener or wrong cluster ID therefore manifests as a broker that exits a minute after start, not one that hangs forever.</p></div>
+
+<h3>Heartbeats &amp; fencing</h3>
+
+<p><code>sendBrokerHeartbeat()</code> builds a <code>BrokerHeartbeatRequest</code> with the current <code>brokerEpoch</code>, <code>currentMetadataOffset = highestMetadataOffsetProvider.get()</code> (wired to <code>loader.lastAppliedOffset()</code> at <span class="cite">core/.../BrokerServer.scala:451</span>), <code>wantFence = !readyToUnfence</code>, <code>wantShutDown = (state == PENDING_CONTROLLED_SHUTDOWN)</code>, and the set of offline log directories <span class="cite">server/.../BrokerLifecycleManager.java:564</span>. Once the broker is caught up and cordoned dirs are supported, it also includes <code>cordonedLogDirs</code>.</p>
+
+<p>The controller's response carries three booleans that drive transitions:</p>
+<ul>
+<li><strong><code>isCaughtUp</code></strong>: in <code>STARTING</code>, completes <code>initialCatchUpFuture</code>, moves to <code>RECOVERY</code>, and computes the cordoned dirs from config. The controller only sets this once the broker's reported metadata offset is sufficiently current.</li>
+<li><strong><code>isFenced</code></strong>: in <code>RECOVERY</code>, when it goes false, completes <code>initialUnfenceFuture</code> and moves to <code>RUNNING</code>.</li>
+<li><strong><code>shouldShutDown</code></strong>: in <code>PENDING_CONTROLLED_SHUTDOWN</code>, when true, calls <code>beginShutdown()</code>.</li>
+</ul>
+
+<p>The broker controls its own fencing through <code>wantFence</code>: it keeps <code>wantFence=true</code> until <code>setReadyToUnfence()</code> is called (which sets <code>readyToUnfence=true</code> and triggers an immediate heartbeat) <span class="cite">server/.../BrokerLifecycleManager.java:379</span>. Thus a broker is fenced during startup/recovery by design, so clients do not contact it while it is still loading state.</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The pull-based registration + heartbeat lease model, with the broker self-fencing until ready and the controller unfencing only once metadata is current, comes from <strong>KIP-631</strong> (the quorum-based controller). Separately, the <code>inControlledShutdown</code> flag in <code>BrokerRegistrationChangeRecord</code> and the rule that fenced replicas may not (re)join the ISR come from <strong>KIP-841</strong>. Feature levels gating record formats (including <code>metadata.version</code>) are <strong>KIP-584</strong>. Metadata transactions in the batch loader are <strong>KIP-866</strong>.</p></div>
+
+<h3>Controlled shutdown</h3>
+
+<p><code>beginControlledShutdown()</code> enqueues a <code>BeginControlledShutdownEvent</code>. From <code>RUNNING</code> it moves to <code>PENDING_CONTROLLED_SHUTDOWN</code> and sends an immediate heartbeat so the controller can start migrating leadership off this broker as soon as possible; from any other state it shuts down directly <span class="cite">server/.../BrokerLifecycleManager.java:335</span>. The broker stays in pending-shutdown, heartbeating with <code>wantShutDown=true</code>, until a response sets <code>shouldShutDown=true</code> — meaning the controller has moved this broker out of leadership for all its partitions. The <code>ShutdownEvent</code> then sets <code>SHUTTING_DOWN</code>, completes <code>controlledShutdownFuture</code>, cancels the catch-up/unfence futures, and tears down the channel manager <span class="cite">server/.../BrokerLifecycleManager.java:756</span>.</p>
+
+<h3>Communication scheduling</h3>
+
+<p>All communication is funnelled through a single <code>CommunicationEvent</code>: if a request is already in flight it sets <code>nextSchedulingShouldBeImmediate</code> and defers; otherwise it heartbeats if registered, or re-registers if not <span class="cite">server/.../BrokerLifecycleManager.java:742</span>. Steady-state heartbeats are scheduled <code>broker.heartbeat.interval.ms</code> (default 2000) apart, both after success and after failure. The <code>communicationInFlight</code> flag plus the in-flight short-circuit guarantee at most one outstanding controller request at a time.</p>
+
+<h3>Offline &amp; cordoned directories</h3>
+
+<p>If a log directory fails, <code>propagateDirectoryFailure(dir, timeout)</code> records it in <code>offlineDirs</code> (value=false until acknowledged), schedules an immediate heartbeat, and arms a deadline: if the offline dir is not acknowledged by the controller before the timeout, <code>OfflineDirBrokerFailureEvent</code> runs the shutdown hook <span class="cite">server/.../BrokerLifecycleManager.java:281</span>. Acknowledgement is detected in the heartbeat response handler, which marks each currently-reported offline dir as acknowledged <span class="cite">server/.../BrokerLifecycleManager.java:644</span>. Cordoned directories (MV &ge; 4.3-IV0) are reported once the broker is caught up.</p>
+
+<h3>BrokerRegistrationTracker — self-healing registration</h3>
+
+<p><code>BrokerRegistrationTracker</code> is itself a publisher. On each update, if either the metadata version changed or this broker's own registration changed, it checks whether the registration needs refreshing <span class="cite">metadata/.../image/publisher/BrokerRegistrationTracker.java:67</span>. The one case it handles: the cluster upgraded to an MV that supports JBOD (&ge; 3.7-IV2) but this broker's registration still lists no directories — then it calls the refresh callback, which is wired to <code>lifecycleManager.resendBrokerRegistration()</code> <span class="cite">core/.../BrokerServer.scala:582</span>. <code>resendBrokerRegistration</code> simply sets <code>registered=false</code> and triggers an immediate communication, causing a fresh <code>BrokerRegistrationRequest</code> <span class="cite">server/.../BrokerLifecycleManager.java:303</span>.</p>
+
+<h2>AssignmentsManager — reporting JBOD placement</h2>
+
+<p>In JBOD mode the controller records which directory each replica lives in, but the broker is the authority on actual placement. <code>AssignmentsManager</code> batches "this partition now lives in directory X" intents up to the controller via the <code>AssignReplicasToDirs</code> RPC <span class="cite">server/.../AssignmentsManager.java:62</span>. The <code>DirectoryEventHandler</code> on the broker forwards <code>handleAssignment(partition, dir, reason, callback)</code> into <code>onAssignment</code> <span class="cite">core/.../BrokerServer.scala:345</span>.</p>
+
+<ul>
+<li><strong>Queues</strong>: a <code>ConcurrentHashMap ready</code> holds assignments waiting to be sent; a <code>volatile Map inflight</code> holds the in-flight batch. <code>onAssignment</code> puts into <code>ready</code> and reschedules <code>MaybeSendAssignmentsEvent</code> with an exponential backoff (100 ms base, x2, 10 s cap) <span class="cite">server/.../AssignmentsManager.java:213</span>.</li>
+<li><strong>Sending</strong>: <code>maybeSendAssignments</code> sends nothing while a batch is in flight; otherwise it drains up to <code>MAX_ASSIGNMENTS_PER_REQUEST</code> assignments, validating each against the current image (<code>assignment.valid(nodeId, image)</code>) and discarding stale ones, then sends with the current broker epoch from <code>image.cluster().brokerEpoch(nodeId)</code> <span class="cite">server/.../AssignmentsManager.java:329</span>.</li>
+<li><strong>Response</strong>: per-partition <code>NONE</code> runs the success callback; any per-partition error or a global failure puts the assignment back into <code>ready</code> via <code>putIfAbsent</code> (so a newer intent for the same partition wins) and the request is retried with backoff <span class="cite">server/.../AssignmentsManager.java:368</span>.</li>
+</ul>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Like the loader and the lifecycle manager, <code>AssignmentsManager</code> is built on a single <code>KafkaEventQueue</code> thread (<code>broker-N-directory-assignments-manager-</code>). The <code>ready</code> map is a <code>ConcurrentHashMap</code> because <code>onAssignment</code> can be invoked from arbitrary threads, but all the send/response logic runs serialized on the event-queue thread.</p></div>
+
+<h2>Concurrency &amp; threading</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Component</th><th>Thread</th><th>What it guards</th></tr></thead>
+<tbody>
+<tr><td><code>MetadataLoader</code> + <code>MetadataBatchLoader</code></td><td>one <code>KafkaEventQueue</code> thread <code>kafka-N-metadata-loader-</code></td><td>The current <code>image</code>, the publisher lists, <code>catchingUp</code>, transaction state. All <code>RaftClient.Listener</code> callbacks append here, so log/snapshot/leader events are serialized.</td></tr>
+<tr><td><code>BrokerMetadataPublisher</code> (and the other publishers)</td><td>runs <em>on</em> the loader thread (invoked from <code>maybePublishMetadata</code>)</td><td>Publishers must not block; a single slow publisher stalls the whole metadata pipeline. They mutate their own subsystems' state, not loader state.</td></tr>
+<tr><td><code>KRaftMetadataCache</code></td><td>writes on the loader thread (<code>setImage</code>); reads on any request thread</td><td>One <code>volatile</code> reference; readers are lock-free and snapshot-consistent by grabbing it once.</td></tr>
+<tr><td><code>BrokerLifecycleManager</code></td><td>one <code>KafkaEventQueue</code> thread <code>broker-N-lifecycle-manager-</code></td><td>All mutable state; <code>state</code> and <code>brokerEpoch</code> are <code>volatile</code> for cross-thread reads but written only here. Controller responses arrive on network threads and are <code>prepend</code>ed as events.</td></tr>
+<tr><td><code>AssignmentsManager</code></td><td>one <code>KafkaEventQueue</code> thread <code>broker-N-directory-assignments-manager-</code></td><td><code>inflight</code> and send logic; <code>ready</code> is a <code>ConcurrentHashMap</code> for external producers.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>There is exactly one writer of the metadata image (the loader thread) and exactly one writer of broker lifecycle state (the lifecycle thread). Cross-thread visibility is achieved either by a single <code>volatile</code> store of an immutable object (the image, the broker state) or by bouncing the work onto the owning event queue (controller responses, assignment intents). No locks are taken on the metadata read path.</p></div>
+
+<h2>Configuration reference</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>broker.heartbeat.interval.ms</code></td><td>2000</td><td>Interval between broker heartbeats to the controller <span class="cite">raft/.../KRaftConfigs.java:39</span>.</td></tr>
+<tr><td><code>broker.session.timeout.ms</code></td><td>9000</td><td>How long a broker lease lasts without heartbeats before the controller fences it (controller-side) <span class="cite">raft/.../KRaftConfigs.java:43</span>.</td></tr>
+<tr><td><code>initial.broker.registration.timeout.ms</code></td><td>60000</td><td>Time to wait for initial registration before the broker process exits <span class="cite">raft/.../KRaftConfigs.java:35</span>.</td></tr>
+<tr><td><code>metadata.log.dir</code> / <code>log.dirs</code></td><td>(first log dir)</td><td>Where the <code>__cluster_metadata</code> log lives; its directory ID seeds the <code>RaftManager</code> <span class="cite">core/.../SharedServer.scala:296</span>.</td></tr>
+<tr><td><code>metadata.log.max.snapshot.interval.ms</code></td><td>(see <code>metadataSnapshotMaxIntervalMs</code>)</td><td>Max time between metadata snapshots, passed to the <code>SnapshotGenerator</code> <span class="cite">core/.../SharedServer.scala:346</span>.</td></tr>
+<tr><td><code>metadata.log.max.record.bytes.between.snapshots</code></td><td>(see <code>metadataSnapshotMaxNewRecordBytes</code>)</td><td>Byte threshold that triggers a new snapshot.</td></tr>
+<tr><td><code>unstable.feature.versions.enable</code></td><td>false</td><td>Allows selecting <code>metadata.version</code> values past <code>LATEST_PRODUCTION</code> (currently <code>IBP_4_3_IV0</code>) <span class="cite">server-common/.../MetadataVersion.java:157</span>.</td></tr>
+</tbody>
+</table></div>
+
+<p><code>metadata.version</code> itself is <em>not</em> a normal config in KRaft: it is a finalized feature level set at <code>kafka-storage format</code> time and changed via the <code>kafka-features</code> tool, then propagated as a <code>FeatureLevelRecord</code>. The minimum is <code>IBP_3_3_IV3</code> (feature level 7) and the latest production version is <code>IBP_4_3_IV0</code> (level 30) <span class="cite">server-common/.../MetadataVersion.java:147,157</span>; unstable versions up to <code>IBP_4_4_IV0</code> (level 31, DLQ for share groups, KIP-1191) require the unstable flag <span class="cite">server-common/.../MetadataVersion.java:136</span>.</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+
+<ul>
+<li><strong>Loader fault during replay.</strong> Per-record errors in <code>loadBatch</code>/<code>loadSnapshot</code> are routed to a <code>FaultHandler</code> with the offending offset, not silently swallowed <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:144</span>. On a broker the metadata-loading fault handler is typically fatal (a broker that cannot understand committed metadata is not safe to run).</li>
+<li><strong>Snapshot load.</strong> If the local log is far behind or has been truncated by retention, the <code>RaftClient</code> delivers a snapshot instead of a tail of records. <code>handleLoadSnapshot</code> rebuilds the delta and crucially calls <code>delta.finishSnapshot()</code>, which (via each sub-delta) generates removal entries for anything in the old image not present in the snapshot — so loading a snapshot correctly drops deleted topics/brokers <span class="cite">metadata/.../image/MetadataDelta.java:375</span>.</li>
+<li><strong>Aborted metadata transaction.</strong> A <code>BeginTransactionRecord</code> with no matching <code>EndTransactionRecord</code> that is instead aborted causes the batch loader to publish an empty delta on the pre-transaction image, discarding partial work <span class="cite">metadata/.../image/loader/MetadataBatchLoader.java:205</span>.</li>
+<li><strong>Registration rejected.</strong> A non-<code>NONE</code> registration error (e.g. duplicate incarnation, stale epoch) triggers <code>scheduleNextCommunicationAfterFailure()</code> and a retry, bounded by the initial-registration timeout that otherwise shuts the broker down.</li>
+<li><strong>Unknown metadata.version.</strong> If a <code>FeatureLevelRecord</code> names a level this binary does not know, <code>FeaturesDelta.replay</code> throws with a directive to set MV to at least <code>MINIMUM_VERSION</code> before upgrading the software <span class="cite">metadata/.../image/FeaturesDelta.java:64</span>. This is the guard against rolling a too-old binary into a too-new cluster.</li>
+<li><strong>Stray logs / abandoned future replicas.</strong> On first publish, <code>initializeManagers</code> uses the new image to decide which on-disk logs are strays (their replica set no longer includes this broker, or the topic ID is missing) and to repair future replicas left behind by a disk failure during reassignment (KAFKA-16082) <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:309</span>.</li>
+<li><strong>Publisher close / shutdown.</strong> On loader shutdown every publisher is closed; <code>BrokerMetadataPublisher.close()</code> completes <code>firstPublishFuture</code> exceptionally with a <code>TimeoutException</code> so a startup still blocked waiting for the first image fails fast rather than hanging <span class="cite">core/.../metadata/BrokerMetadataPublisher.scala:389</span>.</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Total order.</strong> Every node applies metadata records in the exact offset order they were committed in <code>__cluster_metadata</code>. Two brokers that have replayed up to the same offset hold identical images (modulo node-local fields). This is the bedrock guarantee that replaces ZooKeeper's per-znode watches.</p></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Atomic visibility.</strong> Readers never see a half-applied update: the image is swapped by one volatile store of an immutable object, and a publisher always receives a complete image alongside the delta.</p></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Caught-up-before-serve.</strong> A broker does not answer client requests as a healthy node until the loader has reached the high-water mark (<code>initialCatchUpFuture</code>) <em>and</em> the controller has unfenced it (<code>initialUnfenceFuture</code>) <em>and</em> the first image has been published (<code>firstPublishFuture</code>) <span class="cite">core/.../BrokerServer.scala:594</span>.</p></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Epoch fencing.</strong> A broker carries the <code>brokerEpoch</code> assigned at registration in every heartbeat and controller RPC; a stale incarnation cannot impersonate the current one because its epoch will not match the controller's record.</p></div>
+
+<h2>Interactions with other subsystems</h2>
+
+<ul>
+<li><a href="10-kraft-consensus.html">KRaft Consensus</a> — the loader is a <code>RaftClient.Listener</code>; <code>highWaterMark()</code> drives the catch-up gate and snapshots come from the same client.</li>
+<li><a href="11-kraft-controller.html">The KRaft Controller</a> — produces every record the loader consumes, assigns broker epochs, and decides fencing/unfencing and controlled-shutdown completion based on heartbeat contents.</li>
+<li><a href="08-replication.html">Replication, ISR &amp; High Watermark</a> — <code>ReplicaManager.applyDelta</code> consumes <code>TopicDelta.localChanges</code> to make this broker a leader or follower; fencing in the image removes a broker from ISR eligibility (KIP-841).</li>
+<li><a href="09-fetch-path.html">The Fetch Path</a> — leadership/epoch changes published here are what cause replica fetchers to be (re)started against the right leader.</li>
+<li><a href="13-group-coordination.html">Group Coordination</a>, <a href="14-transactions-eos.html">Transactions</a>, <a href="15-share-groups.html">Share Groups</a> — their coordinators are elected/resigned by <code>updateCoordinator</code> as the internal-topic partitions move.</li>
+<li><a href="07-request-processing.html">Request Processing</a> — <code>KafkaApis</code> answers <code>Metadata</code>, <code>DescribeTopicPartitions</code>, and feature queries straight from <code>KRaftMetadataCache</code>'s current image.</li>
+<li><a href="05-tiered-storage.html">Tiered Storage</a> &amp; JBOD — <code>AssignmentsManager</code> reports directory placement; offline-directory propagation feeds the controller's view of broker storage health.</li>
+<li><a href="19-quotas.html">Quotas</a> &amp; <a href="18-security.html">Security</a> — the dynamic-config, client-quota, SCRAM, delegation-token, and ACL publishers are chained behind <code>BrokerMetadataPublisher</code> in the same update.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+
+<p>The image/delta architecture is a deliberate generalization of "apply a log to build a state machine," tuned for the reality that broker metadata is large and changes incrementally. Three design choices stand out in the code:</p>
+
+<ul>
+<li><strong>Immutable, structurally-shared images</strong> let any number of request threads read consistent metadata with zero locking, while the single loader thread is the only writer — a classic single-writer/multi-reader pattern made cheap by persistent data structures.</li>
+<li><strong>Deltas plus a manifest</strong> mean each subsystem applies only what changed (one topic, one broker) instead of diffing whole images, and the manifest tells a publisher whether it is seeing a log tail or a snapshot so it can behave correctly in both cases.</li>
+<li><strong>Self-fencing brokers</strong> (KIP-631) invert the ZooKeeper model: instead of the controller pushing <code>LeaderAndIsr</code> and hoping the broker is ready, the broker pulls metadata, tells the controller via <code>wantFence</code> when it is ready, and the controller unfences only once the broker's reported offset proves it is current.</li>
+</ul>
+
+<p>Relevant KIPs: <span class="pill kip">KIP-631</span> quorum controller &amp; broker registration/heartbeat; <span class="pill kip">KIP-584</span> feature versioning / <code>metadata.version</code>; <span class="pill kip">KIP-841</span> fenced replicas &amp; controlled-shutdown state; <span class="pill kip">KIP-866</span> metadata transactions; <span class="pill kip">KIP-858</span> JBOD disk-failure handling (directory assignments); <span class="pill kip">KIP-966</span> eligible leader replicas (ELR fields in <code>PartitionRegistration</code>); <span class="pill kip">KIP-919</span> controller registration records.</p>
+
+<h2>Gotchas / operational notes</h2>
+
+<ul>
+<li><strong>Publishers run on the loader thread.</strong> Any blocking work inside <code>onMetadataUpdate</code> (or a coordinator <code>onElection</code> it triggers) delays <em>all</em> metadata propagation, including the cache update. This is why heavy startup work (log recovery) is gated to the first publish and why faults are caught per-section rather than allowed to escape.</li>
+<li><strong>"Caught up" is the controller's call, not the broker's.</strong> The broker reports its offset; the controller decides <code>isCaughtUp</code>/<code>isFenced</code>. A broker that cannot reach the active controller will heartbeat-fail and stay fenced even if its loader is fully caught up.</li>
+<li><strong>Re-registration is cheap and idempotent.</strong> <code>BrokerRegistrationTracker</code> may trigger a re-registration spuriously while replaying old log entries that change the directory list; the code accepts this because resending <code>BrokerRegistrationRequest</code> is harmless and a snapshot soon collapses the old entries <span class="cite">metadata/.../image/publisher/BrokerRegistrationTracker.java:116</span>.</li>
+<li><strong>Snapshots truncate replay cost.</strong> If a broker has been down a long time, it loads a snapshot rather than replaying the entire log; <code>finishSnapshot</code> guarantees deletions are honored, so a long-absent broker still converges to exactly the current state.</li>
+<li><strong>The metadata log is one partition.</strong> All cluster metadata flows through <code>__cluster_metadata-0</code>; there is no sharding. Throughput of metadata change is therefore bounded by a single Raft partition — a deliberate trade for total order and simplicity.</li>
+</ul>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

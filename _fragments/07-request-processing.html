@@ -1,0 +1,350 @@
+<h1>07 · Request Processing (KafkaApis)</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Every byte a client sends a Kafka node eventually arrives at a single Scala method: a giant <code>match</code> on the request's API key. This chapter follows that journey — how a parsed request is dequeued by a request-handler thread, dispatched to one of roughly eighty cases, authorized, validated, acted upon (often via a coordinator or the replica manager, frequently parked in a <em>purgatory</em> for produce/fetch), turned into a response, throttled by the quota managers, and finally handed back to the network layer for transmission. We dissect the dispatcher (<code>KafkaApis</code> on brokers, <code>ControllerApis</code> on the KRaft controller), the request-handler thread pool, the <code>RequestChannel</code> round-trip, the <code>ApiVersionManager</code> that decides which APIs a node even exposes, and the authorization/throttling/error-mapping hooks woven through every handler.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The request-processing layer is the broker's <em>application logic dispatcher</em>. The network layer (see <a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a>) is responsible for accepting connections, authenticating them, reading bytes off sockets, parsing them into typed request objects, and enqueuing them. From that point on, the request-processing layer owns the request. Its responsibilities are:</p>
+<ul>
+  <li><strong>Dispatch</strong> — route each request to a type-specific handler based on its API key.</li>
+  <li><strong>Authorize</strong> — consult the pluggable <code>Authorizer</code> for every resource the request touches, mapping denials to the appropriate <code>*_AUTHORIZATION_FAILED</code> error.</li>
+  <li><strong>Validate</strong> — reject malformed input, unknown topics/partitions, unsupported versions, and invalid record batches.</li>
+  <li><strong>Act</strong> — invoke the right subsystem: <code>ReplicaManager</code> for produce/fetch/delete-records, the <code>GroupCoordinator</code>/<code>TransactionCoordinator</code>/<code>ShareCoordinator</code> for group, transaction and share-group APIs, the <code>MetadataCache</code> for read-only metadata, or forward administrative requests to the controller.</li>
+  <li><strong>Respond</strong> — build the response message, fold in quota-driven throttle time, and hand it to the <code>RequestChannel</code>.</li>
+  <li><strong>Account</strong> — record per-request timing, byte, and error metrics.</li>
+</ul>
+<p>A second, structurally similar dispatcher — <code>ControllerApis</code> — runs only on KRaft controller nodes and handles the disjoint set of APIs that the controller exposes (Raft RPCs, broker registration/heartbeat, and the write side of admin operations forwarded by brokers).</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>There is no per-API thread or actor. A small, fixed pool of <em>request-handler threads</em> pulls requests off one shared queue and runs the entire synchronous portion of a handler to completion. Operations that must wait for other events (replication acks, accumulating fetch bytes, a coordinator commit) do not block the thread — they register a <em>delayed operation</em> in a purgatory and the thread moves on. Completion happens later on another thread, which invokes a captured callback to finish building and sending the response.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Class / Interface</th><th>File</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>ApiRequestHandler</code></td><td><code>core/src/main/scala/kafka/server/KafkaRequestHandler.scala:37</code></td><td>The contract: <code>handle(request, requestLocal)</code> + <code>tryCompleteActions()</code>.</td></tr>
+    <tr><td><code>KafkaApis</code></td><td><code>core/src/main/scala/kafka/server/KafkaApis.scala:93</code></td><td>Broker-side dispatcher; ~80 dispatch cases.</td></tr>
+    <tr><td><code>ControllerApis</code></td><td><code>core/src/main/scala/kafka/server/ControllerApis.scala:69</code></td><td>KRaft-controller-side dispatcher.</td></tr>
+    <tr><td><code>KafkaRequestHandler</code></td><td><code>core/src/main/scala/kafka/server/KafkaRequestHandler.scala:91</code></td><td>One request-handler thread (the <code>Runnable</code>).</td></tr>
+    <tr><td><code>KafkaRequestHandlerPool</code></td><td><code>core/src/main/scala/kafka/server/KafkaRequestHandler.scala:227</code></td><td>Pool of handler threads; dynamically resizable.</td></tr>
+    <tr><td><code>RequestChannel</code></td><td><code>core/src/main/scala/kafka/network/RequestChannel.scala:80</code></td><td>The queue between network and handler threads, and the response path back.</td></tr>
+    <tr><td><code>Request</code></td><td><code>server/src/main/java/org/apache/kafka/network/Request.java:54</code></td><td>The in-flight request object: context, body, timing fields.</td></tr>
+    <tr><td><code>RequestHandlerHelper</code></td><td><code>core/src/main/scala/kafka/server/RequestHandlerHelper.scala:28</code></td><td>Throttling + response-sending helpers shared by both dispatchers.</td></tr>
+    <tr><td><code>AuthHelper</code></td><td><code>core/src/main/scala/kafka/server/AuthHelper.scala:42</code></td><td>Authorization helpers (single, batch, by-resource-type).</td></tr>
+    <tr><td><code>ApiVersionManager</code></td><td><code>server/src/main/java/org/apache/kafka/server/ApiVersionManager.java:28</code></td><td>Decides which APIs/versions this node exposes.</td></tr>
+    <tr><td><code>DefaultApiVersionManager</code> / <code>SimpleApiVersionManager</code></td><td><code>server/src/main/java/org/apache/kafka/server/DefaultApiVersionManager.java:33</code> / <code>SimpleApiVersionManager.java:33</code></td><td>Broker / controller implementations.</td></tr>
+    <tr><td><code>DelayedProduce</code></td><td><code>server/src/main/java/org/apache/kafka/server/purgatory/DelayedProduce.java:41</code></td><td>Parked <code>acks=all</code> produce.</td></tr>
+    <tr><td><code>DelayedFetch</code></td><td><code>core/src/main/scala/kafka/server/DelayedFetch.scala:43</code></td><td>Parked long-poll fetch.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+  <dt>API key</dt><dd>A <code>short</code> identifying the request type (PRODUCE=0, FETCH=1, …). Enumerated in <code>ApiKeys</code>. The dispatcher's giant <code>match</code> keys on it.</dd>
+  <dt>Request handler thread</dt><dd>A daemon thread named <code>data-plane-kafka-request-handler-N</code> that loops, pulling requests and running handlers. There are <code>num.io.threads</code> of them per node.</dd>
+  <dt>RequestChannel</dt><dd>The bridge: a bounded request queue (network → handlers) plus the per-processor response queues (handlers → network).</dd>
+  <dt>RequestLocal</dt><dd>A thread-confined scratch area (notably a buffer-supplier cache) handed to the handler; one per request-handler thread, reused across requests on that thread.</dd>
+  <dt>Purgatory</dt><dd>A timeout-and-key-indexed holding area for operations that cannot complete immediately. See <a href="08-replication.html">Replication, ISR &amp; High Watermark</a> and <a href="09-fetch-path.html">The Fetch Path</a>.</dd>
+  <dt>Forwarding</dt><dd>Brokers do not mutate cluster metadata directly; admin requests are wrapped in an <code>Envelope</code> and sent to the active controller via the <code>ForwardingManager</code>.</dd>
+  <dt>Throttle time</dt><dd>An integer field in most responses telling the client how long it was (or should consider itself) throttled by quotas. Computed by the quota managers and folded in just before the response is built.</dd>
+</dl>
+
+<h2>The request-handler thread &amp; the RequestChannel round-trip</h2>
+
+<h3>The handler loop</h3>
+<p>Each <code>KafkaRequestHandler</code> is a <code>Runnable</code>. Its <code>run()</code> loop (<code>KafkaRequestHandler.scala:108</code>) is deceptively small:</p>
+<pre><code>while (!stopped) {
+  val req = requestChannel.receiveRequest(300)          // blocks up to 300 ms
+  // … account idle time …
+  req match {
+    case _: ShutdownRequest   =&gt; completeShutdown(); return
+    case callback: CallbackRequest =&gt; threadCurrentRequest.set(callback.originalRequest)
+                                      callback.fun().accept(requestLocal)   // rescheduled callback
+    case request: Request     =&gt; request.requestDequeueTimeNanos(endTime)
+                                 threadCurrentRequest.set(request)
+                                 apis.handle(request, requestLocal)         // the dispatch
+    case _: WakeupRequest     =&gt; // handled inside receiveRequest
+    case null                 =&gt; // poll timed out, loop
+  }
+}</code></pre>
+<p>On entry the thread stashes the <code>RequestChannel</code> in a <code>ThreadLocal</code> (<code>threadRequestChannel</code>, <code>KafkaRequestHandler.scala:44</code>); while handling, it stashes the current <code>Request</code> in <code>threadCurrentRequest</code>. These two thread-locals are the mechanism that lets an asynchronous completion callback <em>reschedule itself back onto a request-handler thread</em> (described below). Every branch wraps the work in <code>try/catch</code>: a <code>FatalExitError</code> triggers process exit (<code>Exit.exit</code>), any other <code>Throwable</code> is logged and swallowed so a single bad request never kills the thread. The <code>finally</code> clears <code>threadCurrentRequest</code> and calls <code>request.releaseBuffer()</code>.</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:4">
+  <div class="lanes"><span class="actor cat-client">Client socket</span><span class="actor cat-broker">Processor<br>(network thread)</span><span class="actor cat-broker">RequestChannel</span><span class="actor cat-broker">Request-handler thread</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">bytes</span><span class="ln"></span></div>
+    <div class="note" style="--from:2;--to:2">parse &rArr; new Request</div>
+    <div class="m r" style="--from:2;--to:3"><span class="ml">sendRequest(request)</span><span class="ln"></span></div>
+    <div class="note" style="--from:3;--to:3">requestQueue.put(request)</div>
+    <div class="m l" style="--from:4;--to:3"><span class="ml">receiveRequest(300) poll</span><span class="ln"></span></div>
+    <div class="m r dashed" style="--from:3;--to:4"><span class="ml">request</span><span class="ln"></span></div>
+    <div class="note" style="--from:4;--to:4">apis.handle(request, requestLocal)<br>authorize &middot; validate &middot; act</div>
+    <div class="m l" style="--from:4;--to:3"><span class="ml">sendResponse(request, resp)</span><span class="ln"></span></div>
+    <div class="note" style="--from:3;--to:3">buildResponseSend &rArr; SendResponse</div>
+    <div class="m l" style="--from:3;--to:2"><span class="ml">enqueueResponse(resp)</span><span class="ln"></span></div>
+    <div class="m l" style="--from:2;--to:1"><span class="ml">write Send (bytes)</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>Request lifecycle: the network thread parses and enqueues; a handler thread dequeues, runs the handler, and pushes a response back through the originating processor.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client socket</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker thread / queue</span>
+  <span class="lgi"><span class="arr"></span>request / call</span>
+  <span class="lgi"><span class="arr dashed"></span>poll result / response</span>
+  <span class="lgi"><span class="mono">box</span> = note (work done in a lane)</span>
+  <span class="lgi">lanes read top &rarr; bottom over time</span>
+</div></figure>
+
+<h3>RequestChannel internals</h3>
+<p><code>RequestChannel</code> (<code>RequestChannel.scala:80</code>) holds three structures:</p>
+<ul>
+  <li><code>requestQueue</code> — an <code>ArrayBlockingQueue[BaseRequest]</code> of capacity <code>queueSize</code> (= <code>queued.max.requests</code>, default <strong>500</strong>). The network threads <code>put</code>; handler threads <code>poll</code>. Because it is bounded and blocking, a slow handler pool exerts back-pressure all the way to the sockets.</li>
+  <li><code>processors</code> — a <code>ConcurrentHashMap[Int, Processor]</code> keyed by processor id, so a response can be routed back to the exact network thread (processor) that owns the client's connection. <code>request.processor</code> records that id.</li>
+  <li><code>callbackQueue</code> — a second <code>ArrayBlockingQueue</code> for <code>CallbackRequest</code>s (rescheduled completions), which jump ahead of normal requests in <code>receiveRequest</code> (<code>RequestChannel.scala:200</code>) since they have "already waited in line".</li>
+</ul>
+<p>The response path is <code>sendResponse(request, response)</code> (<code>RequestChannel.scala:131</code>): it updates per-error metrics, builds a <code>Send</code> via <code>request.buildResponseSend(response)</code>, computes the optional JSON request-log node, wraps it in a <code>SendResponse</code>, sets <code>responseCompleteTimeNanos</code>, looks up the originating <code>Processor</code> in <code>processors</code>, and calls <code>processor.enqueueResponse</code>. If the processor was shut down (lookup returns <code>null</code>) the response is silently dropped — the connection is already gone. Beyond <code>SendResponse</code>, the channel models <code>NoOpResponse</code> (e.g. <code>acks=0</code> produce: nothing to send), <code>CloseConnectionResponse</code> (error on a no-reply request), and the throttling sentinels <code>StartThrottlingResponse</code>/<code>EndThrottlingResponse</code> that mute/unmute a channel without consuming the single real response (<code>RequestChannel.scala:42-77</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Exactly one of <code>SendResponse</code>, <code>NoOpResponse</code>, or <code>CloseConnectionResponse</code> is produced per request; <code>StartThrottlingResponse</code>/<code>EndThrottlingResponse</code> may occur <em>in addition</em> and deliberately skip the response-timing bookkeeping (<code>RequestChannel.scala:174-187</code>).</p></div>
+
+<h3>The thread pool</h3>
+<p><code>KafkaRequestHandlerPool</code> (<code>KafkaRequestHandler.scala:227</code>) creates <code>num.io.threads</code> handler threads via <code>KafkaThread.daemon("data-plane-kafka-request-handler-" + id, …)</code>. The pool is built from a shared <code>KafkaRequestHandlerPoolFactory</code> so that the broker and controller (when co-located) share one aggregate idle-percent meter (<code>RequestHandlerAvgIdlePercent</code>) while each keeps its own per-pool meter (<code>BrokerRequestHandlerAvgIdlePercent</code> / <code>ControllerRequestHandlerAvgIdlePercent</code>, <code>KafkaRequestHandler.scala:243-251</code>). The pool is dynamically resizable: <code>resizeThreadPool(newSize)</code> (<code>KafkaRequestHandler.scala:283</code>) spins up or stops threads under a monitor, wired to the dynamic config <code>num.io.threads</code> through <code>DynamicThreadPool</code>.</p>
+
+<div class="table-wrap"><table>
+  <thead><tr><th>Config</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>num.io.threads</code></td><td>8</td><td>Size of the request-handler pool per node (<code>ServerConfigs.NUM_IO_THREADS_DEFAULT</code>). Dynamically reconfigurable.</td></tr>
+    <tr><td><code>queued.max.requests</code></td><td>500</td><td>Capacity of the shared request queue (<code>SocketServerConfigs.QUEUED_MAX_REQUESTS_DEFAULT</code>); the back-pressure point.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>The dispatch contract</h2>
+<p>Both dispatchers implement <code>ApiRequestHandler.handle</code>. On the broker, <code>KafkaApis.handle</code> (<code>KafkaApis.scala:155</code>) does:</p>
+<ol>
+  <li><strong>Version gate.</strong> If <code>apiVersionManager.isApiEnabled(apiKey, apiVersion)</code> is false it throws <code>IllegalStateException</code> — though in practice the socket layer already rejected such requests before enqueuing, so this is a defensive backstop (<code>KafkaApis.scala:166-170</code>).</li>
+  <li><strong>The giant match.</strong> A <code>request.header.apiKey match</code> with a case per API (<code>KafkaApis.scala:172-254</code>). Each case calls a <code>handleXxxRequest</code> method. A missing key throws <code>IllegalStateException("No handler …")</code>.</li>
+  <li><strong>Error funnel.</strong> The whole body is wrapped in <code>try/catch</code>: <code>FatalExitError</code> re-throws; any other <code>Throwable</code> goes to the local <code>handleError</code>, which logs and calls <code>requestHelper.handleError(request, e)</code> to send (or, if no response is expected, to close the connection) (<code>KafkaApis.scala:255-257</code>).</li>
+  <li><strong>finally.</strong> Calls <code>replicaManager.tryCompleteActions()</code> — draining the deferred action queue so any delayed operations made completable by this request fire promptly — and records <code>apiLocalCompleteTimeNanos</code> if still unset (<code>KafkaApis.scala:258-267</code>).</li>
+</ol>
+
+<p>Two handler styles coexist:</p>
+<ul>
+  <li><strong>Imperative (<code>Unit</code>-returning).</strong> e.g. produce, fetch, metadata. These send their own response inside callbacks and return nothing.</li>
+  <li><strong>Future-returning (<code>CompletableFuture[Unit]</code>).</strong> e.g. all the consumer-group, share-group and streams APIs that delegate to the <code>GroupCoordinator</code> (which is asynchronous). The dispatch attaches <code>.exceptionally(handleError)</code> so a failed future is funneled to the same error path (e.g. <code>KafkaApis.scala:177</code>, <code>:230</code>).</li>
+</ul>
+
+<div class="callout note"><span class="callout-title">Note</span><p>A large family of admin APIs is not handled locally at all on the broker — the case body is simply <code>forwardToController(request)</code>: <code>CREATE_TOPICS</code>, <code>DELETE_TOPICS</code>, <code>CREATE_PARTITIONS</code>, <code>CREATE_ACLS</code>/<code>DELETE_ACLS</code>, <code>ALTER_CLIENT_QUOTAS</code>, <code>ALTER_USER_SCRAM_CREDENTIALS</code>, <code>ELECT_LEADERS</code>, <code>ALTER_PARTITION_REASSIGNMENTS</code>/<code>LIST_PARTITION_REASSIGNMENTS</code>, <code>UPDATE_FEATURES</code>, <code>UNREGISTER_BROKER</code>, the Raft-voter APIs, and <code>DESCRIBE_QUORUM</code> (<code>KafkaApis.scala:188-237</code>). (The <code>ALTER_CONFIGS</code> family is <em>not</em> bare-forwarded: <code>handleAlterConfigsRequest</code>/<code>handleIncrementalAlterConfigsRequest</code> preprocess some resources locally and forward only the remainder.) These all land in <code>ControllerApis</code> after forwarding.</p></div>
+
+<h2>Walkthrough 1 — Produce</h2>
+<p><code>handleProduceRequest</code> (<code>KafkaApis.scala:397</code>) is the canonical "act, then maybe park in purgatory" handler.</p>
+<ol>
+  <li><strong>Transactional authorize.</strong> If the batch carries transactional records, the principal must have <code>WRITE</code> on the <code>TRANSACTIONAL_ID</code>; otherwise the request is failed with <code>TRANSACTIONAL_ID_AUTHORIZATION_FAILED</code> (<code>KafkaApis.scala:400-407</code>).</li>
+  <li><strong>Resolve &amp; bucket partitions.</strong> Each partition's topic id/name is resolved against the <code>MetadataCache</code>. Partitions are sorted into <code>unauthorizedTopicResponses</code>, <code>nonExistingTopicResponses</code>, <code>invalidRequestResponses</code>, and <code>authorizedRequestInfo</code>. Authorization is done in one batch call — <code>authHelper.filterByAuthorized(ctx, WRITE, TOPIC, …)</code> — to avoid one authorizer round-trip per partition (<code>KafkaApis.scala:415-451</code>).</li>
+  <li><strong>Record validation.</strong> Each authorized batch is run through <code>ProduceRequest.validateRecords</code>; an <code>ApiException</code> there maps the partition to the corresponding error (<code>KafkaApis.scala:444-450</code>).</li>
+  <li><strong>Define the response callback.</strong> <code>sendResponseCallback(responseStatus)</code> merges the per-partition results, attaches current-leader hints (for v10+, on <code>NOT_LEADER_OR_FOLLOWER</code>), computes throttle time, and sends (<code>KafkaApis.scala:458-530</code>).</li>
+  <li><strong>Act.</strong> If anything is left to write, call <code>replicaManager.handleProduceAppend(timeout, requiredAcks, …, responseCallback = sendResponseCallback, …)</code>, then immediately <code>produceRequest.clearPartitionRecords()</code> to drop the request's reference to the record bytes so GC can reclaim them while the operation sits in purgatory (<code>KafkaApis.scala:538-558</code>).</li>
+</ol>
+<p>Inside <code>ReplicaManager</code>, <code>appendRecords</code> writes to the leader log, builds a per-partition <code>ProducePartitionStatus</code>, and calls <code>maybeAddDelayedProduce</code> (<code>ReplicaManager.scala:878</code>). If <code>requiredAcks == -1</code> (acks=all) and the local writes succeeded, it constructs a <code>DelayedProduce</code> and registers it: <code>delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)</code> keyed by each <code>TopicPartitionOperationKey</code> (<code>ReplicaManager.scala:903-911</code>). Otherwise (<code>acks=0</code> or <code>acks=1</code>) the callback fires synchronously and the response is sent at once.</p>
+
+<h3>DelayedProduce mechanics</h3>
+<p><code>DelayedProduce</code> (<code>DelayedProduce.java:41</code>) holds a map of <code>ProducePartitionStatus</code>. On construction, partitions that succeeded locally have <code>acksPending=true</code> and their response error is pre-set to <code>REQUEST_TIMED_OUT</code> (cleared only when enough replicas catch up) (<code>DelayedProduce.java:111-121</code>). <code>tryComplete()</code> (<code>DelayedProduce.java:140</code>) asks, for each still-pending partition, a <code>PartitionStatusValidator</code> — a callback that delegates back into <code>ReplicaManager#getPartitionOrError(...).checkEnoughReplicasReachOffset(requiredOffset)</code> (wired in <code>ReplicaManager.scala:891-901</code>) — three cases:</p>
+<ul>
+  <li><strong>A</strong>: replica not assigned to this broker; <strong>B</strong>: broker no longer leader; <strong>C</strong>: broker is leader → C.1 a local error, or C.2 enough replicas have reached the required offset.</li>
+</ul>
+<p>If any case resolves a partition, its <code>acksPending</code> is cleared and its error set accordingly. When no partition is still pending, <code>forceComplete()</code> fires <code>onComplete()</code>, which assembles the final per-partition response map and invokes the captured <code>responseCallback</code> (= the handler's <code>sendResponseCallback</code>) (<code>DelayedProduce.java:159-196</code>). On timeout, <code>onExpiration()</code> just records the expiration meter; the pre-set <code>REQUEST_TIMED_OUT</code> errors then surface to the client.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">handleProduceRequest</span><span class="nd">KafkaApis</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">ReplicaManager.handleProduceAppend</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage store"><span class="nt">appendRecordsToLeader</span><span class="nd">local write</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage decision">acks = all?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node"><span class="nt">responseCallback(now)</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="yes"></div>
+      <div class="node cat-coord"><span class="nt">delayedProducePurgatory</span><span class="nd">.tryCompleteElseWatch(DelayedProduce, keys)</span></div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn ec-async" data-label="HW advances"></div>
+          <div class="node cat-storage"><span class="nt">follower fetch advances HW</span><span class="nd">checkAndComplete(key)</span></div>
+          <div class="conn"></div>
+          <div class="node cat-coord"><span class="nt">tryComplete</span></div>
+          <div class="conn"></div>
+          <div class="node cat-coord"><span class="nt">forceComplete</span></div>
+        </div>
+        <div class="col">
+          <div class="conn ec-err" data-label="timeout (maxWait)"></div>
+          <div class="node cat-error"><span class="nt">onExpiration</span><span class="nd">REQUEST_TIMED_OUT</span></div>
+        </div>
+      </div>
+      <div class="conn"></div>
+      <div class="node cat-coord"><span class="nt">onComplete</span></div>
+      <div class="conn"></div>
+      <div class="node"><span class="nt">responseCallback</span></div>
+    </div>
+  </div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">sendResponse</span></div>
+</div><figcaption>acks=all produce: written locally, then parked in purgatory until follower fetches advance the high watermark or the timeout expires; either way a single response callback fires.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker dispatch / replica manager</span>
+  <span class="lgi"><span class="sw cat-storage"></span>log / local write</span>
+  <span class="lgi"><span class="sw cat-coord"></span>purgatory (delayed op)</span>
+  <span class="lgi"><span class="sw cat-error"></span>timeout / error path</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = log store</span>
+  <span class="lgi">rounded = decision</span>
+  <span class="lgi"><span class="arr"></span>control flow</span>
+  <span class="lgi"><span class="arr ec-async"></span>async wake-up</span>
+  <span class="lgi"><span class="arr ec-err"></span>expiry</span>
+</div></figure>
+
+<h2>Walkthrough 2 — Fetch</h2>
+<p><code>handleFetchRequest</code> (<code>KafkaApis.scala:564</code>) mirrors produce but for reads, and additionally manages incremental fetch sessions.</p>
+<ol>
+  <li><strong>Build a fetch context.</strong> <code>fetchManager.newContext(version, metadata, isFromFollower, fetchData, forgottenTopics, topicNames)</code> resolves the incremental-fetch session (full vs. incremental) and yields a <code>FetchContext</code> (<code>KafkaApis.scala:577-583</code>). See <a href="09-fetch-path.html">The Fetch Path &amp; Replica Fetchers</a>.</li>
+  <li><strong>Authorize by caller type.</strong> A <em>follower</em> fetch (replicaId ≥ 0) requires <code>CLUSTER_ACTION</code> on <code>CLUSTER</code>; a consumer fetch requires <code>READ</code> on each topic (batched). Unauthorized / unknown partitions go into <code>erroneous</code>; the rest into <code>interesting</code> (<code>KafkaApis.scala:587-621</code>).</li>
+  <li><strong>Define the response callback.</strong> <code>processResponseCallback(responsePartitionData)</code> builds each <code>FetchResponseData.PartitionData</code> (high watermark, last-stable-offset, log-start, aborted txns, records, preferred read replica, diverging epoch, and current-leader hints for v16+), then either records leader-quota usage (follower path, exempt from client throttle) or applies fetch+request quotas and possibly returns an empty throttled response (consumer path) (<code>KafkaApis.scala:636-731</code>).</li>
+  <li><strong>Act.</strong> If <code>interesting</code> is non-empty, cap <code>fetchMaxBytes</code> against <code>fetch.max.bytes</code> and the quota window, build <code>FetchParams</code>, and call <code>replicaManager.fetchMessages(params, interesting, quota, responseCallback)</code> (<code>KafkaApis.scala:733-776</code>).</li>
+</ol>
+<p>When the leader log has fewer than <code>minBytes</code> immediately available, <code>ReplicaManager</code> creates a <code>DelayedFetch</code> and watches it. <code>DelayedFetch.tryComplete</code> (<code>DelayedFetch.scala:70</code>) re-evaluates eight cases on each trigger: leadership loss (A/B), unknown partition (C), offline dir (D), fenced epoch (E), fetch offset on an older/truncated segment (F), accumulated bytes ≥ <code>minBytes</code> (G), or a newly-discovered diverging epoch requiring truncation (H). On completion it re-reads from the log (<code>readFromLog(..., readFromPurgatory = true)</code>) and invokes the callback (<code>DelayedFetch.scala:158-178</code>).</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Follower fetches are <em>exempt from client throttling</em> (<code>sendResponseExemptThrottle</code>) but are recorded against the <em>leader replication quota</em>; consumer fetches are subject to both the per-client fetch-bandwidth quota and the request quota (<code>KafkaApis.scala:686-730</code>).</p></div>
+
+<h2>Walkthrough 3 — Metadata (read from the cache)</h2>
+<p><code>handleTopicMetadataRequest</code> (<code>KafkaApis.scala:885</code>) is purely read-only and never touches a log or coordinator. It authorizes <code>DESCRIBE</code> on the requested topics, then delegates to the private <code>getTopicMetadata</code> helper (<code>KafkaApis.scala:838-883</code>, invoked at <code>:962</code>), which resolves them through <code>metadataCache.getTopicMetadata(topics, listenerName, …)</code> (<code>KafkaApis.scala:847</code>). For topics the cache does not know, the helper either (a) asks the <code>AutoTopicCreationManager</code> to create them — itself a forward-to-controller path gated by the controller-mutation quota — when auto-creation is allowed, or (b) returns <code>UNKNOWN_TOPIC_OR_PARTITION</code> / <code>INVALID_TOPIC_EXCEPTION</code> (<code>KafkaApis.scala:856-882</code>). The <code>MetadataCache</code> is the broker's read-optimized projection of the KRaft metadata log; see <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>.</p>
+
+<h2>Walkthrough 4 — Coordinator-delegating APIs</h2>
+<p>Group, transaction and share-group APIs are thin: authorize, then hand off to a coordinator and let its (asynchronous) result drive the response.</p>
+<ul>
+  <li><strong>InitProducerId</strong> (<code>KafkaApis.scala:1621</code>): authorizes <code>WRITE</code> on the transactional id (or <code>IDEMPOTENT_WRITE</code>/<code>WRITE</code>-by-resource-type for idempotent-only producers; plus <code>TWO_PHASE_COMMIT</code> when <code>enable2Pc</code>), validates the producer-id/epoch pair, then calls <code>txnCoordinator.handleInitProducerId(... sendResponseCallback, requestLocal)</code>. The callback down-converts <code>PRODUCER_FENCED</code> to <code>INVALID_PRODUCER_EPOCH</code> for v&lt;4 clients (<code>KafkaApis.scala:1640-1681</code>).</li>
+  <li><strong>AddPartitionsToTxn</strong> (<code>KafkaApis.scala:1874</code>): v4+ requests come only from other brokers and require <code>CLUSTER_ACTION</code>; v&lt;4 come from clients and require <code>WRITE</code> on the transactional id and topics. Each transaction is dispatched to <code>txnCoordinator.handleAddPartitionsToTransaction</code> (or <code>handleVerifyPartitionsInTransaction</code> for verify-only), and a synchronized counter (<code>responses.synchronized</code>) sends the batched response only once all transactions have reported back (<code>KafkaApis.scala:1904-1980</code>).</li>
+  <li><strong>FindCoordinator</strong> (<code>KafkaApis.scala:1192</code>): resolves the coordinator node for a group/transaction/share key by hashing into the internal topic and reading the partition leader from the <code>MetadataCache</code>.</li>
+  <li><strong>Offset &amp; group APIs</strong> (<code>OFFSET_COMMIT</code>, <code>OFFSET_FETCH</code>, <code>JOIN_GROUP</code>, <code>SYNC_GROUP</code>, <code>HEARTBEAT</code>, <code>CONSUMER_GROUP_HEARTBEAT</code>, …) all return <code>CompletableFuture[Unit]</code> from the new <code>GroupCoordinator</code> interface; see <a href="13-group-coordination.html">Group Coordination &amp; Rebalance Protocols</a>.</li>
+</ul>
+<p>Transaction-specific handling is covered in <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>; share-group APIs (the <code>SHARE_*</code> and <code>*_SHARE_GROUP_STATE</code> families dispatched at <code>KafkaApis.scala:238-249</code>) in <a href="15-share-groups.html">Share Groups</a>.</p>
+
+<h2>ApiVersions &amp; the ApiVersionManager</h2>
+<p><code>ApiVersionManager</code> (<code>ApiVersionManager.java:28</code>) is the authority on <em>which API/version combinations this node accepts</em>. Its default <code>isApiEnabled(apiKey, version)</code> is a conjunction of three predicates (<code>ApiVersionManager.java:62-64</code>):</p>
+<pre><code>apiKey != null
+  &amp;&amp; apiKey.inScope(listenerType())                       // listener-type scope
+  &amp;&amp; apiKey.isVersionEnabled(version, enableUnstableLastVersion())</code></pre>
+<p><code>inScope</code> (<code>ApiKeys.java:312</code>) tests whether the API is exposed on this node's listener type (BROKER vs. CONTROLLER); <code>isVersionEnabled</code> (<code>ApiKeys.java:245</code>) tests the version range, with <code>ApiVersions</code> itself accepted at <em>any</em> version so an old client can always negotiate down to v0. The <code>enableUnstableLastVersion</code> flag — backing the config <code>unstable.api.versions.enable</code> — decides whether the newest, not-yet-stable version of each API is advertised.</p>
+<p>Two implementations exist:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th><code>DefaultApiVersionManager</code> (broker)</th><th><code>SimpleApiVersionManager</code> (controller)</th></tr></thead>
+  <tbody>
+    <tr><td>Listener type</td><td><code>BROKER</code></td><td><code>CONTROLLER</code></td></tr>
+    <tr><td>Features source</td><td><code>metadataCache.features()</code></td><td>controller-supplied <code>featuresProvider</code></td></tr>
+    <tr><td>Advertised versions</td><td>Intersection of broker APIs with the active controller's <code>NodeApiVersions</code> (so a client only sees versions the controller can actually service for forwarded APIs)</td><td>A fixed collection computed once from the listener type</td></tr>
+    <tr><td>Forwarding-aware?</td><td>Yes — takes <code>() =&gt; forwardingManager.controllerApiVersions</code></td><td>No</td></tr>
+    <tr><td>Built at</td><td><code>BrokerServer.scala:267</code></td><td><code>ControllerServer.scala:162</code></td></tr>
+  </tbody>
+</table></div>
+<p><code>handleApiVersionsRequest</code> (<code>KafkaApis.scala:1524</code>) is special-cased: it returns the full supported-API list <em>regardless of authentication state</em>, because clients must negotiate versions before they can SASL-authenticate. The handler builds the response via <code>apiVersionManager.apiVersionResponse(throttleMs, alterFeatureLevel0)</code>, where <code>alterFeatureLevel0 = (apiVersion &lt; 4)</code>. It also validates the request: <code>UNSUPPORTED_VERSION</code> for an unknown request version, <code>INVALID_REQUEST</code> if malformed, and — for v5+ that carry a cluster id / node id (KIP-1242) — <code>REBOOTSTRAP_REQUIRED</code> if they don't match this broker (<code>KafkaApis.scala:1531-1551</code>). The response also carries the cluster's finalized and supported <em>features</em>, which the broker uses for feature-gating (<code>DefaultApiVersionManager.java:78-101</code>).</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Folding the controller's API versions into the broker's <code>ApiVersionsResponse</code> means a client never attempts a forwardable admin request at a version the controller cannot handle — the broker advertises only the intersection. Forwarding of administrative requests through brokers was introduced by <span class="pill kip">KIP-590</span>; the post-ZooKeeper, KRaft-only world makes the broker a pure proxy for these mutations.</p></div>
+
+<h2>Broker APIs vs. controller APIs (the split)</h2>
+<p>The two dispatchers are deliberately disjoint in scope. The split is enforced structurally by <code>ApiKeys.inScope(listenerType)</code>: a broker listener never even surfaces, say, <code>VOTE</code> or <code>BROKER_HEARTBEAT</code> to <code>KafkaApis</code>, and a controller listener never surfaces <code>PRODUCE</code>.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th><code>KafkaApis</code> (broker)</th><th><code>ControllerApis</code> (KRaft controller)</th></tr></thead>
+  <tbody>
+    <tr><td>Handles</td><td>Data plane (produce/fetch/list-offsets), group/txn/share coordination, metadata reads, client telemetry, SASL — plus <em>forwarding</em> of admin writes.</td><td>Raft RPCs (<code>VOTE</code>, <code>BEGIN/END_QUORUM_EPOCH</code>, <code>FETCH</code>/<code>FETCH_SNAPSHOT</code> for the metadata log), broker registration/heartbeat, <code>ALTER_PARTITION</code>, and the <em>write side</em> of admin operations (create/delete topics, ACLs, configs, quotas, reassignments, feature updates).</td></tr>
+    <tr><td>Return style</td><td>Mixed: <code>Unit</code> + <code>CompletableFuture[Unit]</code></td><td>Uniformly <code>CompletableFuture[Unit]</code> per case (<code>ControllerApis.scala:96-137</code>)</td></tr>
+    <tr><td>Backing engine</td><td><code>ReplicaManager</code>, coordinators, <code>MetadataCache</code></td><td>The <code>Controller</code> (QuorumController) and <code>RaftManager</code></td></tr>
+    <tr><td>ApiVersionManager</td><td><code>DefaultApiVersionManager</code></td><td><code>SimpleApiVersionManager</code></td></tr>
+  </tbody>
+</table></div>
+<p>On the controller, Raft RPCs are answered by <code>handleRaftRequest</code> (<code>ControllerApis.scala:685</code>), which forwards the request straight to <code>raftManager.handleRequest(...)</code> and sends the result exempt from throttling. Admin writes (e.g. <code>handleDeleteTopics</code>, <code>ControllerApis.scala:198</code>) wrap the call to <code>controller.*</code> in a <code>ControllerRequestContext</code> carrying a deadline and a controller-mutation quota recorder, and respond via <code>sendResponseMaybeThrottleWithControllerQuota</code>. See <a href="10-kraft-consensus.html">KRaft Consensus</a> and <a href="11-kraft-controller.html">The KRaft Controller</a>.</p>
+
+<h3>Envelopes &amp; forwarding</h3>
+<p>When a broker forwards a request, it wraps the original (with its <em>original principal</em>) in an <code>EnvelopeRequest</code> and sends it to the controller via <code>ForwardingManager.forwardRequest</code> (<code>ForwardingManager.java:46</code>). The controller's <code>handleEnvelopeRequest</code> (<code>ControllerApis.scala:164</code>) requires <code>CLUSTER_ACTION</code> (only brokers may envelope), unwraps it via <code>EnvelopeUtils.handleEnvelopeRequest</code>, and re-dispatches the inner request through its own <code>handle</code>. The inner response is re-wrapped; crucially, if the inner response indicates <code>NOT_CONTROLLER</code>, <code>Request.buildResponseSend</code> rewrites the envelope to carry <code>NOT_CONTROLLER</code> so the broker knows to re-resolve the active controller and retry (<code>Request.java:236-256</code>). A forwarded request is marked by <code>request.envelope().isPresent()</code>; <code>request.isForwarded</code> gates throttling so forwarded requests are not double-throttled (<code>RequestHandlerHelper.scala:87, 97, 105</code>).</p>
+
+<h2>Concurrency &amp; threading model</h2>
+<p>The model is "synchronous handler, asynchronous completion":</p>
+<ul>
+  <li><strong>Who runs handlers:</strong> the <code>data-plane-kafka-request-handler-N</code> threads. One handler runs start-to-finish on one such thread for its synchronous portion. State internal to a single <code>handle</code> call is therefore single-threaded and lock-free.</li>
+  <li><strong>RequestLocal:</strong> created per thread (<code>RequestLocal.withThreadConfinedCaching</code>, <code>KafkaRequestHandler.scala:105</code>) and reused; it holds a buffer-supplier cache that must only be touched by its owning thread.</li>
+  <li><strong>Cross-thread completion:</strong> a <code>DelayedProduce</code>/<code>DelayedFetch</code> may be completed by a <em>different</em> thread — a replica-fetcher thread advancing the high watermark, the purgatory's expiration-reaper thread, or another request-handler thread processing a follower fetch. Its <code>onComplete</code> invokes the response callback there.</li>
+  <li><strong>Re-scheduling onto a handler thread:</strong> when a callback must run with the originating thread's <code>RequestLocal</code> (e.g. coordinator append callbacks), <code>KafkaRequestHandler.wrapAsyncCallback</code> (<code>KafkaRequestHandler.scala:65</code>) checks whether it is already on the right request thread; if not, it enqueues a <code>CallbackRequest</code> on the channel's <code>callbackQueue</code> and pushes a <code>WakeupRequest</code> to nudge a waiting handler. The callback then runs on a handler thread with that thread's <code>RequestLocal</code> (<code>KafkaRequestHandler.scala:131-160</code>).</li>
+  <li><strong>Shared mutable state in handlers:</strong> deliberately minimal. The <code>AddPartitionsToTxn</code> handler is the notable exception — it guards its result accumulator with <code>responses.synchronized</code> because per-transaction callbacks may fire concurrently (<code>KafkaApis.scala:1905</code>).</li>
+  <li><strong>Memory visibility on <code>Request</code>:</strong> the timing fields are <code>volatile</code> precisely because they are written by request/purgatory threads and read by network threads (<code>Request.java:70-82</code>).</li>
+</ul>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>A handler must never perform a long blocking call (disk-bound replication wait, coordinator commit) on the request-handler thread — with only <code>num.io.threads</code> (default 8) threads, a few stuck handlers stall the whole node. The purgatory + callback-rescheduling machinery exists precisely to keep handler threads non-blocking.</p></div>
+
+<h2>Authorization, request context &amp; principal</h2>
+<p>Every <code>Request</code> carries a <code>RequestContext</code> (<code>Request.java:59</code>) with the authenticated <code>KafkaPrincipal</code>, the client address, listener name, security protocol, and the parsed header. A <code>Session</code> (principal + address) is derived for quota keying (<code>Request.java:100</code>).</p>
+<p>Handlers authorize through <code>AuthHelper</code> (<code>AuthHelper.scala:42</code>), which wraps an optional <code>Plugin[Authorizer]</code> — when no authorizer is configured, <em>everything is allowed</em> (the <code>authorizer.forall</code> / "None ⇒ all" branches). Three shapes are used:</p>
+<ul>
+  <li><code>authorize(ctx, op, resourceType, name)</code> — a single allow/deny (<code>AuthHelper.scala:43</code>).</li>
+  <li><code>filterByAuthorized(ctx, op, type, resources)(nameOf)</code> — one batched authorizer call for many resources, returning the allowed names; this is why produce/fetch authorize all partitions in a single round-trip (<code>AuthHelper.scala:100</code>). It deduplicates and counts references per resource name so the audit log sees the true access count.</li>
+  <li><code>authorizeByResourceType / authorizeClusterOperation</code> — for cluster-wide and idempotent-write checks (<code>AuthHelper.scala:57, 78</code>).</li>
+</ul>
+<p>Denials never throw at the partition granularity — they translate to a per-resource error code (<code>TOPIC_AUTHORIZATION_FAILED</code>, <code>GROUP_AUTHORIZATION_FAILED</code>, …) folded into the response, so a partially-authorized request still succeeds for the parts it may touch. Cluster-level denials throw <code>ClusterAuthorizationException</code>, which the error funnel converts to <code>CLUSTER_AUTHORIZATION_FAILED</code>. Full details in <a href="18-security.html">Security: Authentication &amp; Authorization</a>.</p>
+
+<h2>Throttling integration</h2>
+<p>Throttling is computed inside the handler (or in <code>RequestHandlerHelper</code>) right before the response is built, and is expressed two ways at once: (1) the integer <code>throttleTimeMs</code> in the response body that tells the client to back off, and (2) actual server-side <em>channel muting</em> for that duration. The quota managers live in <code>QuotaManagers</code> (<code>quotas.produce</code>, <code>quotas.fetch</code>, <code>quotas.request</code>, <code>quotas.controllerMutation</code>, <code>quotas.leader</code>).</p>
+<p>The common helpers (<code>RequestHandlerHelper.scala</code>):</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Helper</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>sendResponseMaybeThrottle</code></td><td>Record request-quota usage, throttle (mute) if violated and not forwarded, then send (<code>:93</code>).</td></tr>
+    <tr><td><code>sendErrorResponseMaybeThrottle</code></td><td>As above for error responses; also throttles cluster-auth failures even when forwarded (<code>:102</code>).</td></tr>
+    <tr><td><code>sendResponseExemptThrottle</code></td><td>Record as exempt and send without muting — used for follower fetch and Raft RPCs (<code>:143</code>).</td></tr>
+    <tr><td><code>sendForwardedResponse</code></td><td>Take <code>max(controllerThrottle, localRequestThrottle)</code> so forwarding adds the controller's throttle on top (<code>:67</code>).</td></tr>
+    <tr><td><code>sendResponseMaybeThrottleWithControllerQuota</code></td><td>Compare controller-mutation throttle vs. request throttle, mute on whichever is larger (<code>:120</code>).</td></tr>
+    <tr><td><code>throttle</code></td><td>Mute the channel by sending <code>StartThrottlingResponse</code>/<code>EndThrottlingResponse</code> around the delay (<code>:34</code>).</td></tr>
+  </tbody>
+</table></div>
+<p>The produce and fetch handlers compute throttle inline because they juggle <em>two</em> quotas (bandwidth + request) and pick the larger; <code>maxThrottleTimeMs = max(bandwidthThrottleTimeMs, requestThrottleTimeMs)</code> is recorded onto <code>request.apiThrottleTimeMs</code> and used as the muting duration (<code>KafkaApis.scala:491-505</code> for produce, <code>:700-717</code> for fetch). Note that for <code>acks=0</code> the request quota is <em>not</em> enforced (<code>KafkaApis.scala:494-496</code>). Quotas, throttling, and client metrics are detailed in <a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a>.</p>
+
+<h2>Error mapping</h2>
+<p>Kafka has a fixed catalog of <code>Errors</code> codes; handlers map exceptions and conditions to them. There are two layers:</p>
+<ul>
+  <li><strong>Per-resource:</strong> a handler explicitly sets a partition/topic/group error code (e.g. <code>UNKNOWN_TOPIC_OR_PARTITION</code>, <code>NOT_LEADER_OR_FOLLOWER</code>). Some are version-aware: a <code>KafkaStorageException</code> is down-converted to <code>NOT_LEADER_OR_FOLLOWER</code> for fetch ≤ v5 (<code>KafkaApis.scala:623-633</code>); <code>PRODUCER_FENCED</code> becomes <code>INVALID_PRODUCER_EPOCH</code> for old InitProducerId/AddPartitionsToTxn clients (<code>KafkaApis.scala:1643-1646</code>, <code>:1955-1958</code>).</li>
+  <li><strong>Whole-request:</strong> an uncaught exception hits the funnel. <code>RequestHandlerHelper.handleError</code> (<code>RequestHandlerHelper.scala:46</code>) decides between <code>sendErrorResponseMaybeThrottle</code> and <code>sendErrorResponseExemptThrottle</code> (cluster-action requests are exempt unless they failed with <code>ClusterAuthorizationException</code>). Building the error response calls <code>request.body(...).getErrorResponse(throttleMs, error)</code>; if that returns <code>null</code> (the API expects no response, e.g. <code>acks=0</code> produce), the connection is closed via <code>closeConnection</code> instead (<code>RequestHandlerHelper.scala:54-65</code>).</li>
+</ul>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Handler exception.</strong> Caught by the dispatcher and translated to an error response (or connection close); the handler thread survives.</li>
+  <li><strong>FatalExitError.</strong> Propagated out of the loop; the thread shuts down and the JVM exits — used for truly unrecoverable states.</li>
+  <li><strong>Queue full.</strong> <code>requestQueue.put</code> blocks the network thread, throttling intake at the socket — intentional back-pressure rather than dropping requests.</li>
+  <li><strong>Processor gone.</strong> If the owning network thread shut down, <code>sendResponse</code> finds <code>null</code> in <code>processors</code> and drops the response (connection already closed) (<code>RequestChannel.scala:189-194</code>).</li>
+  <li><strong>acks=0 with errors.</strong> No response is expected, so on any error the broker <em>closes the connection</em> to force the client to refresh metadata (<code>KafkaApis.scala:508-521</code>).</li>
+  <li><strong>Forwarding to a stale controller.</strong> If the controller replies with an unsupported version during forwarding, the broker closes the client connection (it may have failed over) (<code>KafkaApis.scala:145-150</code>); a <code>NOT_CONTROLLER</code> envelope reply makes the broker re-resolve the controller.</li>
+  <li><strong>Delayed-op timeout.</strong> A <code>DelayedProduce</code>/<code>DelayedFetch</code> that never becomes completable fires <code>onExpiration</code> at its deadline, returning whatever is available (with <code>REQUEST_TIMED_OUT</code> for produce partitions that never got enough acks).</li>
+  <li><strong>Buffer lifecycle.</strong> Most parsed requests release their network buffer immediately; produce (and any schema with <code>BYTES</code>/<code>NULLABLE_BYTES</code> fields, flagged <code>requiresDelayedAllocation</code>) keeps it until processing finishes, then the loop's <code>finally</code> calls <code>releaseBuffer()</code> (<code>Request.java:113-115</code>, <code>ApiKeys.java:194</code>, <code>KafkaRequestHandler.scala:175</code>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A request is processed by at most one handler thread's synchronous pass; any continuation that needs that thread's <code>RequestLocal</code> is rescheduled back onto a handler thread rather than run on a foreign (purgatory/fetcher) thread.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Per-partition ordering for a producer is preserved because each connection's requests are read in order by one network thread, the request queue is FIFO, and (with idempotence) the log append enforces sequence ordering. The dispatcher itself adds no reordering.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Exactly one terminal response (or connection-close) is emitted per request; throttle muting is layered on top without consuming that response.</p></div>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="06-network-and-threading.html">Network Layer &amp; Threading</a> — produces the parsed <code>Request</code>, owns the <code>Processor</code> that sends the response, and authenticates the principal in <code>RequestContext</code>.</li>
+  <li><a href="08-replication.html">Replication, ISR &amp; HW</a> — <code>ReplicaManager.appendRecords</code> and the produce purgatory.</li>
+  <li><a href="09-fetch-path.html">Fetch Path</a> — <code>ReplicaManager.fetchMessages</code>, fetch sessions, and the fetch purgatory.</li>
+  <li><a href="13-group-coordination.html">Group Coordination</a> / <a href="14-transactions-eos.html">Transactions</a> / <a href="15-share-groups.html">Share Groups</a> — the coordinators these handlers delegate to.</li>
+  <li><a href="11-kraft-controller.html">KRaft Controller</a> &amp; <a href="12-metadata-propagation.html">Metadata Propagation</a> — the forwarding target and the source of the <code>MetadataCache</code>.</li>
+  <li><a href="18-security.html">Security</a> &amp; <a href="19-quotas.html">Quotas</a> — the authorization and throttling hooks invoked by every handler.</li>
+  <li><a href="02-wire-protocol.html">Wire Protocol &amp; RPC Framework</a> — defines <code>ApiKeys</code>, request/response schemas, and the version negotiation surfaced by <code>ApiVersionsResponse</code>.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The single shared queue + small fixed thread pool keeps the broker's concurrency model trivially reasonable and bounded, while the purgatory pattern decouples a request's <em>arrival</em> from its <em>completion</em> so long-poll fetches and quorum-acked produces never tie up a scarce I/O thread. The cost is that all latency-sensitive work must be expressible as a delayed operation with a <code>tryComplete</code> predicate.</p></div>
+<p>Major evolutionary points visible in the code: request forwarding through brokers (<span class="pill kip">KIP-590</span>) which makes <code>KafkaApis</code> a proxy for admin mutations; incremental fetch sessions (<span class="pill kip">KIP-227</span>) behind <code>FetchManager.newContext</code>; the new asynchronous <code>GroupCoordinator</code> consumer-group protocol (<span class="pill kip">KIP-848</span>) that turned many group handlers into <code>CompletableFuture</code>-returning methods; share groups / queues (<span class="pill kip">KIP-932</span>) adding the whole <code>SHARE_*</code> handler family; and the cluster-id/node-id bootstrap check in ApiVersions (KIP-1242, <code>KafkaApis.scala:1544</code>). With ZooKeeper removed in 4.0, the broker/controller dispatcher split is now the clean boundary between the data plane (<code>KafkaApis</code>) and the metadata control plane (<code>ControllerApis</code> + the KRaft controller).</p>
+
+<h2>Gotchas &amp; operational notes</h2>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The version check in <code>KafkaApis.handle</code> (<code>:166</code>) is a defensive backstop — the socket server normally rejects out-of-scope/unsupported APIs and closes the connection <em>before</em> the request reaches the handler. If you ever see that <code>IllegalStateException</code>, the network-layer gate was bypassed (typically only in tests).</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>acks=0</code> produce is the one path that closes the client connection on error rather than replying. Spurious connection resets under load on producers configured with <code>acks=0</code> usually mean broker-side produce errors, not network faults.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Per-request metrics distinguish sub-categories under the same API key: follower vs. consumer fetch (<code>FetchFollower</code>/<code>FetchConsumer</code>), verify-only AddPartitionsToTxn, and the legacy client-metrics resource listing — see the metric-name override switch in <code>Request.updateRequestMetrics</code> (<code>Request.java:339-356</code>). Monitor the right one.</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>The <code>RequestHandlerAvgIdlePercent</code> meter is the canonical "is my broker CPU/IO-thread saturated?" signal: values near 0 mean the handler pool is fully busy and you may need more <code>num.io.threads</code> (or to relieve the underlying bottleneck). It is computed by discounting each handler's idle time by the thread count so it reads as a true fraction (<code>KafkaRequestHandler.scala:111-123</code>).</p></div>

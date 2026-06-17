@@ -1,0 +1,415 @@
+{
+ "01-record-format": [
+  {
+   "severity": "major",
+   "location": "Legacy formats figure caption (row 130): 'v1 message: \u2026same, plus an 8-byte timestamp after attrs (HEADER_SIZE_V1 = 22)'",
+   "claim": "HEADER_SIZE_V1 = 22",
+   "correction": "HEADER_SIZE_V1 = CRC_LENGTH(4) + MAGIC_LENGTH(1) + ATTRIBUTES_LENGTH(1) + TIMESTAMP_LENGTH(8) = 14, NOT 22. The value 22 is RECORD_OVERHEAD_V1 (which the doc correctly states in the next figcaption line). The doc conflated HEADER_SIZE_V1 with RECORD_OVERHEAD_V1. See clients/src/main/java/org/apache/kafka/common/record/internal/LegacyRecord.java:64 (HEADER_SIZE_V1 = ... = 14) vs LegacyRecord.java:74 (RECORD_OVERHEAD_V1 = HEADER_SIZE_V1 + KEY_SIZE_LENGTH + VALUE_SIZE_LENGTH = 22)."
+  },
+  {
+   "severity": "minor",
+   "location": "Legacy weaknesses list, 'No efficient count or leader epoch' bullet (row 140), citation 'AbstractLegacyRecordBatch.java:499-501'",
+   "claim": "countOrNull() returns null for v0/v1 and partitionLeaderEpoch() is -1 and cannot be set \u2014 all cited to AbstractLegacyRecordBatch.java:499-501",
+   "correction": "Lines 499-501 only contain setPartitionLeaderEpoch(...) throwing UnsupportedOperationException (the 'cannot be set' part). countOrNull() returning null is at AbstractLegacyRecordBatch.java:159-161; partitionLeaderEpoch() returning NO_PARTITION_LEADER_EPOCH (-1) is at AbstractLegacyRecordBatch.java:210-212. The facts are correct; the single line citation does not cover two of the three sub-claims."
+  }
+ ],
+ "02-wire-protocol": [
+  {
+   "severity": "major",
+   "location": "Section 'The API Registry: ApiKeys', first paragraph: \"the enum spans ids 0 through 84 and ends at STREAMS_GROUP_TOPOLOGY_DESCRIPTION_UPDATE (protocol/ApiKeys.java:48-141)\"",
+   "claim": "The ApiKeys enum spans ids 0 through 84.",
+   "correction": "The enum has 94 constants spanning ids 0 through 93, not 0 through 84. The terminal constant STREAMS_GROUP_TOPOLOGY_DESCRIPTION_UPDATE has apiKey 93 (clients/src/main/resources/common/message/StreamsGroupTopologyDescriptionUpdateRequest.json:17 -> \"apiKey\": 93; and 94 constants counted in clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java:48-141). The cited line range 48-141 is correct, but the upper id bound should be 93."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Two-pass serialization': \"protocol/ObjectSerializationCache.java:14-55\" and 'Core Concepts' framing",
+   "claim": "ObjectSerializationCache is cited at lines 14-55.",
+   "correction": "The class body spans clients/src/main/java/org/apache/kafka/common/protocol/ObjectSerializationCache.java:32-55 (lines 14-31 are license/imports/Javadoc). The substance of the claim (IdentityHashMap-backed value/size cache) is correct; only the starting line of the range is loose."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'The 4-byte frame': \"SendBuilder.buildSend computes the combined size of header and body in one pass\"",
+   "claim": "buildSend computes the combined header+body size in one pass.",
+   "correction": "buildSend makes two separate addSize calls (header.addSize then apiMessage.addSize) into a shared MessageSizeAccumulator before the write pass (clients/src/main/java/org/apache/kafka/common/protocol/SendBuilder.java:217-218). It is one sizing phase but two accumulation calls; the cited line range 208-226 and the writeInt(totalSize) quote are accurate."
+  }
+ ],
+ "03-storage-log-engine": [
+  {
+   "severity": "minor",
+   "claim": "\"The 30-line comment at AbstractIndex.java:330\u2013386 records the original ~1 s produce-latency spike that motivated this.\"",
+   "correction": "The cited line range (330\u2013386) is correct and the comment does mention the ~1 s latency spike (\"this can cause the at-least-once produce latency to jump to about 1 second\", AbstractIndex.java:358), but the comment block is 57 lines long (lines 330 `/*` through 386 `*/`), not 30. Only the \"30-line\" descriptor is inaccurate.",
+   "location": "Design rationale callout under \"AbstractIndex: mmap, the warm-section search, and locking\""
+  },
+  {
+   "severity": "minor",
+   "claim": "TimeIndex diagram caption: \"repeated, monotonic in timestamp AND offset\" and prose \"timestamps are monotonically non-decreasing within the file.\"",
+   "correction": "In code, timestamps are strictly increasing: TimeIndex.maybeAppend only writes a new entry when `timestamp > lastEntry.timestamp()` (TimeIndex.java:203); offsets are allowed to be equal to the previous entry (it only rejects `offset < lastEntry.offset()`, TimeIndex.java:193). The source javadoc itself says \"monotonically increasing\" (TimeIndex.java:42). The doc's \"non-decreasing\" for timestamps is slightly looser than the strict-increase the code enforces. Faithful enough to the source's own wording; pedantic."
+  }
+ ],
+ "04-storage-management": [
+  {
+   "severity": "minor",
+   "location": "Design rationale & evolution section, last sentence of the 'cleaner is being simplified for Kafka 5.0' paragraph: 'the cleaner will always run (LogCleaner.java:838-840, CleanerConfig.java:53)'",
+   "claim": "Cites LogCleaner.java:838-840 for the warning that log.cleaner.enable is deprecated and the cleaner will always run.",
+   "correction": "LogCleaner.java is only 653 lines long, so :838-840 does not exist in that file. The deprecation warning ('The config `log.cleaner.enable` is deprecated and will be removed in Kafka 5.0. Starting from Kafka 5.0, the log cleaner will always be enabled...') is in LogManager.java:839 (startupWithConfigOverrides else-branch). storage/src/main/java/org/apache/kafka/storage/internals/log/LogManager.java:838-841. The companion CleanerConfig.java:53 reference (the @Deprecated LOG_CLEANER_ENABLE_PROP) is correct."
+  },
+  {
+   "severity": "minor",
+   "location": "Design rationale callout: 'the delete-horizon batch stamping refined under KIP-734 (record v2 baseTimestamp/delete-horizon)'",
+   "claim": "Attributes the record-v2 delete-horizon batch stamping to KIP-734.",
+   "correction": "The record-v2 delete-horizon batch attribute was introduced by KIP-534, not KIP-734 (KIP-734 is an unrelated broker-IDLE-metrics KIP). The mechanism itself is correctly described and real: DefaultRecordBatch.java:89 documents that when the delete-horizon flag is set the BaseTimestamp holds the delete horizon; batch.deleteHorizonMs() at clients/src/main/java/org/apache/kafka/common/record/internal/DefaultRecordBatch.java:256. Only the KIP number appears wrong."
+  },
+  {
+   "severity": "minor",
+   "location": "Final 'Note' callout in Gotchas & operational notes: 'a partition with more distinct dirty keys than fit in slots \u00d7 loadFactor is cleaned in multiple passes ... (Cleaner.java:126-128)'",
+   "claim": "Cites Cleaner.java:126-128 as the source for the multi-pass / per-thread offset-map sizing behaviour.",
+   "correction": "Cleaner.java:126-128 is the constructor assertion `assert offsetMap.slots() * dupBufferLoadFactor > 1` (map-too-small guard), not the multi-pass logic. The actual 'map full -> partial range -> advance cleaner point a chunk at a time' behaviour is buildOffsetMapForSegment: maxDesiredMapSize = (int)(map.slots() * dupBufferLoadFactor) at storage/src/main/java/org/apache/kafka/storage/internals/log/Cleaner.java:781 and the `if (map.size() < maxDesiredMapSize) ... else return true` at Cleaner.java:810-813, with endOffset = offsetMap.latestOffset() + 1 at Cleaner.java:178. Topically related but the line range is imprecise."
+  }
+ ],
+ "05-tiered-storage": [
+  {
+   "severity": "major",
+   "location": "Detailed mechanics \u2192 The copy task, step 3 (Copy-lag gate): \"isEligibleForUpload (:949) returns true immediately if both remote.copy.lag.ms and remote.copy.lag.bytes are 0\"",
+   "claim": "isEligibleForUpload returns true immediately only if BOTH remote.copy.lag.ms and remote.copy.lag.bytes are 0.",
+   "correction": "The short-circuit is an OR, not an AND: the method returns true if EITHER is 0. Source: `if (copyLagMs == 0 || copyLagBytes == 0) { return true; }` at storage/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteLogManager.java:957. So with e.g. copyLagMs=0 and copyLagBytes=5000 the segment is still immediately eligible, contrary to the doc's wording."
+  },
+  {
+   "severity": "minor",
+   "location": "Detailed mechanics \u2192 The copy task, step 5 (Per-segment copy): \"copyLogSegment (:1079) generates a fresh RemoteLogSegmentId, registers it in segmentIdsBeingCopied\"",
+   "claim": "copyLogSegment generates the fresh RemoteLogSegmentId and registers it in segmentIdsBeingCopied.",
+   "correction": "Generation and registration happen in the CALLER copyLogSegmentsToRemote: RemoteLogSegmentId.generateNew(topicIdPartition) at RemoteLogManager.java:1049 and segmentIdsBeingCopied.add(segmentId) at :1050; copyLogSegment (signature at :1079) receives segmentId as a parameter. The rest of the step-5 description (build COPY_SEGMENT_STARTED, blocking add().get(), copy via RSM, COPY_SEGMENT_FINISHED, advance copiedOffsetOption, updateHighestOffsetInRemoteStorage) is accurate."
+  },
+  {
+   "severity": "minor",
+   "location": "Data structures \u2192 \"CustomMetadata wraps a byte[] whose accepted maximum is remote.log.metadata.custom.metadata.max.bytes (default 128; RemoteLogSegmentMetadata.java:384)\"",
+   "claim": "The default-128 cap is documented at RemoteLogSegmentMetadata.java:384.",
+   "correction": "The value 128 is the default is correct, but it is defined in RemoteLogManagerConfig (DEFAULT_REMOTE_LOG_METADATA_CUSTOM_METADATA_MAX_BYTES = 128 at storage/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteLogManagerConfig.java:88). RemoteLogSegmentMetadata.java:384 is merely the `class CustomMetadata` declaration; that line does not contain the 128 value (the javadoc there only names the setting). Citation location is imprecise."
+  },
+  {
+   "severity": "minor",
+   "location": "Code map table row + Quotas section: RLMQuotaManager described as \"Token-bucket-style byte-rate throttling for copy & fetch\"",
+   "claim": "RLMQuotaManager is token-bucket-style.",
+   "correction": "It is a sliding-window/sample-based rate limiter, not a token bucket: it uses a SimpleRate sensor over N windows with a Quota bound and returns QuotaUtils.throttleTime(...) on a QuotaViolationException (storage/src/main/java/org/apache/kafka/server/log/remote/quota/RLMQuotaManager.java:80-90, SimpleRate at :111). The body text elsewhere describes the windowed mechanism correctly; only the 'token-bucket-style' label is misleading."
+  }
+ ],
+ "06-network-and-threading": [
+  {
+   "severity": "minor",
+   "location": "Section 'The request purgatory & hierarchical timing wheel', paragraph after the purgatory table: 'Coordinators add more (DelayedJoin, DelayedHeartbeat, transaction purgatories via DelayedFuturePurgatory).'",
+   "claim": "DelayedJoin and DelayedHeartbeat are live coordinator delayed-operation/purgatory classes in this KRaft 4.x build.",
+   "correction": "No such classes exist in this build. 'DelayedJoin' survives only in source comments (core/src/main/scala/kafka/server/KafkaApis.scala:261 and server-common/.../purgatory/DelayedOperation.java:36 javadoc); 'DelayedHeartbeat' is referenced nowhere. group-coordinator/ and coordinator-common/ contain no DelayedOperationPurgatory or `extends DelayedOperation` (the KIP-848 coordinator is event/timer-loop based). DelayedFuturePurgatory IS real (e.g. core/.../AclApis.scala:56)."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'DelayedOperation contract': 'carries a completed flag plus a private ReentrantLock (DelayedOperation.java:38)'; and Concurrency table row 'Purgatory completed flag \u2026 per-op ReentrantLock (DelayedOperation.java:40)'.",
+   "claim": "The per-operation ReentrantLock is private and lives at DelayedOperation.java:40.",
+   "correction": "The lock is `protected final ReentrantLock lock` at server-common/.../purgatory/DelayedOperation.java:42 (not private). Line 40 is the `volatile boolean completed` field; the lock is line 42."
+  },
+  {
+   "severity": "minor",
+   "location": "Configuration reference table, row producer.purgatory.purge.interval.requests: Default '1000 (inferred from purgatory default)' (ReplicaManager.scala:186).",
+   "claim": "The default is inferred from the purgatory's internal default rather than an explicit config default.",
+   "correction": "1000 is an explicit config default: server/.../config/ReplicationConfigs.java:111 (PRODUCER_PURGATORY_PURGE_INTERVAL_REQUESTS_DEFAULT = 1000). The value is correct but the 'inferred' framing is misleading; the cited ReplicaManager.scala:186 is the purgatory construction (config.producerPurgatoryPurgeIntervalRequests), not the default definition."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'The request lifecycle timeline': 'Request records seven timestamps (all in nanoseconds)'.",
+   "claim": "Request records seven nanosecond lifecycle timestamps.",
+   "correction": "The accompanying diagram shows only five stored lifecycle timestamps (startTimeNanos, requestDequeueTimeNanos, apiLocalCompleteTimeNanos, responseCompleteTimeNanos, responseDequeueTimeNanos at server/.../network/Request.java:60,72,73,74,75) plus a computed endTime. 'Seven' only holds if the two callbackRequest* timestamps (Request.java:80-81) are counted, which the diagram does not. Loose, not strictly wrong."
+  },
+  {
+   "severity": "render",
+   "location": "prose",
+   "claim": "~10 stray '&' characters not forming an HTML entity",
+   "correction": "Replace each bare '&' in text with &amp; (do not touch existing &amp;/&lt;/&gt; or & inside attribute-free entities)."
+  }
+ ],
+ "07-request-processing": [
+  {
+   "severity": "major",
+   "location": "Note callout under 'The dispatch contract' (around line 122): 'A large family of admin APIs is not handled locally at all on the broker \u2014 the case body is simply forwardToController(request): CREATE_TOPICS, ... ALTER_CONFIGS-family writes, ...'",
+   "claim": "The broker dispatch case body for ALTER_CONFIGS-family writes (ALTER_CONFIGS / INCREMENTAL_ALTER_CONFIGS) is simply forwardToController(request), landing in ControllerApis after forwarding.",
+   "correction": "ALTER_CONFIGS and INCREMENTAL_ALTER_CONFIGS are NOT bare forwardToController cases. In KafkaApis.handle the case bodies are handleAlterConfigsRequest(request) (core/src/main/scala/kafka/server/KafkaApis.scala:201) and handleIncrementalAlterConfigsRequest(request) (KafkaApis.scala:215). Those handlers (KafkaApis.scala:2204-2226 and 2228-2253) preprocess configs locally via configManager.preprocess, split off already-handled resources, forward ONLY the remaining resources via forwardingManager.forwardRequest(request, new AlterConfigsRequest(remaining,...), ...), and then reassemble the response (ConfigAdminManager.reassembleLegacyResponse / reassembleIncrementalResponse). The actual bare forwardToController(request) cases are only: CREATE_TOPICS(188), DELETE_TOPICS(189), CREATE_ACLS(199), DELETE_ACLS(200), CREATE_PARTITIONS(206), ELECT_LEADERS(214), ALTER_PARTITION_REASSIGNMENTS(216), LIST_PARTITION_REASSIGNMENTS(217), ALTER_CLIENT_QUOTAS(220), ALTER_USER_SCRAM_CREDENTIALS(222), UPDATE_FEATURES(223), UNREGISTER_BROKER(226), DESCRIBE_QUORUM(229), ADD_RAFT_VOTER(236), REMOVE_RAFT_VOTER(237)."
+  },
+  {
+   "severity": "minor",
+   "location": "Lead paragraph / 'Where it lives in the code' table / Key-idea callout: 'dispatched to one of roughly ninety handlers', '~90 handlers', 'roughly ninety handlers'",
+   "claim": "KafkaApis dispatches to roughly ninety (~90) handlers.",
+   "correction": "The broker dispatch match (core/src/main/scala/kafka/server/KafkaApis.scala:172-253) has 78 `case ApiKeys.*` arms, ~15 of which are bare forwardToController(request) (not distinct handler methods), so the number of actual handleXxx methods is closer to ~63. 'Roughly ninety' overstates the count; 'roughly eighty cases' would be accurate."
+  },
+  {
+   "severity": "minor",
+   "location": "Walkthrough 3 \u2014 Metadata: 'It authorizes DESCRIBE on the requested topics, then resolves them through metadataCache.getTopicMetadata(topics, listenerName, \u2026) (KafkaApis.scala:847) ... returns UNKNOWN_TOPIC_OR_PARTITION / INVALID_TOPIC_EXCEPTION (KafkaApis.scala:856-882)'",
+   "claim": "Implies handleTopicMetadataRequest (line 885) performs the getTopicMetadata call at line 847 and the auto-create/error handling at 856-882.",
+   "correction": "Those lines (847, 856-882) live in the private helper getTopicMetadata (core/src/main/scala/kafka/server/KafkaApis.scala:838-883), which precedes and is called by handleTopicMetadataRequest (which starts at line 885 and invokes the helper at line 962). The cited line numbers point at correct call sites, but the handler at :885 is after them, so the narrative ordering is slightly inverted. Content (auto-create via autoTopicCreationManager.createTopics at :858; UNKNOWN_TOPIC_OR_PARTITION at :863; INVALID_TOPIC_EXCEPTION at :866) is correct."
+  }
+ ],
+ "08-replication": [
+  {
+   "severity": "minor",
+   "claim": "PartitionRegistration field table: lastKnownElr = 'Last known good leader, retained to allow balanced recovery when ISR and ELR are empty.'",
+   "correction": "lastKnownElr is declared as int[] (PartitionRegistration.java:159), not a single leader. The body text later correctly calls it a retained last-good-leader for single-member recovery, and PartitionChangeBuilder.canElectLastKnownLeader does require exactly one member (PartitionChangeBuilder.java:305), so the operational description is accurate; only the field-table phrasing ('leader', singular) is slightly imprecise for an array-typed field.",
+   "location": "Data structures > PartitionRegistration table, lastKnownElr row"
+  },
+  {
+   "severity": "minor",
+   "claim": "'ReplicaManager exports IsrExpandsPerSec, IsrShrinksPerSec and FailedIsrUpdatesPerSec via the AlterPartitionListener (Partition.scala:101-111)'",
+   "correction": "The metric names and meters are actually defined/registered in ReplicaManager.scala:100-102 and :257-259. Partition.scala:101-111 is the AlterPartitionListener anonymous class that merely calls replicaManager.isrExpandRate.mark() etc. The sentence correctly attributes the *export* to ReplicaManager and the parenthetical cite correctly points at the listener it names, so this is defensible, but the cite could be read as locating the metrics in Partition.scala where they are not defined.",
+   "location": "Gotchas/operational notes > 'useful JMX gauges' callout"
+  }
+ ],
+ "09-fetch-path": [
+  {
+   "severity": "minor",
+   "location": "Architecture diagram, line 81: \"maybeTruncate() \u2500\u2500 OffsetsForLeaderEpoch \u2500\u2500\u25b6 KafkaApis.handleOffsetForLeaderEpoch\"",
+   "claim": "The leader-side handler for OffsetsForLeaderEpoch is named KafkaApis.handleOffsetForLeaderEpoch.",
+   "correction": "The actual method is handleOffsetForLeaderEpochRequest (core/src/main/scala/kafka/server/KafkaApis.scala:2169; dispatched at KafkaApis.scala:192). The diagram drops the 'Request' suffix. The companion 'KafkaApis.handleFetchRequest' label in the same diagram is correct."
+  },
+  {
+   "severity": "minor",
+   "location": "Interactions list, line 266: \"Share Groups \u2014 share-fetch reuses FetchParams/fetchMessages with shareFetchRequest = true (KafkaApis.scala:3510)\"",
+   "claim": "Share-fetch reuses fetchMessages (implying ReplicaManager.fetchMessages) with shareFetchRequest = true.",
+   "correction": "The FetchParams reuse with the trailing shareFetchRequest=true flag is correct (KafkaApis.scala:3510 builds `new FetchParams(... true)` at line 3518). But it then calls sharePartitionManagerInstance.fetchMessages(...) (KafkaApis.scala:3521), i.e. SharePartitionManager.fetchMessages, not ReplicaManager.fetchMessages directly. The phrasing conflates the two fetchMessages entry points."
+  },
+  {
+   "severity": "minor",
+   "location": "Concurrency & threading, line 216: \"FetcherLagStats uses a ConcurrentHashMap and an AtomicLong gauge per partition (AbstractFetcherThread.scala:933)\"",
+   "claim": "FetcherLagStats (ConcurrentHashMap + per-partition AtomicLong) is at AbstractFetcherThread.scala:933.",
+   "correction": "Line 933 is `private[this] val lagVal = new AtomicLong(-1L)` inside class FetcherLagMetrics. The class FetcherLagStats that actually holds `val stats = new ConcurrentHashMap[...]` is at AbstractFetcherThread.scala:949-950. The cited line points only at the AtomicLong, not the ConcurrentHashMap; the two structures live in different classes (~17 lines apart)."
+  }
+ ],
+ "10-kraft-consensus": [
+  {
+   "severity": "major",
+   "location": "Snapshots (KIP-630) \u2192 \"Retention & cleaning\" paragraph: \"always keeps at least two snapshots and respects segment invariants (KafkaRaftLog.java:538-583)\"",
+   "claim": "KafkaRaftLog.maybeClean ... always keeps at least two snapshots.",
+   "correction": "The cleaner keeps at least ONE snapshot, not two. cleanSnapshots() iterates `i < epochs.size() - 1` so it always preserves the newest snapshot, and the maybeClean javadoc states cleaning repeats 'until only a single snapshot remains' (raft/.../internals/KafkaRaftLog.java:534-535). The `snapshots.size() < 2` guard (KafkaRaftLog.java:561) only means 2+ snapshots are required to delete ANY; it still deletes down to 1. MetadataLogConfig docs likewise say 'at least one snapshot must exist before any logs can be deleted' (raft/.../MetadataLogConfig.java:68,72)."
+  },
+  {
+   "severity": "minor",
+   "location": "Data structures \u2192 \"In-memory: the role objects\": \"All seven roles implement EpochState; the current one is held in a single volatile EpochState state field ... (QuorumState.java:99)\"",
+   "claim": "All seven roles implement EpochState.",
+   "correction": "There are only SIX concrete EpochState implementations: UnattachedState, ProspectiveState, CandidateState, FollowerState, LeaderState, ResignedState (raft/.../raft/*State.java; NomineeState is an interface, not a role). The sentence is self-contradictory: the doc's own table lists 6 rows and 14 lines later states 'there is no separate VotedState class' (the 7th 'role', Voted, is UnattachedState-with-a-vote). Should read 'all six role classes implement EpochState'. The `volatile EpochState state` field at QuorumState.java:99 is correct."
+  },
+  {
+   "severity": "minor",
+   "location": "The state machine \u2192 \"Pre-Vote and the Prospective role (KIP-996)\": \"The vote request schema added this field at version 2 (VoteRequest.json:51, comment: 'Version 2 adds PreVote field and renames candidate to replica')\"",
+   "claim": "The PreVote field and the comment 'Version 2 adds PreVote field and renames candidate to replica' are at VoteRequest.json:51.",
+   "correction": "The PreVote field (type bool, versions '2+') is at clients/.../message/VoteRequest.json:51, but the quoted comment 'Version 2 adds PreVote field and renames candidate to replica' is at line 22, not 51. The citation conflates the field line with the comment line. (Also the message JSON lives under clients/, not raft/, though the doc's bare 'VoteRequest.json' filename is otherwise fine; the apiKey 52 and 'Version 1 ... (KIP-853)' comment at line 21 cited elsewhere are correct.)"
+  }
+ ],
+ "11-kraft-controller": [
+  {
+   "severity": "minor",
+   "location": "PartitionChangeBuilder: the leader/ISR algorithm \u2014 \"emits an Optional<PartitionChangeRecord> \u2014 empty when nothing changed\"",
+   "claim": "PartitionChangeBuilder.build() emits an Optional<PartitionChangeRecord>.",
+   "correction": "The build() method returns Optional<ApiMessageAndVersion> (which wraps a PartitionChangeRecord), not Optional<PartitionChangeRecord>. See metadata/src/main/java/org/apache/kafka/controller/PartitionChangeBuilder.java:426 (`public Optional<ApiMessageAndVersion> build()`)."
+  },
+  {
+   "severity": "minor",
+   "location": "Becoming the active controller \u2014 \"The prepended activation event runs ActivationRecordsGenerator.generate ... metadata/.../controller/ActivationRecordsGenerator.java:40\"",
+   "claim": "ActivationRecordsGenerator.generate is at ActivationRecordsGenerator.java:40.",
+   "correction": "The generate() dispatcher method is at ActivationRecordsGenerator.java:154; line 40 is the recordsForEmptyLog() helper (the empty-log path the sentence goes on to describe). The behavior described \u2014 empty log writes bootstrap metadata wrapped in Begin/EndTransactionRecord, non-empty log finishes/aborts a dangling transaction via AbortTransactionRecord \u2014 is accurate (recordsForEmptyLog at :40, Begin/End at :70/:108, recordsForNonEmptyLog at :115, Abort at :137), but the cited line points to the helper rather than to generate()."
+  },
+  {
+   "severity": "minor",
+   "location": "PartitionChangeBuilder constructor description \u2014 \"takes the current PartitionRegistration, the target ISR, an isAcceptableLeader predicate, the metadataVersion, the effective min.insync.replicas, and whether ELR is enabled\"",
+   "claim": "The PartitionChangeBuilder constructor takes the target ISR.",
+   "correction": "The constructor (PartitionChangeBuilder.java:106-114) takes (PartitionRegistration partition, Uuid topicId, int partitionId, IntPredicate isAcceptableLeader, MetadataVersion metadataVersion, int minISR, boolean eligibleLeaderReplicasEnabled). The target ISR is NOT a constructor parameter; it is supplied separately via setTargetIsr / setTargetIsrWithBrokerStates. All other listed parameters are present and correct."
+  }
+ ],
+ "12-metadata-propagation": [
+  {
+   "severity": "minor",
+   "claim": "KafkaRaftServer aliases these as MetadataPartition and MetadataTopicId = Uuid.METADATA_TOPIC_ID [cite core/.../KafkaRaftServer.scala:118]",
+   "location": "Core concepts & terminology, __cluster_metadata entry",
+   "correction": "The aliases are at KafkaRaftServer.scala:119 (val MetadataPartition = Topic.CLUSTER_METADATA_TOPIC_PARTITION) and :120 (val MetadataTopicId = Uuid.METADATA_TOPIC_ID). The cited line 118 is off by 1-2 lines (still the right area). Content is correct."
+  },
+  {
+   "severity": "minor",
+   "claim": "The minimum is IBP_3_3_IV3 (feature level 7) and the latest production version is IBP_4_3_IV0 (level 30) ... [cite server-common/.../MetadataVersion.java:136]",
+   "location": "Configuration reference, paragraph after the table",
+   "correction": "All values are correct (MINIMUM_VERSION=IBP_3_3_IV3 at MetadataVersion.java:147/enum line 50; LATEST_PRODUCTION=IBP_4_3_IV0 at :157/enum line 125; IBP_4_4_IV0 level 31 at line 136), but the single cite :136 points to the IBP_4_4_IV0 declaration rather than the minimum/latest-production lines. Citation is imprecise, not wrong in substance."
+  }
+ ],
+ "13-group-coordination": [
+  {
+   "severity": "minor",
+   "claim": "The inner Offsets class (committed offsets timeline map) is cited at OffsetMetadataManager.java:356.",
+   "correction": "The `private class Offsets` is declared at OffsetMetadataManager.java:350 (the three-level map field `offsetsByGroup` is at :354; line 356 is the constructor). The structural description (group \u2192 topic \u2192 partition \u2192 OffsetAndMetadata) is exactly correct; only the line is off by ~6.",
+   "location": "In-memory structure: 'the inner Offsets class, OffsetMetadataManager.java:356'"
+  },
+  {
+   "severity": "minor",
+   "claim": "ConsumerGroup.currentPartitionEpoch (ConsumerGroup.java:580) is described as 'the global map of partition \u2192 owning epoch'.",
+   "correction": "Line 580 is the accessor method `public int currentPartitionEpoch(Uuid, int)`, not the map itself; the backing field `TimelineHashMap currentPartitionEpoch` is declared at ConsumerGroup.java:145. The cited line points to the lookup method, not the map field, but functionally describes the same construct.",
+   "location": "No double ownership bullet: 'ConsumerGroup.currentPartitionEpoch (ConsumerGroup.java:580) is the global map'"
+  },
+  {
+   "severity": "minor",
+   "claim": "LEAVE_GROUP_MEMBER_EPOCH/LEAVE_GROUP_STATIC_MEMBER_EPOCH live in clients/.../ConsumerGroupHeartbeatRequest.java:31.",
+   "correction": "Constants and line are correct (LEAVE_GROUP_MEMBER_EPOCH=-1 at :31, LEAVE_GROUP_STATIC_MEMBER_EPOCH=-2 at :32), but the full path is clients/src/main/java/org/apache/kafka/common/requests/ConsumerGroupHeartbeatRequest.java (package common.requests, not clients.consumer). The '.../' abbreviation hides this; the prompt's own seed path implied a consumer-client location which is not where these constants are.",
+   "location": "Liveness/fencing/leaving: 'constants LEAVE_GROUP_MEMBER_EPOCH / LEAVE_GROUP_STATIC_MEMBER_EPOCH (clients/.../ConsumerGroupHeartbeatRequest.java:31)'"
+  }
+ ],
+ "14-transactions-eos": [
+  {
+   "severity": "minor",
+   "location": "Section '3 \u00b7 Produce \u2014 transactional data batches' (last sentence of the paragraph)",
+   "claim": "A non-transactional write while a transaction is open, or a transactional write with no open transaction, throws InvalidTxnStateException (ProducerAppendInfo.java:235-243).",
+   "correction": "Only the FIRST direction throws. In ProducerAppendInfo.appendDataBatch, the InvalidTxnStateException is thrown solely when currentTxnFirstOffset is present AND the batch is non-transactional (storage/.../ProducerAppendInfo.java:235-238). The other case the doc lists \u2014 a transactional write with no open transaction (currentTxnFirstOffset empty && isTransactional) \u2014 is NOT an error; it is exactly how a transaction begins ('Began a new transaction', ProducerAppendInfo.java:239-243, which sets currentTxnFirstOffset and adds a TxnMetadata). So a transactional write with no open transaction does not throw here."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Persistent: the __transaction_state log', first paragraph parenthetical",
+   "claim": "...(50 partitions by default, RF 3, min.insync.replicas=2, uncompressed, unclean.leader.election=false \u2014 set in TransactionCoordinator.transactionStateTopicConfigs, TransactionCoordinator.scala:1014-1022).",
+   "correction": "transactionStateTopicConfigs (TransactionCoordinator.scala:1014-1022) only sets unclean.leader.election.enable=false, compression.type=uncompressed, cleanup.policy=compact, min.insync.replicas (= transactionLogMinInsyncReplicas), and segment.bytes. It does NOT set the partition count (50) or replication factor (3); those come from transaction.state.log.num.partitions / .replication.factor (TransactionLogConfig.java:32,40) and are applied during internal-topic creation, not in this method. The default values cited are correct, but attributing '50 partitions, RF 3' to this method is inaccurate."
+  }
+ ],
+ "15-share-groups": [
+  {
+   "severity": "major",
+   "location": "Dead-letter queue (KIP-1191) section, first paragraph: \"When a group sets <code>group.share.dlq.enable</code>/has a DLQ topic configured\"",
+   "claim": "DLQ is enabled via a config key named group.share.dlq.enable (in addition to having a DLQ topic configured).",
+   "correction": "No such config key exists anywhere in the tree. DLQ activation is gated by the broker-level share.version feature (ShareVersion.SV_2 / supportsShareGroupDLQ(), server-common/.../common/ShareVersion.java:30,75-77) AND the group having errors.deadletterqueue.topic.name set; in code: isDLQEnabledForGroup() = shareGroupDlqEnableSupplier.get() && configProvider.errorsDLQTopicName(groupId).isPresent() (core/src/main/java/kafka/server/share/SharePartition.java:3356-3358). The only DLQ-related group config keys are errors.deadletterqueue.topic.name and errors.deadletterqueue.copy.record.enable (GroupConfig.java:113,117) plus the internal group.share.dlq.manager.class.name (ShareGroupConfig.java:85). The '/has a DLQ topic configured' half is correct; the named key is fabricated."
+  },
+  {
+   "severity": "minor",
+   "location": "Snapshot/update compaction section: \"...has reached <code>group.share.coordinator.snapshot.update.records.per.snapshot</code> (config key <code>share.coordinator.snapshot.update.records.per.snapshot</code>...)\"",
+   "claim": "The snapshot-frequency limit is named group.share.coordinator.snapshot.update.records.per.snapshot (with the real key given only parenthetically).",
+   "correction": "There is no 'group.'-prefixed variant. The only key is share.coordinator.snapshot.update.records.per.snapshot, default 500, range between(0,500) (share-coordinator/.../ShareCoordinatorConfig.java:58-60,103). The parenthetical and the default/line cite are correct; only the leading fabricated name is wrong."
+  },
+  {
+   "severity": "minor",
+   "location": "Acknowledgement & persist protocol section: \"...happen in <code>rollbackOrProcessStateUpdates</code> (<code>SharePartition.java:2564</code>)\"",
+   "claim": "rollbackOrProcessStateUpdates is at SharePartition.java:2564.",
+   "correction": "The method rollbackOrProcessStateUpdates is declared at core/src/main/java/kafka/server/share/SharePartition.java:2528; line 2564 is the writeShareGroupState(...) call inside it. The dependent in-prose cites (:2540 rollback, :2597/:2608 commit, :2578 RPC-failure rollback, :2858 writeShareGroupState) are all correct. Off-by-~36 on the method-declaration line only."
+  },
+  {
+   "severity": "minor",
+   "location": "Acquisition lock & timeout section: \"On expiry (<code>AcquisitionLockTimerTask.run</code>, <code>AcquisitionLockTimerTask.java:67</code>)\"",
+   "claim": "AcquisitionLockTimerTask.run() is at line 67.",
+   "correction": "run() is declared at server/.../fetch/AcquisitionLockTimerTask.java:68 and sets hasExpired=true at line 73 (line 67 is the closing comment line). The behavioral claim (sets volatile hasExpired before invoking the handler) is correct."
+  }
+ ],
+ "16-producer-client": [
+  {
+   "severity": "minor",
+   "claim": "\"The broker tracks the last five sequence numbers per producer-partition and rejects duplicates ... and gaps\" (Ordering & idempotence section).",
+   "correction": "The broker retains the last five *batches* per producer-partition, not five sequence numbers. The constant is ProducerStateEntry.NUM_BATCHES_TO_RETAIN = 5 (storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerStateEntry.java:35), referenced by ProducerConfig.java:276 (\"aligned with ProducerStateEntry#NUM_BATCHES_TO_RETAIN\"). Conceptually a 5-deep dedup window, but \"sequence numbers\" is imprecise.",
+   "location": "Ordering & idempotence, paragraph beginning \"Idempotence is on by default\""
+  },
+  {
+   "severity": "minor",
+   "claim": "\"A batch counts as full when the deque has more than one batch ... or the last batch's builder reports isFull() (RecordAccumulator.java:416).\"",
+   "correction": "The prose correctly describes the `dq.size() > 1 || batch.isFull()` test, but that logic lives in tryAppend/appendNewBatch/partitionReady (RecordAccumulator.java:406, :442, :719). The cited line 416 is `allBatchesFull`, which checks only the LAST batch's isFull() (RecordAccumulator.java:416-420) and does not include the `size > 1` clause. Citation points to a related-but-different helper.",
+   "location": "\"What \\\"ready\\\" and \\\"full\\\" mean\" section"
+  },
+  {
+   "severity": "minor",
+   "claim": "Several citations point at an enclosing field/method declaration rather than the exact behavior line.",
+   "correction": "Examples: Sticky-partition rotation cited at BuiltInPartitioner.java:48 (the AtomicReference field) but the rotation is at :251; forced-close abort cited at Sender.java:544 (initiateClose) but abortIncompleteBatches is invoked at :295; the \"partial wait already elapsed \u2192 BufferPool gets the remainder\" cited at KafkaProducer.java:1259 but the remainder computation is at :1146. All land in the correct method/region; none are wrong enough to mislead.",
+   "location": "Core concepts (Sticky partition), flush()/close(), Failure modes (Metadata never arrives)"
+  }
+ ],
+ "17-consumer-client": [
+  {
+   "severity": "minor",
+   "location": "Section 'poll() on the application thread: the AsyncPollEvent', sentence: 'The two boolean flags isValidatePositionsComplete and isReconciliationCheckComplete (both volatile, events/AsyncPollEvent.java:50)'",
+   "claim": "isReconciliationCheckComplete is a volatile boolean flag on AsyncPollEvent (like isValidatePositionsComplete).",
+   "correction": "Only isValidatePositionsComplete is a volatile boolean field (AsyncPollEvent.java:50). isReconciliationCheckComplete() is a METHOD (AsyncPollEvent.java:104) that returns reconciliationCheckFuture.isDone(); the reconciliation state is held in a `final CompletableFuture<Void> reconciliationCheckFuture` (AsyncPollEvent.java:51), not a volatile boolean. So 'both volatile [boolean flags]' is inaccurate for the reconciliation one."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Group membership & rebalancing (async engine)', sentence: 'the manager emits PartitionsRevoked/PartitionsAssigned background events'",
+   "claim": "The membership manager emits a 'PartitionsRevoked' background event (alongside PartitionsAssigned).",
+   "correction": "There is no PartitionsRevoked background event. The two background events are PartitionsAssignedEvent (BackgroundEventProcessor case PARTITIONS_ASSIGNED, AsyncKafkaConsumer.java:202) and PartitionsRemovedEvent (case PARTITIONS_REMOVED, AsyncKafkaConsumer.java:206 / events/PartitionsRemovedEvent.java). Revocation AND loss are both carried by PartitionsRemovedEvent, which dispatches on event.methodName() (AsyncKafkaConsumer.java:271). No PartitionsRevokedEvent.java file exists."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Failure modes', bullet 'Log truncation': 'a LogTruncationException carries the divergent offset (SubscriptionState.java:1422)'",
+   "claim": "LogTruncationException is defined/located at SubscriptionState.java:1422.",
+   "correction": "SubscriptionState.java:1422 is the `LogTruncation` holder class (fields topicPartition, fetchPosition, divergentOffsetOpt), NOT LogTruncationException. The exception class is clients/src/main/java/org/apache/kafka/clients/consumer/LogTruncationException.java and is constructed/thrown in PositionsValidator.java / OffsetsRequestManager.java / OffsetFetcherUtils.java. The cited line names a related-but-different type."
+  }
+ ],
+ "18-security": [
+  {
+   "severity": "minor",
+   "location": "Architecture & control flow, paragraph after first diagram: \"The two factory entry points are serverChannelBuilder(...) and clientChannelBuilder(...) in ChannelBuilders.java:63 / :95\"",
+   "claim": "serverChannelBuilder is at ChannelBuilders.java:63 and clientChannelBuilder is at :95",
+   "correction": "The two line numbers are swapped relative to the method names listed. clientChannelBuilder(...) is at clients/src/main/java/org/apache/kafka/common/network/ChannelBuilders.java:63 and serverChannelBuilder(...) is at ChannelBuilders.java:95. Both methods exist and both funnel into create(...) at :109 (correct); only the attribution order is reversed."
+  },
+  {
+   "severity": "minor",
+   "location": "SASL mechanisms section: \"the inter-broker mechanism is sasl.mechanism.inter.broker.protocol (default GSSAPI, :133)\" and the Configuration reference row for the same key",
+   "claim": "sasl.mechanism.inter.broker.protocol has its GSSAPI default at BrokerSecurityConfigs.java:133",
+   "correction": "The default value GSSAPI is correct, but there is no default constant at line 133. BrokerSecurityConfigs.java:132 is the key constant (SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG) and :133 is the DOC string; the actual default is supplied by SaslConfigs.DEFAULT_SASL_MECHANISM (=GSSAPI_MECHANISM, SaslConfigs.java:35), wired in at BrokerSecurityConfigs.java:175. Off-by-one/wrong-line for the default, value is right."
+  }
+ ],
+ "19-quotas": [
+  {
+   "severity": "major",
+   "location": "Detailed mechanics \u2192 \"Strict vs permissive controller-mutation quotas\" (line 162): \"these are wired with strictSinceVersion = 5 (CreateTopics), 6 (CreatePartitions), 3 (DeleteTopics) \u2014 ControllerApis.scala:200,364,801\"",
+   "claim": "CreateTopics strict-since version = 5, CreatePartitions = 6, DeleteTopics = 3.",
+   "correction": "The API-to-version pairings are all scrambled. The cited line numbers are correct but each is attached to the wrong API/version. Actual: handleDeleteTopics calls newQuotaFor(..., 5) at core/src/main/scala/kafka/server/ControllerApis.scala:200; handleCreateTopics calls newQuotaFor(..., 6) at ControllerApis.scala:364; handleCreatePartitions calls newQuotaFor(..., 3) at ControllerApis.scala:801. So the correct mapping is CreateTopics=6, CreatePartitions=3, DeleteTopics=5."
+  },
+  {
+   "severity": "minor",
+   "location": "Client telemetry \u2192 \"Subscriptions & the subscription id\" (line 247): \"createClientInstance (line 330) intersects all subscriptions whose match pattern matches\"",
+   "claim": "The effective subscription is the intersection of matching subscriptions.",
+   "correction": "It is a UNION, not an intersection: createClientInstance (server/src/main/java/org/apache/kafka/server/ClientMetricsManager.java:338-345) does subscribedMetrics.addAll(info.metrics()) over every matching subscription and takes Math.min of the intervals. The doc's very next clause ('unions their metric prefixes') is correct, so 'intersects' is just imprecise wording, but it contradicts the union semantics."
+  }
+ ],
+ "20-kafka-streams": [
+  {
+   "severity": "minor",
+   "location": "Section 'Inserting repartition topics' \u2014 '...a null-key filter (\u2026-filter, a KStreamFilter dropping null keys since they cannot be partitioned)...' citing KStreamImpl.java:969/:978",
+   "claim": "KStreamImpl.createRepartitionedSource() emits a null-key filter (a KStreamFilter that drops null keys).",
+   "correction": "In the cited method the filter is created with predicate (k,v) -> true, i.e. it does NOT drop null keys: 'new KStreamFilter<>((k, v) -> true, false)' (streams/.../kstream/internals/KStreamImpl.java:1005). The variable is merely named nullKeyFilterProcessorName. The actual null-key-dropping predicate '(k,v) -> k != null' is installed later by an optimization pass, InternalStreamsBuilder.rewriteRepartitionNodes() (streams/.../kstream/internals/InternalStreamsBuilder.java:372), and even that is skipped for repartition nodes feeding relaxed-null-key joins. So the high-level narrative is right but the attribution/detail at the cited line is inaccurate."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Interactive Queries (IQv2)' \u2014 'StreamsMetadataState ... answers queryMetadataForKey(store, key, partitioner)'",
+   "claim": "StreamsMetadataState exposes queryMetadataForKey(store, key, partitioner).",
+   "correction": "The method on StreamsMetadataState is named keyQueryMetadataForKey(...) (streams/.../processor/internals/StreamsMetadataState.java:206,223,247). 'queryMetadataForKey' is the public KafkaStreams API name (KafkaStreams.java:1748,1765) which delegates to it. Minor internal-name imprecision; behaviour described is correct (returns active host plus standby hosts)."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Punctuation' \u2014 'Either firing sets commitNeeded = true (:1236, :1266)'",
+   "claim": "commitNeeded = true is set at StreamTask.java:1236 and :1266.",
+   "correction": "Lines 1236 and 1266 are the starts of maybePunctuateStreamTime() and maybePunctuateSystemTime(); the actual 'commitNeeded = true;' assignments are at StreamTask.java:1247 and :1272. Citation points at the enclosing method rather than the exact line (consistent with the doc's roughly-right-place convention)."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'How EOS-v2 commits atomically' \u2014 'its transactional.id is <application.id>-<processId>-<threadIdx> (ActiveTaskCreator.java:104)'",
+   "claim": "The transactional.id is constructed at ActiveTaskCreator.java:104.",
+   "correction": "The transactional.id construction 'APPLICATION_ID + \"-\" + processId + \"-\" + threadIdx' is at ActiveTaskCreator.java:~109-110 (inside producer(), which begins ~:103). The format string itself is correct; only the exact line is off by a few."
+  }
+ ],
+ "21-kafka-connect": [
+  {
+   "severity": "major",
+   "location": "Section 'ConnectProtocol wire format', paragraph after the diagram: 'V2 (\"sessioned\") additionally embeds the request-signing session key (IncrementalCooperativeConnectProtocol.java:59)'",
+   "claim": "The V2 (\"sessioned\") incremental-cooperative protocol additionally embeds the request-signing session key in the wire format.",
+   "correction": "The session key is NOT embedded in the protocol metadata or assignment. Per the source, the V2 header 'is schematically identical to V1' and merely SIGNIFIES that session-key distribution is enabled (IncrementalCooperativeConnectProtocol.java:73-82). The session key is distributed via the config topic (KafkaConfigBackingStore.putSessionKey -> SESSION_KEY_V0 schema, KafkaConfigBackingStore.java:711-727), and ASSIGNMENT_V1 has no session-key field (only Error/Leader/LeaderUrl/ConfigOffset/Assignment/Revoked/ScheduledDelay, IncrementalCooperativeConnectProtocol.java:131-139). The chapter itself correctly states this elsewhere (config-topic 'session-key' record at line 107; signing via session key at line 242). Also the citation is off: IncrementalCooperativeConnectProtocol.java:59 is CONNECT_PROTOCOL_V1=1, and :60 is CONNECT_PROTOCOL_V2=2."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Connector lifecycle state machine': 'reconciles its actual state toward the herder-requested TargetState in doTransitionTo() (WorkerConnector.java:213)'",
+   "claim": "WorkerConnector.doTransitionTo() is at WorkerConnector.java:213.",
+   "correction": "doTransitionTo() is defined at WorkerConnector.java:378 (the Callback overload) and :399 (the private TargetState overload). Line 213 is inside doStart() (the 'case STARTED: return false;' branch). The method exists and the described behavior is correct; only the line number is off."
+  },
+  {
+   "severity": "minor",
+   "location": "Section 'Role & responsibilities', first bullet: 'notifying the runtime through a ConnectorContext (connect/api/.../connector/Connector.java:124)'",
+   "claim": "The ConnectorContext-notification behavior is at Connector.java:124.",
+   "correction": "Connector.java:124 is the abstract taskConfigs(int maxTasks) declaration, not the ConnectorContext machinery. The ConnectorContext is described in the class javadoc (Connector.java:36-43) and wired via initialize()/context() (Connector.java:56, 87). The claim itself (connectors monitor and notify via ConnectorContext) is correct; only the line target is imprecise."
+  },
+  {
+   "severity": "render",
+   "location": "a <pre> block",
+   "claim": "2 raw unescaped '<' inside a <pre> diagram/code block",
+   "correction": "Escape each raw '<' as &lt; (and '>' as &gt;, '&' as &amp;) inside that pre block so it renders."
+  }
+ ]
+}

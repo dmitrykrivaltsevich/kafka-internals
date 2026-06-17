@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance Tuning · Kafka Internals</title>
+<meta name="description" content="Producer/consumer/broker knobs, the end-to-end latency budget, page cache and zero-copy; throughput ⇄ latency.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="op05-performance-tuning">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>II · 05 · Performance Tuning: Throughput ⇄ Latency</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">Kafka tuning is not a search for one fast configuration; it is the deliberate choice of where on three axes — <strong>throughput</strong>, <strong>latency</strong>, and <strong>durability</strong> — you want to sit. Almost every knob trades one against another, and the trade is mechanical: batching amortizes per-request cost at the price of a fixed latency tax; <code>acks=all</code> buys durability with a replication round-trip; compression buys network and disk savings with producer CPU. This chapter maps each dial to the exact source mechanism that makes it a dial, gives you the compiled-in default and the file it lives in, and then breaks the end-to-end latency budget into the five broker stages you can actually measure. The cardinal skill is reading the signal — the request-queue/local/remote breakdown and the two idle-ratio gauges — so that you tune the stage that is actually slow rather than the one folklore blames.</p>
+
+<h2>The three-axis model: what you are really trading</h2>
+
+<p>Hold this picture before touching any config. A produce request's success has three independent costs. <strong>Latency</strong> is how long the producer waits for the ack. <strong>Throughput</strong> is how many bytes per second the pipeline sustains. <strong>Durability</strong> is how many simultaneous failures the data survives. You optimize for at most two; the third is the bill. Batching raises throughput and (under load) can even lower latency, but raises latency under light load. Compression raises effective throughput and cuts cost but spends CPU. <code>acks=all</code> raises durability but adds a remote round-trip to latency. Confluent's reference benchmark demonstrates the happy region — roughly <strong>605 MB/s peak</strong> and <strong>p99 5 ms at 200 MB/s</strong> on <code>i3en.2xlarge</code>, RF=3, <code>acks=all</code>, fsync off (Confluent "Kafka Performance", empirical, 1 KB messages, reads served from page cache) — but note the words "AND, not maxed simultaneously": you do not get peak throughput and minimum latency at the same instant.</p>
+
+<figure class="diagram">
+<div class="dstack">
+<div class="layer cat-client"><div class="ln">Producer dials</div><div class="ld"><code>batch.size</code> + <code>linger.ms</code> (batching) · <code>compression.type</code> · <code>acks</code> · <code>max.in.flight</code> · <code>buffer.memory</code></div><div class="row"><span class="chip">throughput ⇄ latency ⇄ durability</span></div></div>
+<div class="sep">↕</div>
+<div class="layer cat-broker"><div class="ln">Broker dials</div><div class="ld"><code>num.io.threads</code> · <code>num.network.threads</code> · <code>num.replica.fetchers</code> · socket buffers · <code>queued.max.requests</code> · <code>log.segment.bytes</code></div><div class="row"><span class="chip">sized from idle-ratio gauges</span></div></div>
+<div class="sep">↕</div>
+<div class="layer cat-storage"><div class="ln">OS / page cache</div><div class="ld">small heap → OS caches the tail; zero-copy <code>sendfile</code>; <code>vm.swappiness=1</code>; FDs; <code>vm.max_map_count</code>; dirty ratios</div><div class="row"><span class="chip">the real read/write engine</span></div></div>
+<div class="sep">↕</div>
+<div class="layer cat-coord"><div class="ln">Consumer dials</div><div class="ld"><code>fetch.min.bytes</code> + <code>fetch.max.wait.ms</code> (read batching) · <code>max.partition.fetch.bytes</code> · <code>max.poll.records</code> + <code>max.poll.interval.ms</code></div><div class="row"><span class="chip">processing budget ⇄ liveness</span></div></div>
+</div>
+<figcaption>The tuning surface, top to bottom: where each knob lives and which axes it moves.</figcaption>
+<div class="legend"><span class="sw cat-client"></span> producer/client · <span class="sw cat-broker"></span> broker · <span class="sw cat-storage"></span> OS &amp; page cache · <span class="sw cat-coord"></span> consumer · <span class="mono">code</span> = a config key.</div>
+</figure>
+
+<div class="callout key"><span class="callout-title">The tuning triangle (rule of thumb)</span><p><code>linger.ms↑</code> trades latency for throughput. <code>compression.type</code> trades producer CPU for network and disk. <code>acks=all</code> trades latency for durability. Pick two; pay for the third (synthesized from Confluent / Strimzi tuning guides, empirical). Before you change anything, decide which one your workload is allowed to spend.</p></div>
+
+<h2>Producer: the batching dial</h2>
+
+<p>The producer's dominant lever is batching, and its mechanism is the <code>RecordAccumulator</code> — a per-partition deque of <code>ProducerBatch</code> objects (<code>clients/.../producer/internals/RecordAccumulator.java:76,78</code> hold <code>batchSize</code> and <code>lingerMs</code>; the class is documented at line 102 as trading "some latency for potentially better throughput due to more batching"). A batch becomes <em>ready</em> to send when either it fills to <code>batch.size</code> <strong>or</strong> <code>linger.ms</code> elapses since the first record landed (the <code>ready</code>/<code>allBatchesFull</code> logic, <code>RecordAccumulator.java:416</code>), whichever comes first. That single OR is the whole dial. The sender thread then drains all ready batches across partitions into per-broker requests, capped by <code>max.request.size</code> (default <strong>1 MB</strong>, <code>ProducerConfig.java:424</code>). Part I chapter <a href="16-producer-client.html">16 · Producer Client</a> walks the accumulator and sender threads in full.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config</th><th>Default</th><th>Source</th><th>Mechanism / why</th></tr></thead>
+<tbody>
+<tr><td><code>batch.size</code></td><td>16384 (16 KB)</td><td><code>ProducerConfig.java:413</code></td><td>Upper bound per-partition batch; a buffer of this size is pre-allocated. Larger ⇒ fewer requests, better compression, more throughput, more memory waste.</td></tr>
+<tr><td><code>linger.ms</code></td><td><strong>5</strong></td><td><code>ProducerConfig.java:418</code></td><td>Artificial delay to let a batch fill. <strong>Changed from 0 to 5 in Apache Kafka 4.0</strong> (doc, <code>ProducerConfig.java:100,162</code>) because larger batches usually yield similar or lower latency.</td></tr>
+<tr><td><code>compression.type</code></td><td><code>none</code></td><td><code>ProducerConfig.java:409</code></td><td>Compresses whole batches; batching efficacy drives the ratio. Valid: <code>none</code>, <code>gzip</code>, <code>snappy</code>, <code>lz4</code>, <code>zstd</code>.</td></tr>
+<tr><td><code>acks</code></td><td><code>all</code></td><td><code>ProducerConfig.java:405</code></td><td>How many replicas must ack. <code>all</code> waits for the full ISR. Idempotence requires <code>all</code>.</td></tr>
+<tr><td><code>max.in.flight.requests.per.connection</code></td><td>5</td><td><code>ProducerConfig.java:489</code></td><td>Unacked requests per connection. Capped at 5 under idempotence (broker retains 5 batches/producer).</td></tr>
+<tr><td><code>buffer.memory</code></td><td>33554432 (32 MB)</td><td><code>ProducerConfig.java:401</code></td><td>Total record-buffering memory; producer blocks when full.</td></tr>
+<tr><td><code>max.block.ms</code></td><td>60000 (60 s)</td><td><code>ProducerConfig.java:451</code></td><td>How long <code>send()</code> blocks on a full buffer or metadata fetch before throwing.</td></tr>
+<tr><td><code>delivery.timeout.ms</code></td><td>120000 (120 s)</td><td><code>ProducerConfig.java:419</code></td><td>Total deadline from <code>send()</code> to success/failure; must be ≥ <code>request.timeout.ms</code> + <code>linger.ms</code>.</td></tr>
+<tr><td><code>enable.idempotence</code></td><td><code>true</code></td><td><code>ProducerConfig.java:543</code></td><td>Exactly-once-per-partition writes; on by default unless conflicting configs disable it.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout rationale"><span class="callout-title">Why linger.ms default became 5 in Kafka 4.0</span><p>With <code>linger.ms=0</code> the accumulator sends as soon as the sender thread is free, so under light load batches are tiny — Confluent's producer hands-on course measured average batches of only <strong>~1,215 bytes</strong> against a 16 KB limit at <code>linger=0</code>, versus <strong>~275 KB</strong> at <code>linger=1500ms</code> (empirical, Confluent). Tiny batches mean more requests, worse compression, more broker CPU. The 4.0 default of 5 ms (<code>ProducerConfig.java:100</code>) bets that the efficiency gain typically <em>lowers</em> end-to-end latency despite the added 5 ms ceiling, because each request now does proportionally more useful work.</p></div>
+
+<div class="callout gotcha"><span class="callout-title">linger.ms only helps when the batch can fill</span><p>Raising <code>linger.ms</code> on a <em>low-rate</em> topic is counter-productive: Confluent's hands-on course showed that for a 200 rec/s stream of 1000-byte records, increasing linger <strong>decreased</strong> throughput and <strong>increased</strong> latency — the defaults were already optimal (empirical, Confluent). Set <code>linger.ms &gt; 0</code> meaningfully only when the produce rate is high enough to fill <code>batch.size</code> within the window. Otherwise you are just adding dead time.</p></div>
+
+<h3>The throughput recipe vs the latency recipe</h3>
+
+<p>Two named configurations bracket the dial. For <strong>maximum throughput</strong>: <code>batch.size</code> in the 64 KB–1 MB range, <code>linger.ms</code> 5–100 ms, <code>compression.type=lz4</code> (or <code>zstd</code> when storage cost dominates), <code>acks=all</code> with <code>min.insync.replicas=2</code> (Intel/Confluent learn page, empirical). For <strong>minimum latency</strong>: keep <code>linger.ms</code> at 0–1 ms, modest <code>batch.size</code>, and accept lower compression ratios. The historical "10–50× throughput from batching" figures are vendor roll-ups — directional, not guarantees — but the direction is real and rooted in the per-request fixed cost the accumulator amortizes.</p>
+
+<div class="callout warning"><span class="callout-title">buffer.memory is backpressure, not a buffer you can ignore</span><p><code>buffer.memory</code> (32 MB, <code>ProducerConfig.java:401</code>) must be ≥ <code>batch.size</code>, and Kafka's own partition-count guidance is that a producer needs "at least a few tens of KB per partition being produced" (Jun Rao, empirical). When the buffer fills — because the brokers are slow or the network is saturated — <code>send()</code> blocks for up to <code>max.block.ms</code> (60 s) and then throws (<code>ProducerConfig.java:225</code> doc). That block <em>is</em> your backpressure: if you see produce latency spikes, check whether the buffer is saturating before blaming the broker. Sizing rule: <code>buffer.memory ≥ batch.size × partitions_produced + compression + in-flight headroom</code>.</p></div>
+
+<h3>Ordering, idempotence, and max.in.flight</h3>
+
+<p>The interaction between <code>max.in.flight.requests.per.connection</code> (5) and idempotence is a correctness boundary, not a performance one. The constant <code>MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE = 5</code> (<code>ProducerConfig.java:277</code>) is a <strong>hard cap</strong>: the broker retains at most 5 batches per producer (aligned to <code>ProducerStateEntry#NUM_BATCHES_TO_RETAIN</code>, comment at line 276), so a 6th in-flight batch could be silently dropped on the broker side. The validation throws <code>ConfigException</code> if you set it above 5 with idempotence on (<code>ProducerConfig.java:640</code>). With idempotence, all five in-flight requests preserve order because the broker dedups and reorders by sequence number; <strong>without</strong> idempotence, <code>max.in.flight &gt; 1</code> plus retries can reorder records on a failed-then-retried send (<code>ProducerConfig.java:301</code> doc). Part I chapter <a href="14-transactions-eos.html">14 · Transactions &amp; EOS</a> details the sequence-number mechanism.</p>
+
+<figure class="diagram">
+<div class="dseq" style="--cols:3">
+<div class="lanes"><span class="actor cat-client">Producer</span><span class="actor cat-storage">RecordAccumulator</span><span class="actor cat-broker">Leader</span></div>
+<div class="body">
+<div class="lifelines"><i></i><i></i><i></i></div>
+<div class="m r" style="--from:1;--to:2"><span class="ml">append(record)</span><span class="ln"></span></div>
+<div class="m l dashed" style="--from:2;--to:1"><span class="ml">future (not yet sent)</span><span class="ln"></span></div>
+<div class="m r" style="--from:2;--to:2"><span class="ml">wait: batch full OR linger.ms (5)</span><span class="ln"></span></div>
+<div class="m r" style="--from:2;--to:3"><span class="ml">ProduceRequest (≤ 5 in flight)</span><span class="ln"></span></div>
+<div class="m r" style="--from:3;--to:3"><span class="ml">append + await ISR (acks=all)</span><span class="ln"></span></div>
+<div class="m l dashed" style="--from:3;--to:1"><span class="ml">ack ⇒ complete future</span><span class="ln"></span></div>
+</div>
+</div>
+<figcaption>Producer send path: the accumulator holds the record until the batch fills or linger elapses; the latency tax is that wait plus the acks=all round-trip.</figcaption>
+<div class="legend"><span class="arr"></span> request · <span class="arr dashed"></span> async reply/callback · <span class="sw cat-client"></span> producer · <span class="sw cat-storage"></span> accumulator · <span class="sw cat-broker"></span> leader.</div>
+</figure>
+
+<h3>Compression: a CPU-vs-ratio dial, applied per batch</h3>
+
+<p>Compression happens on the full batch (<code>ProducerConfig.java:247</code> doc), which is why batching and compression compound: a bigger batch compresses better. The data travels and is stored <em>compressed</em> — Kafka replicates and persists the compressed batch — so a good ratio cuts produce bytes, replication bytes, disk, and consumer-fetch bytes all at once. The cost is producer CPU. Kafka 4.x exposes per-codec levels: <code>compression.gzip.level</code>, <code>compression.lz4.level</code>, <code>compression.zstd.level</code> (<code>ProducerConfig.java:410-412</code>, defaults are each codec's <code>defaultLevel()</code>).</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Codec</th><th>Compress / Decompress (lzbench)</th><th>Ratio (HTTP data)</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>lz4</code></td><td>594 / 2428 MB/s</td><td>1.81×</td><td>Default choice for performance — fastest decompressor by far; lowest CPU. Often faster end-to-end than no compression.</td></tr>
+<tr><td><code>snappy</code></td><td>446 / 1344 MB/s</td><td>2.35×</td><td>Similar niche to lz4; slightly higher ratio, slower decompress.</td></tr>
+<tr><td><code>zstd</code> (lvl -1)</td><td>409 / 844 MB/s</td><td>4.5× (lvl 6)</td><td>Best ratio for moderately more CPU; strong default when storage/network cost dominates (Kafka 2.1+, KIP-110).</td></tr>
+<tr><td><code>gzip</code></td><td>slowest</td><td>3.58×</td><td>Highest CPU; usually avoided despite decent ratio.</td></tr>
+</tbody>
+</table></div>
+<p class="src-note">Speeds and ratios: Cloudflare "Squeezing the firehose" (lzbench on ~1 MB / 600-record batches; HTTP-request data), empirical and data-dependent. Cloudflare chose <strong>Zstandard level 6</strong>, saving "hundreds of gigabits of internal traffic and terabytes of flash storage" and cancelling a hardware expansion; Trendyol chose <code>zstd</code> level 3 for ~70% message-size reduction (empirical).</p>
+
+<div class="callout gotcha"><span class="callout-title">"zstd is the default" is wrong, and tiny batches compress poorly</span><p><code>compression.type</code> defaults to <code>none</code> (<code>ProducerConfig.java:409</code>), not <code>producer</code> and not <code>zstd</code>. And because compression is per-batch, the "4.5×" ratio is a property of large batches of compressible data — a stream of tiny, near-random, or already-compressed payloads will see little benefit from any codec. Get batching right first (raise <code>linger.ms</code> / <code>batch.size</code>), then compression pays off. For the cost angle — compression as the cheapest cross-AZ lever — see <a href="op10-cost.html">II · 10 · Cost</a>.</p></div>
+
+<h2>Consumer: read batching and the processing budget</h2>
+
+<p>On the read side, the symmetric batching dial is <code>fetch.min.bytes</code> + <code>fetch.max.wait.ms</code>. The broker holds a fetch open until it has <code>fetch.min.bytes</code> available <strong>or</strong> <code>fetch.max.wait.ms</code> elapses (this is local-log fetch; remote/tiered fetch has its own <code>remote.fetch.max.wait.ms</code>, noted in <code>ConsumerConfig.java:208</code>). The crucial fact is the default: <code>fetch.min.bytes=1</code> (<code>ConsumerConfig.java:187</code>) means Kafka <strong>does not batch reads by default</strong> — it answers as soon as a single byte is available, optimized for millisecond latency, not for cost. Part I chapter <a href="09-fetch-path.html">09 · Fetch Path</a> covers the broker-side delayed-fetch purgatory that implements this wait.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config</th><th>Default</th><th>Source</th><th>Mechanism / why</th></tr></thead>
+<tbody>
+<tr><td><code>fetch.min.bytes</code></td><td>1</td><td><code>ConsumerConfig.java:187</code></td><td>Min bytes before broker answers. =1 ⇒ no read batching; latency-optimized, NOT cost-optimized.</td></tr>
+<tr><td><code>fetch.max.wait.ms</code></td><td>500</td><td><code>ConsumerConfig.java:210</code></td><td>Max the broker blocks waiting for <code>fetch.min.bytes</code> (local fetch only).</td></tr>
+<tr><td><code>fetch.max.bytes</code></td><td>52428800 (50 MB)</td><td><code>ConsumerConfig.java:200</code></td><td>Cap per fetch response across all partitions (soft; one oversized batch still returns).</td></tr>
+<tr><td><code>max.partition.fetch.bytes</code></td><td>1048576 (1 MB)</td><td><code>ConsumerConfig.java:225</code></td><td>Cap per partition per fetch (soft). Drives consumer fetch memory.</td></tr>
+<tr><td><code>max.poll.records</code></td><td>500</td><td><code>ConsumerConfig.java:94</code></td><td>Records returned per <code>poll()</code>. Does NOT change fetching — caps records handed up from the cache.</td></tr>
+<tr><td><code>max.poll.interval.ms</code></td><td>300000 (5 min)</td><td><code>ConsumerConfig.java:629</code></td><td>Max gap between <code>poll()</code> calls before the member is evicted ⇒ rebalance.</td></tr>
+<tr><td><code>session.timeout.ms</code></td><td><strong>45000</strong></td><td><code>ConsumerConfig.java:438</code></td><td>Liveness window (classic protocol). Member dropped if no heartbeat within it.</td></tr>
+<tr><td><code>heartbeat.interval.ms</code></td><td>3000</td><td><code>ConsumerConfig.java:443</code></td><td>Heartbeat cadence; keep ≈ ⅓ of <code>session.timeout.ms</code>.</td></tr>
+<tr><td><code>receive.buffer.bytes</code></td><td>65536 (64 KB)</td><td><code>ConsumerConfig.java:493</code></td><td>SO_RCVBUF for the consumer socket; raise on high-BDP links.</td></tr>
+<tr><td><code>enable.auto.commit</code></td><td><code>true</code></td><td><code>ConsumerConfig.java:460</code></td><td>Background offset commits; set <code>false</code> for at-least-once correctness control.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout gotcha"><span class="callout-title">session.timeout.ms default is 45000, not ~10000</span><p>Older guides and the empirical reference quote a ~10 s session timeout; the actual compiled default in this tree is <strong>45000 ms</strong> (<code>ConsumerConfig.java:438</code>), with <code>heartbeat.interval.ms=3000</code> (line 443). Verify against the version you run — this is exactly the kind of number that drifts in folklore. Note also that <code>session.timeout.ms</code> and <code>heartbeat.interval.ms</code> are <em>not used</em> under the new <code>consumer</code> group protocol (KIP-848); they are listed as unsupported for that protocol at <code>ConsumerConfig.java:407-413</code>. See <a href="13-group-coordination.html">13 · Group Coordination</a>.</p></div>
+
+<div class="callout rationale"><span class="callout-title">Raising fetch.min.bytes can cut whole-cluster CPU — the New Relic result</span><p>Because the default is <code>fetch.min.bytes=1</code>, a consumer of a low-throughput topic that polls in a tight loop sends a flood of near-empty fetch requests, each costing broker CPU to service. New Relic raised <code>fetch.min.bytes</code> (and tuned <code>fetch.max.wait.ms</code>) on the consumers of low-traffic topics and cut <strong>cluster-wide broker CPU by 15% from a single application change</strong>, enabling broker scale-down (New Relic, empirical). The mechanism is pure request-rate reduction: fewer, fatter fetches. This is the highest-leverage consumer knob most operators never touch.</p></div>
+
+<div class="callout warning"><span class="callout-title">max.poll.records is a liveness guard, not a throughput knob</span><p>A common misconception: <code>max.poll.records</code> does NOT change how much data is fetched — fetching is governed by <code>fetch.max.bytes</code> / <code>max.partition.fetch.bytes</code>. It only caps how many already-cached records each <code>poll()</code> hands to your code (<code>ConsumerConfig.java:92</code> doc). Its real job is protecting against rebalance storms: if your per-record processing is slow, a large <code>max.poll.records</code> can push the loop past <code>max.poll.interval.ms</code> (5 min), the coordinator evicts the member, it rejoins, and you get a self-sustaining rebalance. Sizing rule: <code>max.poll.records × worst-case per-record time ≤ max.poll.interval.ms</code>, with margin. To go faster, fetch more and process in parallel — do not just raise this cap. Rebalance-storm recovery lives in <a href="op07-failure-modes.html">II · 07 · Failure Modes</a>.</p></div>
+
+<p>Consumer fetch memory is bounded two ways and you must provision RAM for the larger: <code>fetch_memory ≈ #brokers × fetch.max.bytes</code>, and also <code>≈ #partitions × max.partition.fetch.bytes</code> (Strimzi, empirical). With defaults, a consumer subscribed to 1,000 partitions can demand up to ~1 GB of fetch buffering by the second bound — a reason not to point one consumer at thousands of partitions. Partition-count economics are in <a href="op03-partitioning.html">II · 03 · Partitioning</a>.</p>
+
+<h2>Broker: threads, queues, and how to size them from idle ratios</h2>
+
+<p>A broker has two thread pools on the request path. <strong>Network threads</strong> (<code>num.network.threads</code>, default <strong>3</strong> per listener, <code>SocketServerConfigs.java:152</code>) read bytes off sockets and write responses; each listener except the controller listener gets its own pool (doc, line 153). <strong>I/O threads</strong> a.k.a. request handlers (<code>num.io.threads</code>, default <strong>8</strong>, <code>ServerConfigs.java:51</code>) do the actual work — log append, fetch, index lookups, including disk I/O. Between them sits the request queue, capped by <code>queued.max.requests</code> (default <strong>500</strong>, <code>SocketServerConfigs.java:144</code>); when it fills, network threads stop reading — that is the broker's intake backpressure. Part I chapters <a href="06-network-and-threading.html">06 · Network &amp; Threading</a> and <a href="07-request-processing.html">07 · Request Processing</a> describe this acceptor → processor → handler pipeline in detail.</p>
+
+<div class="callout key"><span class="callout-title">Size threads from the idle-ratio gauges, not from a formula alone</span><p>Do not guess. Each pool publishes an idle fraction. <code>RequestHandlerAvgIdlePercent</code> (the I/O pool, metric name defined at <code>core/.../KafkaRequestHandler.scala:210</code>) and <code>NetworkProcessorAvgIdlePercent</code> (the network pool, gauge registered at <code>core/.../SocketServer.scala:120</code>) are both fractions in <strong>[0, 1]</strong>: 1 = fully idle, 0 = saturated. Raise the pool whose idle ratio is low.</p></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Pool</th><th>Config (default · source)</th><th>Idle gauge</th><th>Action threshold</th></tr></thead>
+<tbody>
+<tr><td>I/O / request handlers</td><td><code>num.io.threads</code> = 8 · <code>ServerConfigs.java:51</code></td><td><code>RequestHandlerAvgIdlePercent</code></td><td>&lt; 0.2 ⇒ overloaded, add handlers/brokers; &lt; 0.1 ⇒ active problem (Instaclustr/Confluent, empirical). Heuristic: <code>num.io.threads ≈ 8 × #data disks</code>, bounded by cores.</td></tr>
+<tr><td>Network processors</td><td><code>num.network.threads</code> = 3 · <code>SocketServerConfigs.java:152</code></td><td><code>NetworkProcessorAvgIdlePercent</code></td><td>Ideal &gt; 0.4; &lt; 0.3 ⇒ raise <code>num.network.threads</code> (Confluent, empirical). Common production range 8–12.</td></tr>
+<tr><td>Replica fetchers</td><td><code>num.replica.fetchers</code> = 1 · <code>ReplicationConfigs.java:96</code></td><td>(watch URP / <code>RemoteTimeMs</code>)</td><td>Raise to 4–8 when followers lag and <code>RemoteTimeMs</code> is high. Total fetchers = this × #brokers (doc, line 97).</td></tr>
+<tr><td>Recovery</td><td><code>num.recovery.threads.per.data.dir</code> = 2 · <code>ServerLogConfigs.java:147</code></td><td>(startup time)</td><td>Raise to speed log recovery at startup / flush at shutdown on multi-disk hosts.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout gotcha"><span class="callout-title">RequestHandlerAvgIdlePercent has a measurement history — confirm it is a 0–1 gauge</span><p>This metric has been misreported repeatedly: mis-calculated (KAFKA-7295), surfaced as a <em>rate</em> by some integrations (Datadog integrations-core #516), and anomalous in KRaft combined mode (KIP-1207). Before you trust the &lt; 0.2 threshold, confirm your monitoring shows it as a fraction in [0, 1]. The defaults — 3 network, 8 I/O threads — are deliberately conservative starting points (<code>SocketServerConfigs.java:152</code>, <code>ServerConfigs.java:51</code>); real clusters routinely run higher, but only raise the pool the gauge says is starved.</p></div>
+
+<h3>Replication parallelism and the ISR-drop window</h3>
+
+<p>Followers replicate by issuing fetch requests through <code>num.replica.fetchers</code> threads (default 1). One thread per source broker fetches all that broker's leader partitions sequentially, so a single slow or hot leader can starve the rest. When a follower falls behind, the leader drops it from the ISR after <code>replica.lag.time.max.ms</code> (default <strong>30000 ms</strong>, <code>ReplicationConfigs.java:55</code>) without a successful fetch reaching the leader's LEO. The follower fetch itself blocks up to <code>replica.fetch.wait.max.ms</code> (default <strong>500 ms</strong>, <code>ReplicationConfigs.java:75</code>), and the doc is explicit that this must stay below <code>replica.lag.time.max.ms</code> to avoid frequent ISR shrinking on low-throughput topics (line 76). Each follower fetch pulls up to <code>replica.fetch.max.bytes</code> per partition (default <strong>1 MB</strong>, line 68). The durability consequences of ISR membership are the subject of Part I <a href="08-replication.html">08 · Replication</a>.</p>
+
+<div class="callout rationale"><span class="callout-title">Why high RemoteTimeMs means "raise num.replica.fetchers or fix the follower's disk"</span><p>Under <code>acks=all</code> the leader cannot ack a produce until the ISR has the record. That wait shows up as <code>RemoteTimeMs</code> in the latency breakdown. If <code>RemoteTimeMs</code> is high, the replication pipeline is the bottleneck: either the leader's write rate exceeds the followers' fetch rate (raise <code>num.replica.fetchers</code> so more partitions replicate in parallel) or a specific follower's disk/network is slow (fix the host). Jun Rao's mental model — "replicating 1000 partitions from one broker to another can add about 20 ms latency" (empirical, 2015 hardware) — explains why the single-fetcher default does not scale to thousands of partitions per broker.</p></div>
+
+<h3>Socket buffers and segment size</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config</th><th>Default</th><th>Source</th><th>Tuning</th></tr></thead>
+<tbody>
+<tr><td><code>socket.send.buffer.bytes</code></td><td>102400 (100 KB)</td><td><code>SocketServerConfigs.java:88</code></td><td>SO_SNDBUF; raise toward 1 MB on high bandwidth-delay-product links. <code>-1</code> ⇒ OS default.</td></tr>
+<tr><td><code>socket.receive.buffer.bytes</code></td><td>102400 (100 KB)</td><td><code>SocketServerConfigs.java:92</code></td><td>SO_RCVBUF; same logic. Set ≈ <code>bandwidth × RTT</code>.</td></tr>
+<tr><td><code>socket.request.max.bytes</code></td><td>104857600 (100 MB)</td><td><code>SocketServerConfigs.java:96</code></td><td>Hard cap on a single socket request.</td></tr>
+<tr><td><code>queued.max.requests</code></td><td>500</td><td><code>SocketServerConfigs.java:144</code></td><td>Request-queue depth before network threads block reading (intake backpressure).</td></tr>
+<tr><td><code>replica.socket.receive.buffer.bytes</code></td><td>65536 (64 KB)</td><td><code>ReplicationConfigs.java:64</code></td><td>SO_RCVBUF for the follower→leader replication socket.</td></tr>
+<tr><td><code>log.segment.bytes</code></td><td>1073741824 (1 GB)</td><td><code>LogConfig.java:131</code></td><td>Segment roll size. Smaller ⇒ more files/FDs/index churn; larger ⇒ coarser retention granularity.</td></tr>
+<tr><td><code>message.max.bytes</code></td><td>1 MB + overhead</td><td><code>ServerLogConfigs.java:177</code></td><td>Largest batch the broker accepts (after compression). Must be coordinated with producer <code>max.request.size</code>.</td></tr>
+</tbody>
+</table></div>
+
+<p>The bandwidth-delay product is the formula for socket buffers: <code>buffer = link_bandwidth × round-trip latency</code>. On a 10 Gbps link with 1 ms RTT that is ~1.25 MB, so the 100 KB default throttles a single high-BDP connection — raise both socket buffers (and the OS <code>net.core.rmem_max</code>/<code>wmem_max</code>) for cross-region replication or fat WAN consumers. <code>log.segment.bytes</code> is a storage-engine knob (Part I <a href="03-storage-log-engine.html">03 · Storage Log Engine</a>): smaller segments give finer retention and faster individual-segment recovery but multiply open file descriptors and <code>.index</code> mmaps, which feeds directly into the file-descriptor and <code>vm.max_map_count</code> limits below.</p>
+
+<h2>The page cache is the performance engine</h2>
+
+<p>Kafka's read and write speed comes from the OS page cache, not the JVM heap. Writes go to the page cache and are flushed by the kernel; reads of the log tail are served from the page cache; and the fetch path uses zero-copy <code>sendfile</code> to ship bytes from page cache straight to the socket without copying through user space or the heap (Part I <a href="03-storage-log-engine.html">03 · Storage Log Engine</a> and <a href="09-fetch-path.html">09 · Fetch Path</a>). The operational consequence is counter-intuitive: <strong>keep the JVM heap small so the OS has more RAM to cache the tail.</strong> Kafka does not need a heap above ~6 GB; on a 64 GB box with a 6 GB heap, roughly 28–30 GB is left for page cache (Confluent, empirical). Note that by default Kafka does <em>not</em> fsync on every write — <code>log.flush.interval.messages</code> defaults to <code>Long.MAX_VALUE</code> (<code>ServerLogConfigs.java:101</code>), i.e. flushing is left to the OS — which is precisely why durability under <code>acks=all</code> means "in the ISR's page cache," not "on disk" (see <a href="op06-durability.html">II · 06 · Durability</a>).</p>
+
+<div class="callout warning"><span class="callout-title">Cold reads evict the cache that serves your hot writes</span><p>A consumer that suddenly reads from the beginning of a large topic (a backfill, a new analytics job, a reset offset) streams cold segments off disk and into the page cache, evicting the hot tail that producers and real-time consumers depend on. The symptom is a latency spike on otherwise-healthy partitions, often with rising <code>LocalTimeMs</code>, while one consumer does a historical scan. Mitigations: isolate batch/backfill consumers, use <a href="05-tiered-storage.html">tiered storage</a> so cold data lives in object storage rather than thrashing the broker's cache, and provision page cache for roughly <code>write_throughput × 30 seconds</code> of working set (synthesized, empirical). This is the single most common "mysterious" broker latency event.</p></div>
+
+<div class="callout rationale"><span class="callout-title">Why heap ≤ 6 GB and not "more to go faster"</span><p>A large heap does not speed Kafka up; it slows it down twice. First, it steals RAM from the page cache, shrinking the cache hit rate that actually drives throughput. Second, it lengthens GC pauses — a 32 GB G1GC heap can incur 100–200 ms pauses, and a multi-second Full GC drops the broker from the ISR and triggers rebalances (empirical; LinkedIn's busy clusters hold ~21 ms p90 GC pause at &lt; 1 young-GC/sec). Use G1GC with a small heap: <code>-Xms6g -Xmx6g -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35</code>. Alert when GC P99 &gt; 50 ms (warning) / &gt; 200 ms (critical). Reserve ZGC for heaps &gt; 16 GB (rare for brokers) at ~5–10% CPU overhead. GC-induced ISR thrash is a runbook in <a href="op07-failure-modes.html">II · 07</a>.</p></div>
+
+<h2>The end-to-end latency budget</h2>
+
+<p>When a request is slow, do not guess which stage — read it. The broker decomposes every request's <code>TotalTimeMs</code> into five additive stages, each a JMX histogram under <code>kafka.network:type=RequestMetrics,name=…,request={Produce|FetchConsumer|FetchFollower}</code>. The names are compiled in at <code>server/.../network/metrics/RequestMetrics.java:48-54</code>:</p>
+
+<dl class="kv">
+<dt><code>TotalTimeMs</code> = sum of the below</dt><dd>The full server-side latency for the request (<code>RequestMetrics.java:54</code>). Plus, when throttled, <code>ThrottleTimeMs</code> (line 51).</dd>
+<dt><code>RequestQueueTimeMs</code></dt><dd>Time waiting in the request queue for a free I/O thread (<code>RequestMetrics.java:48</code>). High ⇒ too few <code>num.io.threads</code> (handler starvation).</dd>
+<dt><code>LocalTimeMs</code></dt><dd>Time the I/O thread spends doing the work locally — log append, page-cache/disk, index (<code>RequestMetrics.java:49</code>). High ⇒ disk/flush latency, page-cache misses, or GC.</dd>
+<dt><code>RemoteTimeMs</code></dt><dd>Time waiting on other brokers — for a produce with <code>acks=all</code>, waiting for ISR acks; for a fetch, waiting in delayed-fetch purgatory (<code>RequestMetrics.java:50</code>). High ⇒ slow followers / <code>min.insync.replicas</code> waits.</dd>
+<dt><code>ResponseQueueTimeMs</code></dt><dd>Time the built response waits for a network thread to send it (<code>RequestMetrics.java:52</code>). High ⇒ too few <code>num.network.threads</code>.</dd>
+<dt><code>ResponseSendTimeMs</code></dt><dd>Time actually writing the response to the socket (<code>RequestMetrics.java:53</code>). High ⇒ slow client/network, small socket buffers.</dd>
+</dl>
+
+<p>Two more diagnostic gauges from the same class: <code>MessageConversionsTimeMs</code> (line 45) flags expensive down-conversion for old clients, and <code>TemporaryMemoryBytes</code> (line 46) tracks transient memory for conversion/compression. Throttle time (<code>ThrottleTimeMs</code>, line 51) is added when a client exceeds its quota — covered in Part I <a href="19-quotas.html">19 · Quotas</a>; from the latency-budget view it is "the broker deliberately delaying you," not a fault.</p>
+
+<figure class="diagram">
+<div class="dflow"><div class="node cat-broker"><span class="nt">symptom: produce/fetch p99 high</span></div>
+<div class="conn" data-label="read RequestMetrics breakdown"></div>
+<div class="node cat-control decision">which stage dominates TotalTimeMs?</div>
+<div class="conn"></div>
+<div class="row">
+<div class="col"><div class="conn" data-label="RequestQueueTimeMs"></div><div class="node cat-broker">too few io threads → raise <code>num.io.threads</code> (RequestHandlerAvgIdlePercent low)</div></div>
+<div class="col"><div class="conn" data-label="LocalTimeMs"></div><div class="node cat-storage store">disk / page-cache miss / GC → check flush latency, cold reads, GC pauses</div></div>
+<div class="col"><div class="conn ec-async" data-label="RemoteTimeMs"></div><div class="node cat-coord">slow followers / ISR wait → raise <code>num.replica.fetchers</code>, check URP</div></div>
+<div class="col"><div class="conn" data-label="ResponseQueueTimeMs"></div><div class="node cat-broker">too few network threads → raise <code>num.network.threads</code> (NetworkProcessorAvgIdlePercent low)</div></div>
+<div class="col"><div class="conn ec-err" data-label="ThrottleTimeMs"></div><div class="node cat-error">client over quota → see Quotas (Part I 19)</div></div>
+</div>
+</div>
+<figcaption>Latency root-cause decision tree, driven by the RequestMetrics decomposition. Read the stage, fix that stage.</figcaption>
+<div class="legend"><span class="sw cat-broker"></span> thread-pool fix · <span class="sw cat-storage"></span> disk/cache · <span class="sw cat-coord"></span> replication wait · <span class="sw cat-control"></span> decision · <span class="sw cat-error"></span> quota throttle · <span class="arr"></span> sync stage · <span class="arr dashed"></span> remote/async wait.</div>
+</figure>
+
+<div class="callout key"><span class="callout-title">The latency-localization cheat sheet</span><p>High <code>RequestQueueTimeMs</code> → too few I/O threads (confirm with low <code>RequestHandlerAvgIdlePercent</code>). High <code>LocalTimeMs</code> → leader disk, page-cache miss, or GC. High <code>RemoteTimeMs</code> → slow followers or <code>acks=all</code>/<code>min.insync.replicas</code> waits (confirm with URP). High <code>ResponseQueueTimeMs</code> → too few network threads (confirm with low <code>NetworkProcessorAvgIdlePercent</code>). This is the map in <a href="op08-metrics-signals.html">II · 08 · Metrics &amp; Signals</a>; the breakdown is the first thing to pull in any latency incident.</p></div>
+
+<h2>OS-level tuning: the kernel knobs that gate Kafka</h2>
+
+<p>Because Kafka leans on the page cache, zero-copy, and thousands of memory-mapped index files, a handful of kernel settings gate its performance and stability. These are emergent limits — consequences of the architecture, not Kafka configs — and getting them wrong produces failures that look like Kafka bugs.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>OS knob</th><th>Recommended</th><th>Why (mechanism)</th></tr></thead>
+<tbody>
+<tr><td><code>vm.swappiness</code></td><td><strong>1</strong> (not 0)</td><td>Minimize swapping the JVM/page-cache to disk, which would murder latency — but <strong>1, not 0</strong>: 0 forbids swap entirely and removes the OOM safety net (Cloudera/Confluent, empirical).</td></tr>
+<tr><td><code>vm.max_map_count</code></td><td>≥ 262144</td><td>Each partition uses ~2 mmap areas (<code>.index</code> + <code>.timeindex</code>). The Linux default 65530 ⇒ a hard ceiling around <strong>~32,765 partitions/broker</strong> (Instaclustr, empirical). Must exceed your <code>.index</code> file count — see <a href="op02-limits.html">II · 02 · Limits</a>.</td></tr>
+<tr><td>open files (<code>nofile</code>)</td><td>≥ 100000</td><td><code>FDs ≈ (#partitions × partition_size / segment_size) + 1 per connection</code>; production brokers run 30k+ open handles (Jun Rao/Confluent, empirical). Too low ⇒ "Too many open files" and a downed broker.</td></tr>
+<tr><td><code>vm.dirty_background_ratio</code></td><td>~5</td><td>Start flushing dirty page-cache pages early so the kernel never has to do one giant blocking flush that spikes <code>LocalTimeMs</code>.</td></tr>
+<tr><td><code>net.core.rmem_max</code> / <code>wmem_max</code></td><td>~16 MB+</td><td>Ceiling for the socket-buffer tuning above; without it, <code>socket.send/receive.buffer.bytes</code> cannot grow to the BDP on fat links.</td></tr>
+<tr><td>filesystem</td><td>XFS, <code>noatime</code>, NVMe SSD</td><td><code>noatime</code> avoids a metadata write on every read; XFS handles Kafka's large sequential I/O well; NVMe lowers <code>LocalTimeMs</code> floor.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout gotcha"><span class="callout-title">vm.max_map_count is a silent partition ceiling</span><p>This one bites at scale, not in testing. With the Linux default of 65530 and ~2 mmaps per partition, a broker simply cannot host much beyond ~32k partitions — the JVM throws on the next mmap and the broker fails. The Instaclustr KRaft work hit exactly this when pushing toward 600k partitions/broker, and KAFKA-14204 (fixed 3.3.0) made high-partition creation painfully slow before the limit was even reached (empirical). Raise <code>vm.max_map_count</code> to ≥ 262144 <em>before</em> you grow partition counts, and treat it as a first-class capacity input in <a href="op04-capacity-planning.html">II · 04 · Capacity Planning</a>.</p></div>
+
+<h2>Putting it together: two reference profiles</h2>
+
+<p>The knobs are not independent; they compose into a posture. Two endpoints, both grounded in the defaults and mechanisms above. Treat all benchmark numbers as empirical and version/hardware-dependent — the canonical LinkedIn 2014 result is <strong>2,024,032 rec/s (193 MB/s)</strong> with three producers and async replication, but a single durable producer at <code>acks=-1</code> drops to <strong>421,823 rec/s (40.2 MB/s)</strong> — sync replication roughly halved throughput (Jay Kreps/LinkedIn, empirical). That gap <em>is</em> the durability tax, measured.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Dial</th><th>Throughput / cost profile</th><th>Latency profile</th></tr></thead>
+<tbody>
+<tr><td><code>linger.ms</code></td><td>10–100 ms (fill big batches)</td><td>0–1 ms (send immediately)</td></tr>
+<tr><td><code>batch.size</code></td><td>64 KB – 1 MB</td><td>16 KB default</td></tr>
+<tr><td><code>compression.type</code></td><td><code>lz4</code> (or <code>zstd</code> for storage)</td><td><code>none</code> or <code>lz4</code></td></tr>
+<tr><td><code>acks</code></td><td><code>all</code> (durable) — accept the round-trip</td><td><code>all</code> still preferred; <code>1</code> only if loss is tolerable</td></tr>
+<tr><td>consumer <code>fetch.min.bytes</code></td><td>raise (fatter fetches, less CPU)</td><td>1 (answer immediately)</td></tr>
+<tr><td>broker <code>num.io.threads</code></td><td>raise until <code>RequestHandlerAvgIdlePercent</code> ≥ 0.3</td><td>same gauge target</td></tr>
+<tr><td>broker <code>num.network.threads</code></td><td>raise until <code>NetworkProcessorAvgIdlePercent</code> ≥ 0.4</td><td>same gauge target</td></tr>
+<tr><td>JVM heap</td><td>~6 GB; rest → page cache</td><td>~6 GB; rest → page cache</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout invariant"><span class="callout-title">What does not change between profiles</span><p>The durability floor and the resource posture are constant. Keep <code>acks=all</code> with <code>min.insync.replicas=2</code> and RF=3 (see <a href="op06-durability.html">II · 06</a>), keep the heap small so the page cache stays large, keep <code>vm.swappiness=1</code> / <code>vm.max_map_count ≥ 262144</code> / <code>nofile ≥ 100000</code>, and always read the <code>RequestMetrics</code> breakdown and the two idle gauges before turning a knob. Latency and throughput are dials; data loss is not a dial you want to discover you turned.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

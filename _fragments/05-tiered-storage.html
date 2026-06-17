@@ -1,0 +1,430 @@
+<h1>05 · Tiered Storage (Remote Log)</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Tiered storage (KIP-405) lets a Kafka topic keep a small, hot tail of log segments on local disk while offloading older, immutable segments to an external object store. The broker-side orchestrator is <code>RemoteLogManager</code>; it drives two pluggable SPIs — <code>RemoteStorageManager</code> (RSM) for byte movement of segment data and indexes, and <code>RemoteLogMetadataManager</code> (RLMM) for tracking <code>RemoteLogSegmentMetadata</code> with strongly-consistent semantics. Leaders run a copy task that uploads eligible segments past the local-retention boundary, an expiration task that enforces remote retention, and a follower task that tracks the highest-copied offset; consumers that fetch below the local log start are served by streaming the segment back from remote storage through a thread-pooled read path, with local index files cached by <code>RemoteIndexCache</code>. The default RLMM, <code>TopicBasedRemoteLogMetadataManager</code>, persists metadata as records in the internal <code>__remote_log_metadata</code> topic.</p>
+
+<h2>Role &amp; responsibilities</h2>
+
+<p>Without tiered storage, a topic's retention is bounded by the aggregate local disk of the brokers that host its replicas. Tiered storage decouples retention from local disk: the broker copies sealed (non-active) segments to a remote object store, then deletes the corresponding local copies once they fall outside the (smaller) <em>local</em> retention. Reads for offsets that exist only in remote storage are transparently served by fetching from the object store. The <code>RemoteLogManager</code> Javadoc enumerates its duties at <code>storage/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteLogManager.java:144</code>: initialize the RSM and RLMM instances; react to leader/follower/stop-partition events; expose APIs to fetch indexes and metadata; copy log segments to remote; and clean up segments expired by remote retention.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>The contract splits cleanly: the RSM owns <em>data</em> (segment + index bytes) with only eventual-consistency requirements, while the RLMM owns <em>metadata</em> (which segment covers which offsets/epochs) with <strong>strongly consistent</strong> semantics. The broker always writes/updates RLMM metadata around every RSM data operation, so the durable source of truth about what exists in remote is the metadata, not the object store listing (<code>RemoteStorageManager.java:33</code>).</p></div>
+
+<dl class="kv">
+  <dt>Tiered storage</dt><dd>System feature enabled cluster-wide by <code>remote.log.storage.system.enable</code> (default <code>false</code>) and per-topic by <code>remote.storage.enable</code>.</dd>
+  <dt>Local retention</dt><dd>How long/large the locally-kept tail may be (<code>log.local.retention.ms</code> / <code>.bytes</code>). Always ≤ the topic's total retention.</dd>
+  <dt>Remote retention</dt><dd>Effectively the topic's total <code>retention.ms</code> / <code>retention.bytes</code>, applied to remote segments by the expiration task.</dd>
+  <dt>Copied offset</dt><dd>Highest offset known to be durably in remote storage for the partition; gates local deletion.</dd>
+  <dt>RSM / RLMM</dt><dd>The two plugin SPIs: RemoteStorageManager and RemoteLogMetadataManager.</dd>
+</dl>
+
+<h2>Where it lives in the code</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Class / interface</th><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>RemoteLogManager</code></td><td><code>storage/.../remote/storage/RemoteLogManager.java</code></td><td>Broker orchestrator: tasks, read path, quotas, plugin wiring (~2435 lines).</td></tr>
+<tr><td><code>RemoteStorageManager</code> (SPI)</td><td><code>storage/api/.../remote/storage/RemoteStorageManager.java</code></td><td>Copy / fetch / delete segment data &amp; indexes to/from object store.</td></tr>
+<tr><td><code>RemoteLogMetadataManager</code> (SPI)</td><td><code>storage/api/.../remote/storage/RemoteLogMetadataManager.java</code></td><td>Store / fetch <code>RemoteLogSegmentMetadata</code>, strongly consistent.</td></tr>
+<tr><td><code>RemoteLogSegmentMetadata</code></td><td><code>storage/api/.../remote/storage/RemoteLogSegmentMetadata.java</code></td><td>Per-segment metadata record (offsets, epochs, size, state).</td></tr>
+<tr><td><code>RemoteLogSegmentId</code></td><td><code>storage/api/.../remote/storage/RemoteLogSegmentId.java</code></td><td>Universally-unique <code>(TopicIdPartition, Uuid)</code> identifier.</td></tr>
+<tr><td><code>LogSegmentData</code></td><td><code>storage/api/.../remote/storage/LogSegmentData.java</code></td><td>Paths/buffers for the five artefacts passed to <code>copyLogSegmentData</code>.</td></tr>
+<tr><td><code>RemoteIndexCache</code></td><td><code>storage/.../internals/log/RemoteIndexCache.java</code></td><td>On-disk LFU cache of remote offset/time/txn indexes.</td></tr>
+<tr><td><code>RemoteLogReader</code> / <code>RemoteStorageThreadPool</code></td><td><code>storage/.../remote/storage/RemoteLogReader.java</code>, <code>internals/log/RemoteStorageThreadPool.java</code></td><td>Async remote read task + its bounded thread pool.</td></tr>
+<tr><td><code>TopicBasedRemoteLogMetadataManager</code></td><td><code>storage/.../remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java</code></td><td>Default RLMM backed by <code>__remote_log_metadata</code>.</td></tr>
+<tr><td><code>ConsumerTask</code> / <code>ProducerManager</code> / <code>RemoteLogMetadataCache</code></td><td><code>storage/.../remote/metadata/storage/{ConsumerTask,ProducerManager,RemoteLogMetadataCache}.java</code></td><td>Consume/produce metadata records; in-memory per-partition cache.</td></tr>
+<tr><td><code>RLMQuotaManager</code></td><td><code>storage/.../remote/quota/RLMQuotaManager.java</code></td><td>Sliding-window (sample-based) byte-rate throttling for copy &amp; fetch.</td></tr>
+<tr><td><code>RemoteLogManagerConfig</code></td><td><code>storage/.../remote/storage/RemoteLogManagerConfig.java</code></td><td>All broker-level RLM config keys &amp; defaults.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+
+<h3>The two SPIs</h3>
+
+<p><strong><code>RemoteStorageManager</code></strong> (<code>RemoteStorageManager.java:52</code>) is <code>Configurable</code> + <code>Closeable</code> and exposes exactly five operations: <code>copyLogSegmentData(metadata, LogSegmentData)</code> returning an optional <code>CustomMetadata</code>; two overloads of <code>fetchLogSegment(metadata, startPosition[, endPosition])</code> returning an <code>InputStream</code>; <code>fetchIndex(metadata, IndexType)</code> for one of the five <code>IndexType</code> values <code>OFFSET</code>, <code>TIMESTAMP</code>, <code>PRODUCER_SNAPSHOT</code>, <code>TRANSACTION</code>, <code>LEADER_EPOCH</code> (<code>RemoteStorageManager.java:57</code>); and <code>deleteLogSegmentData(metadata)</code>. Copy and delete must be <em>idempotent</em> (re-copy overwrites; delete of a missing object must not throw). Plugins signal transient failures with <code>RetriableRemoteStorageException</code> so the RLM can retry without cancelling the task (<code>RemoteStorageManager.java:47</code>).</p>
+
+<p><strong><code>RemoteLogMetadataManager</code></strong> (<code>RemoteLogMetadataManager.java:55</code>) provides async, future-returning mutators — <code>addRemoteLogSegmentMetadata</code> (must be in state <code>COPY_SEGMENT_STARTED</code>), <code>updateRemoteLogSegmentMetadata</code> (state transition), <code>putRemotePartitionDeleteMetadata</code> — plus synchronous lookups: <code>remoteLogSegmentMetadata(tpId, epoch, offset)</code>, <code>highestOffsetForEpoch</code>, <code>listRemoteLogSegments(tpId[, epoch])</code> (epoch variant sorted by start offset), <code>remoteLogSize(tpId, epoch)</code>, and the default-method <code>nextSegmentWithTxnIndex</code>. Lifecycle callbacks <code>onPartitionLeadershipChanges</code> and <code>onStopPartitions</code> tell the RLMM which partitions this broker now serves, and <code>isReady(tpId)</code> gates task execution until the partition's metadata is loaded.</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Both plugins can be loaded by a dedicated <code>ChildFirstClassLoader</code> when <code>remote.log.storage.manager.class.path</code> / <code>remote.log.metadata.manager.class.path</code> is set, isolating plugin dependencies from the broker classpath (<code>RemoteLogManager.java:389</code>, <code>:409</code>). Each plugin is wrapped via <code>Plugin.wrapInstance(...)</code> so a <code>Monitorable</code> plugin can register metrics tagged with its class name (<code>RemoteLogManager.java:402</code>, <code>:422</code>). RSM gets props prefixed <code>rsm.config.</code>; RLMM gets <code>rlmm.config.</code> plus <code>broker.id</code>, <code>log.dir</code>, <code>cluster.id</code>, and the bootstrap endpoint.</p></div>
+
+<h3>Segment state machine</h3>
+
+<p>Every remote segment moves through four states defined in <code>RemoteLogSegmentState.java:51</code>, each with a 1-byte id used on the wire:</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">add · initial</span><span class="ta"></span></span>
+  <span class="st">COPY_SEGMENT_STARTED · id 0</span>
+  <span class="tr"><span class="tl">copy ok &nbsp;·&nbsp; (also → DELETE_STARTED on copy aborted / cleanup)</span><span class="ta"></span></span>
+  <span class="st accent">COPY_SEGMENT_FINISHED · id 1</span>
+  <span class="tr"><span class="tl">retention breach</span><span class="ta"></span></span>
+  <span class="st warn">DELETE_SEGMENT_STARTED · id 2</span>
+  <span class="tr"><span class="tl">RSM delete ok</span><span class="ta"></span></span>
+  <span class="st warn">DELETE_SEGMENT_FINISHED · id 3</span>
+  <span class="tr"><span class="tl">purged from cache</span><span class="ta"></span></span>
+  <span class="term end"></span>
+</div><figcaption>RemoteLogSegmentState transitions. From <code>null</code> only COPY_SEGMENT_STARTED is legal; COPY_SEGMENT_STARTED may also jump straight to DELETE_SEGMENT_STARTED on an aborted copy; every self-transition is valid for idempotent retry / failover.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw round"></span><b>pill</b> = segment lifecycle state</span>
+  <span class="lgi"><span class="sw cat-storage round"></span>readable (COPY_SEGMENT_FINISHED only)</span>
+  <span class="lgi"><span class="sw cat-error round"></span>delete path (invisible to reads)</span>
+  <span class="lgi">● = initial · ◉ = terminal (purged)</span>
+  <span class="lgi"><span class="arr"></span>state transition (label = trigger)</span>
+  <span class="lgi"><span class="mono">id N</span> = 1-byte on-wire state id</span>
+</div></figure>
+
+<p><code>isValidTransition</code> (<code>RemoteLogSegmentState.java:90</code>) enforces the lattice: from <code>null</code> only <code>COPY_SEGMENT_STARTED</code>; a self-transition is always valid (idempotency under retry/failover); <code>COPY_SEGMENT_STARTED</code> → <code>{FINISHED, DELETE_STARTED}</code>; <code>COPY_SEGMENT_FINISHED</code> → <code>DELETE_STARTED</code>; <code>DELETE_STARTED</code> → <code>DELETE_FINISHED</code>. The cache keeps every segment that has not reached <code>DELETE_SEGMENT_FINISHED</code>; only <code>COPY_SEGMENT_FINISHED</code> segments are visible to reads (<code>RemoteLogMetadataCache.java:78</code> table).</p>
+
+<h2>Data structures</h2>
+
+<h3>RemoteLogSegmentId &amp; RemoteLogSegmentMetadata</h3>
+
+<p><code>RemoteLogSegmentId</code> is <code>(TopicIdPartition topicIdPartition, Uuid id)</code> with a fresh random <code>Uuid</code> generated for <em>each copy attempt</em> via <code>generateNew</code> (<code>RemoteLogSegmentId.java:40</code>). Re-uploading the same segment after a failure produces a new id, which is how copy stays idempotent without coordinating on object names.</p>
+
+<p><code>RemoteLogSegmentMetadata</code> (<code>RemoteLogSegmentMetadata.java:37</code>) carries the field set below. Note the constructor invariants: <code>startOffset ≥ 0</code>, <code>endOffset ≥ startOffset</code>, and <code>segmentLeaderEpochs</code> must be non-empty (a single-epoch segment still maps that epoch → its start offset). It extends <code>RemoteLogMetadata</code>, which adds <code>brokerId</code> and <code>eventTimestampMs</code>.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>remoteLogSegmentId</code></td><td><code>RemoteLogSegmentId</code></td><td>Unique id (topic-id-partition + uuid).</td></tr>
+<tr><td><code>startOffset</code> / <code>endOffset</code></td><td><code>long</code></td><td>Inclusive offset range of the segment.</td></tr>
+<tr><td><code>maxTimestampMs</code></td><td><code>long</code></td><td>Largest record timestamp; drives time-based remote retention.</td></tr>
+<tr><td><code>segmentLeaderEpochs</code></td><td><code>NavigableMap&lt;Integer,Long&gt;</code></td><td>Leader-epoch → start-offset lineage within the segment (immutable <code>TreeMap</code>).</td></tr>
+<tr><td><code>segmentSizeInBytes</code></td><td><code>int</code></td><td>Size of the segment data; drives size-based retention &amp; lag.</td></tr>
+<tr><td><code>customMetadata</code></td><td><code>Optional&lt;CustomMetadata&gt;</code></td><td>Opaque RSM-returned bytes (e.g. object path/size). Size-capped.</td></tr>
+<tr><td><code>state</code></td><td><code>RemoteLogSegmentState</code></td><td>Lifecycle state (see above).</td></tr>
+<tr><td><code>txnIdxEmpty</code></td><td><code>boolean</code></td><td>True if the segment has no transaction index (skip txn fetch).</td></tr>
+<tr><td><code>brokerId</code> / <code>eventTimestampMs</code></td><td><code>int</code> / <code>long</code></td><td>Origin broker &amp; event time (from <code>RemoteLogMetadata</code> base).</td></tr>
+</tbody>
+</table></div>
+
+<p><code>createWithUpdates(RemoteLogSegmentMetadataUpdate)</code> (<code>RemoteLogSegmentMetadata.java:310</code>) produces a new immutable instance with the update's <code>brokerId</code>, <code>eventTimestampMs</code>, <code>customMetadata</code>, and <code>state</code> applied — offsets, epochs, and size are carried over unchanged. <code>CustomMetadata</code> (<code>RemoteLogSegmentMetadata.java:384</code>) wraps a <code>byte[]</code> whose accepted maximum is <code>remote.log.metadata.custom.metadata.max.bytes</code> (default 128; <code>RemoteLogManagerConfig.java:88</code>).</p>
+
+<h3>LogSegmentData — the five artefacts</h3>
+
+<p><code>copyLogSegmentData</code> receives a <code>LogSegmentData</code> bundling the segment and its auxiliary indexes (<code>LogSegmentData.java:29</code>): <code>logSegment</code> (the <code>.log</code> file), <code>offsetIndex</code> (<code>.index</code>), <code>timeIndex</code> (<code>.timeindex</code>), <code>transactionIndex</code> (<code>Optional&lt;Path&gt;</code>, may be absent), <code>producerSnapshotIndex</code> (the producer-state snapshot at the <em>next</em> segment's base offset), and <code>leaderEpochIndex</code> — a <code>ByteBuffer</code> rather than a path. The RLM builds that buffer by serializing the leader-epoch checkpoint entries up to the next base offset via <code>epochEntriesAsByteBuffer</code> using the <code>LeaderEpochCheckpointFile.FORMATTER</code> (<code>RemoteLogManager.java:2256</code>).</p>
+
+<h3>On-wire metadata record &amp; on-disk index files</h3>
+
+<p>The default RLMM serializes each <code>RemoteLogMetadata</code> event to bytes with <code>RemoteLogMetadataSerde</code> and produces it as the value of a record on <code>__remote_log_metadata</code> (key is <code>null</code>; partition is chosen explicitly — see partitioner below) (<code>ProducerManager.java:83</code>). On the read path, the local index files cached by <code>RemoteIndexCache</code> are named <code>{startOffset}_{uuid}{suffix}</code>, e.g. <code>45_&lt;uuid&gt;.index</code> / <code>.timeindex</code> / <code>.txnindex</code>, under <code>$logdir/remote-log-index-cache</code> (<code>RemoteIndexCache.java:713</code>, <code>:83</code>). A remote segment's data stream is parsed batch-by-batch by <code>RemoteLogInputStream</code>, which reads the fixed log header up to the magic byte, derives the batch size from the <code>SIZE_OFFSET</code> field, allocates <code>LOG_OVERHEAD + size</code> bytes, and constructs a <code>DefaultRecordBatch</code> (magic &gt; v1) over that buffer (<code>clients/.../record/internal/RemoteLogInputStream.java:41</code>).</p>
+
+<h2>Architecture &amp; control/data flow</h2>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">produce</span><span class="nd">client append</span></div>
+  <div class="conn ec-data"></div>
+  <div class="node cat-storage store"><span class="nt">UnifiedLog</span><span class="nd">local log — active · sealed · local-retention boundary</span></div>
+  <div class="conn" data-label="sealed segments · LSO"></div>
+  <div class="node cat-broker"><span class="nt">RemoteLogManager</span><span class="nd">broker orchestrator (leader)</span></div>
+  <div class="conn dashed ec-async" data-label="deleteOldSegments — guarded by highestOffsetInRemoteStorage (↑ back to UnifiedLog)"></div>
+  <div class="node cat-broker"><span class="nt">copy &amp; read paths</span><span class="nd">RemoteLogManager fans out ↓</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="metadata"></div>
+      <div class="node cat-storage store"><span class="nt">RLMM (SPI)</span><span class="nd">add COPY_STARTED ⇒ update COPY_FINISHED · <code>__remote_log_metadata</code></span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="copyLogSegmentData"></div>
+      <div class="node cat-broker"><span class="nt">RSM (SPI)</span><span class="nd">PUT segment + indexes</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="fetch &lt; local log start"></div>
+      <div class="node cat-coord"><span class="nt">RemoteStorageThreadPool</span><span class="nd">RemoteLogReader.call ⇒ rlm.read</span></div>
+      <div class="conn" data-label="fetchLogSegment / fetchIndex"></div>
+      <div class="node cat-broker"><span class="nt">RSM (SPI)</span><span class="nd">GET bytes</span></div>
+    </div>
+  </div>
+  <div class="conn" data-label="PUT / GET bytes"></div>
+  <div class="node cat-storage store"><span class="nt">object store</span><span class="nd">S3 · GCS · ABS · HDFS</span></div>
+</div><figcaption>Copy path writes RLMM metadata then PUTs bytes via the RSM; the read path streams a remote segment back through the thread pool on a fetch below the local log start. Local deletion is gated by the highest remotely-stored offset.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client / produce</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker component (RLM · RSM)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>log / metadata / object store</span>
+  <span class="lgi"><span class="sw cat-coord"></span>remote read thread pool</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = log / store</span>
+  <span class="lgi"><span class="arr"></span>data / control flow</span>
+  <span class="lgi"><span class="arr dashed cat-coord"></span>deletion guard (feedback)</span>
+</div></figure>
+
+<h3>Task model on leadership change</h3>
+
+<p><code>onLeadershipChange(becomeLeader, becomeFollower, topicIds)</code> (<code>RemoteLogManager.java:469</code>) filters to partitions whose <code>UnifiedLog.remoteLogEnabled()</code> is true, caches topic-id ↔ partition mappings, notifies the RLMM via <code>onPartitionLeadershipChanges</code>, then installs tasks. Leaders get a <code>RLMCopyTask</code> (only if <code>remote.log.copy.disable=false</code>) <em>and</em> a <code>RLMExpirationTask</code>; followers get a <code>RLMFollowerTask</code> (<code>doHandleLeaderPartition</code> at <code>:2150</code>, <code>doHandleFollowerPartition</code> at <code>:2176</code>). Each task is scheduled with <code>scheduleWithFixedDelay(task, 0, remote.log.manager.task.interval.ms, MS)</code> on its pool. Converting roles cancels the opposing tasks first via <code>RLMTaskWithFuture.cancel()</code>, which sets a volatile <code>cancelled</code> flag and calls <code>future.cancel(true)</code> (<code>:2207</code>).</p>
+
+<h2>Detailed mechanics</h2>
+
+<h3>The copy task</h3>
+
+<p><code>RLMCopyTask.execute</code> (<code>RemoteLogManager.java:880</code>) first resets per-task state if the log directory changed (an alter-logdir guard, KAFKA-16711), then calls <code>copyLogSegmentsToRemote(log)</code>. The algorithm (<code>:996</code>):</p>
+
+<ol>
+<li><strong>Establish offsets.</strong> On first run after becoming leader, <code>maybeUpdateLogStartOffsetOnBecomingLeader</code> computes the remote log-start via <code>findLogStartOffset</code> (start offset of the earliest segment found by walking leader epochs from the earliest entry forward; falls back to <code>localLogStartOffset</code>) and pushes it through <code>updateRemoteLogStartOffset</code> (<code>:892</code>, <code>:2121</code>). <code>maybeUpdateCopiedOffset</code> computes the highest already-copied offset via <code>findHighestRemoteOffset</code> — walking leader epochs from the latest entry backward, asking the RLMM <code>highestOffsetForEpoch</code>, and reconciling against the epoch's end offset (<code>:902</code>, <code>:2091</code>). It seeds <code>log.updateHighestOffsetInRemoteStorage(...)</code>.</li>
+<li><strong>Select candidates.</strong> With <code>copiedOffset</code> and the partition's last-stable-offset (LSO), <code>candidateLogSegments(log, fromOffset, lso)</code> returns all sealed segments (never the active segment) whose base offset ≤ LSO, in order, stopping at the first segment that is not yet eligible by copy-lag (<code>:925</code>). <code>fromOffset = max(copiedOffset+1, logStartOffset)</code>.</li>
+<li><strong>Copy-lag gate.</strong> <code>isEligibleForUpload</code> (<code>:949</code>) returns true immediately if either <code>remote.copy.lag.ms</code> or <code>remote.copy.lag.bytes</code> is 0 (the short-circuit at <code>:957</code> is an <code>||</code>); otherwise a segment is eligible if its age (now − <code>largestTimestamp</code>) ≥ copy-lag-ms, or the bytes of log <em>after</em> the segment ≥ copy-lag-bytes.</li>
+<li><strong>Quota wait.</strong> Before each segment, under <code>copyQuotaManagerLock</code>, the task polls <code>rlmCopyQuotaManager.getThrottleTimeMs()</code> and, while &gt; 0, records the throttle and <code>await</code>s on <code>copyQuotaManagerLockCondition</code> for up to <code>quotaTimeout()</code> = 1 s, re-checking each cycle; on clearance it records the segment's byte size against the quota and signals other waiters (<code>:1028</code>).</li>
+<li><strong>Per-segment copy.</strong> The caller <code>copyLogSegmentsToRemote</code> generates a fresh <code>RemoteLogSegmentId</code> via <code>generateNew</code> (<code>:1049</code>) and registers it in <code>segmentIdsBeingCopied</code> (<code>:1050</code>), then passes it to <code>copyLogSegment</code> (<code>:1079</code>), which builds the <code>COPY_SEGMENT_STARTED</code> metadata (offsets, <code>largestTimestamp</code>, size, segment leader epochs, <code>isTxnIdxEmpty</code>), and <code>addRemoteLogSegmentMetadata(...).get()</code> — blocking until the RLMM persists it. It then assembles <code>LogSegmentData</code> and calls <code>RSM.copyLogSegmentData</code>. On success it writes <code>COPY_SEGMENT_FINISHED</code> via <code>updateRemoteLogSegmentMetadata(...).get()</code>, advances the in-memory <code>copiedOffsetOption</code> to <code>(endOffset, lastEpochInSegment)</code>, and calls <code>log.updateHighestOffsetInRemoteStorage(endOffset)</code>.</li>
+</ol>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">generate uuid</span><span class="nd">RemoteLogSegmentId.generateNew</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage store"><span class="nt">add COPY_SEGMENT_STARTED</span><span class="nd">RLMM · blocking <code>add(…).get()</code></span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">RSM.copyLogSegmentData(meta, LogSegmentData)</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-err dashed" data-label="RetriableRemoteStorageException"></div>
+      <div class="node cat-error"><span class="nt">rethrow</span><span class="nd">task retries next tick</span></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-err" data-label="RemoteStorageException"></div>
+      <div class="node cat-error"><span class="nt">deleteRemoteLogSegment</span><span class="nd">cleanup ⇒ rethrow</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="ok ⇒ customMetadata"></div>
+      <div class="node cat-storage decision">size &gt; custom.metadata.max.bytes?</div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn ec-err" data-label="yes"></div>
+          <div class="node cat-error"><span class="nt">cleanup + throw</span><span class="nd">CustomMetadataSizeLimitExceeded ⇒ cancel task</span></div>
+        </div>
+        <div class="col">
+          <div class="conn" data-label="no"></div>
+          <div class="node cat-storage store"><span class="nt">update COPY_SEGMENT_FINISHED</span><span class="nd">RLMM · blocking <code>update(…).get()</code></span></div>
+          <div class="conn"></div>
+          <div class="node cat-broker"><span class="nt">copiedOffset := endOffset</span><span class="nd">log.updateHighestOffsetInRemoteStorage(endOffset)</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>copyLogSegment failure handling (<code>RemoteLogManager.java:1079</code>). The highest remote offset advances only after COPY_SEGMENT_FINISHED is durable, so a mid-copy crash can never orphan local data.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker step (RLM · RSM call)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>RLMM metadata write</span>
+  <span class="lgi"><span class="sw cat-error"></span>failure / abort path</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = metadata store</span>
+  <span class="lgi">rounded = decision / branch</span>
+  <span class="lgi"><span class="arr"></span>success flow</span>
+  <span class="lgi"><span class="arr cat-error"></span>error throw</span>
+  <span class="lgi"><span class="arr dashed cat-error"></span>retriable (retry next tick)</span>
+</div></figure>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A local segment is only eligible for deletion once it is fully in remote. <code>UnifiedLog.isSegmentEligibleForDeletion</code> requires <code>upperBoundOffset − 1 ≤ highestOffsetInRemoteStorage()</code> (or that the log-start-offset was incremented past it) when remote copy is enabled (<code>storage/.../internals/log/UnifiedLog.java:1857</code>). Because <code>copyLogSegment</code> only advances <code>highestOffsetInRemoteStorage</code> <em>after</em> the <code>COPY_SEGMENT_FINISHED</code> metadata is durable, a crash mid-copy can never orphan data: the local copy survives and the next leader re-copies.</p></div>
+
+<h3>Custom-metadata overflow</h3>
+
+<p>If the RSM returns <code>CustomMetadata</code> larger than the configured cap, the task does <em>not</em> store the finished update; instead it reconstructs the finished metadata only to delete the just-copied data, throws <code>CustomMetadataSizeLimitExceededException</code>, and <code>cancel()</code>s the copy task for that partition (<code>RemoteLogManager.java:1128</code>, caught at <code>:1061</code>). This stops further copying for the partition until intervention, surfacing as <code>failedRemoteCopyRequestRate</code>.</p>
+
+<h3>The follower task</h3>
+
+<p>Followers do not copy; <code>RLMFollowerTask.execute</code> simply calls <code>findHighestRemoteOffset</code> and <code>log.updateHighestOffsetInRemoteStorage(...)</code> (<code>RemoteLogManager.java:1662</code>). This keeps a follower's local deletion guard in sync so that when it later becomes leader (or while it serves follower fetches) it will not delete local segments that the cluster believes are not yet remote.</p>
+
+<h3>The expiration task — remote retention</h3>
+
+<p><code>RLMExpirationTask.cleanupExpiredRemoteLogSegments</code> (<code>RemoteLogManager.java:1410</code>) enforces remote retention and removes dangling/unreferenced segments. Step by step:</p>
+
+<ol>
+<li><strong>Tally.</strong> <code>calculateMetadataAndSize</code> iterates all segments to compute metadata count, total tracked size, and the size of only <code>COPY_SEGMENT_FINISHED</code> segments; these feed gauges <code>RemoteLogMetadataCount</code> and <code>RemoteLogSizeBytes</code> (<code>:1383</code>).</li>
+<li><strong>Build retention contexts.</strong> <code>buildRetentionTimeData(retention.ms)</code> yields a <code>cleanupUntilMs = now − retentionMs</code> threshold (only if <code>retentionMs &gt; -1</code> and the threshold is ≥ 0) (<code>:1575</code>). <code>buildRetentionSizeData(...)</code> computes how many remote bytes breach <code>retention.bytes</code>, validating each finished segment against the current leader-epoch lineage (<code>:1594</code>). The first time, it iterates and sums valid segments; once it proves all segments are valid (<code>isAllSegmentsValid</code>) it short-circuits to the cheaper cached size.</li>
+<li><strong>Iterate epochs in order.</strong> For each leader epoch, for each segment (sorted by start offset): skip segments currently being copied (sets <code>canProcess=false</code>, <code>:1465</code>); re-publish a delete for any segment stuck in <code>DELETE_SEGMENT_STARTED</code> (dangling-delete retry, <code>:1473</code>); decide deletion via, in priority order, log-start-offset breach (<code>isSegmentBreachByLogStartOffset</code>), then — if the segment is within the leader-epoch lineage — retention-time breach, then retention-size breach (<code>:1488</code>).</li>
+<li><strong>Advance remote log-start.</strong> Each deletion reason records the candidate's <code>endOffset + 1</code>; the maximum is pushed via <code>handleLogStartOffsetUpdate</code> <em>before</em> the actual deletes, so followers can pick up the new log-start even if this leader later fails the deletes (<code>:1509</code>; the code's comment at <code>:1511</code> reasons through leader-change races).</li>
+<li><strong>Delete.</strong> Each candidate goes through <code>deleteRemoteLogSegment</code> (<code>:1677</code>): publish <code>DELETE_SEGMENT_STARTED</code> → <code>RSM.deleteLogSegmentData</code> → publish <code>DELETE_SEGMENT_FINISHED</code>, all blocking, with remote-delete request/failure rates marked.</li>
+<li><strong>Unreferenced cleanup.</strong> Finally it deletes segments whose leader epochs are all below the leader's earliest known epoch — unreferenced after unclean leader election (<code>deleteLogSegmentsDueToLeaderEpochCacheTruncation</code>, <code>:1340</code>, driven from <code>:1539</code>).</li>
+</ol>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Remote retention is computed against the partition's <strong>leader-epoch lineage</strong>, not a flat segment list. <code>isRemoteSegmentWithinLeaderEpochs</code> (<code>RemoteLogManager.java:1728</code>) validates that a remote segment's epoch/offset boundaries are consistent with the current leader's filtered epoch map, handling overlapping segments produced across leader elections. Segments outside the lineage are treated as unreferenced and removed separately. This is what makes tiered storage correct across unclean failovers where the remote store can hold segments from divergent histories.</p></div>
+
+<h3>The remote read path</h3>
+
+<p>When a consumer fetch targets an offset below the local log start, <code>ReplicaManager.handleOffsetOutOfRangeError</code> detects <code>logStartOffset ≤ offset &lt; localLogStartOffset</code> and routes to remote (<code>core/.../server/ReplicaManager.scala:1904</code>). It first consults the <em>fetch</em> quota: if <code>remoteLogManager.getFetchThrottleTimeMs &gt; 0</code>, it returns an empty <code>FetchDataInfo</code> with <code>UNKNOWN_OFFSET_METADATA</code> (so other partitions in the request can still be served via delayed fetch) instead of scheduling a remote read (<code>ReplicaManager.scala:1917</code>). Otherwise it builds a <code>RemoteStorageFetchInfo</code> and the fetch becomes a <code>DelayedRemoteFetch</code>; <code>processRemoteFetch</code> calls <code>rlm.asyncRead(fetchInfo, callback)</code> (<code>ReplicaManager.scala:1610</code>).</p>
+
+<p><code>asyncRead</code> submits a <code>RemoteLogReader</code> to the bounded <code>remoteStorageReaderThreadPool</code> (<code>RemoteLogManager.java:2145</code>). <code>RemoteLogReader.call()</code> times <code>rlm.read(fetchInfo)</code> against the <code>remoteReadTimer</code>, records bytes against the fetch quota, and invokes the callback with a <code>RemoteLogReadResult</code> (<code>RemoteLogReader.java:61</code>). The heavy lifting is <code>RemoteLogManager.read</code> (<code>:1834</code>):</p>
+
+<ol>
+<li>Resolve the leader epoch for the fetch offset from the leader-epoch cache and look up the covering <code>RemoteLogSegmentMetadata</code> via the RLMM; if none, throw <code>OffsetOutOfRangeException</code> (<code>:1852</code>).</li>
+<li><code>lookupPositionForOffset</code> uses <code>RemoteIndexCache.lookupOffset</code> on the cached offset index to get a byte <code>startPos</code> (<code>:1933</code>); open <code>RSM.fetchLogSegment(meta, startPos)</code> and wrap it in a <code>RemoteLogInputStream</code>.</li>
+<li><code>findFirstBatch</code> scans forward, skipping batches whose <code>lastOffset &lt; offset</code>, summing <code>skippedBytes</code> (<code>:2077</code>). If a segment is exhausted (e.g. the offset was compacted away), <code>findNextSegmentMetadata</code> advances to the next segment and repeats (<code>:1870</code>).</li>
+<li>Copy the first batch plus as many subsequent bytes as fit into a <code>min(fetchMaxBytes, partition.maxBytes)</code> buffer; honour <code>minOneMessage</code> by returning at least the first batch even if it exceeds the cap, or an empty result if not (<code>:1887</code>).</li>
+<li>If isolation is <code>TXN_COMMITTED</code>, <code>addAbortedTransactions</code> walks the txn indexes of this and following segments (then local segments) up to the fetch upper bound, accumulating aborted-transaction markers for the client to filter (<code>:1937</code>, <code>:1979</code>).</li>
+</ol>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">consumer fetch</span><span class="nd">offset below localLogStartOffset</span></div>
+  <div class="conn ec-data"></div>
+  <div class="node cat-broker"><span class="nt">ReplicaManager.readFromLog</span><span class="nd">⇒ OffsetOutOfRange</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">handleOffsetOutOfRangeError</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord decision">getFetchThrottleTimeMs &gt; 0 — throttled?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-err" data-label="yes"></div>
+      <div class="node cat-error"><span class="nt">empty FetchDataInfo · no remote read</span><span class="nd">request shed — consumer retries later</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-broker"><span class="nt">RemoteStorageFetchInfo ⇒ DelayedRemoteFetch</span><span class="nd">rlm.asyncRead(fetchInfo, callback)</span></div>
+      <div class="conn"></div>
+      <div class="node cat-coord"><span class="nt">RemoteLogReader.call ⇒ rlm.read</span><span class="nd">on a RemoteStorageThreadPool thread ↓</span></div>
+      <div class="conn ec-async" data-label="rlm.read"></div>
+      <div class="node cat-storage store"><span class="nt">RLMM.remoteLogSegmentMetadata(epoch, offset)</span><span class="nd">resolve covering segment</span></div>
+      <div class="conn ec-async"></div>
+      <div class="node cat-storage store"><span class="nt">RemoteIndexCache.lookupOffset ⇒ startPos</span><span class="nd">cached offset index</span></div>
+      <div class="conn ec-async"></div>
+      <div class="node cat-broker"><span class="nt">RSM.fetchLogSegment(meta, startPos)</span><span class="nd">⇒ InputStream</span></div>
+      <div class="conn ec-async"></div>
+      <div class="node cat-broker"><span class="nt">RemoteLogInputStream.findFirstBatch</span><span class="nd">fill buffer ⇒ (aborted txns)</span></div>
+      <div class="conn"></div>
+      <div class="node cat-client"><span class="nt">callback completes DelayedRemoteFetch</span><span class="nd">response to client</span></div>
+    </div>
+  </div>
+</div><figcaption>Remote fetch lifecycle. A fetch below the local log start either is shed when the fetch quota is exceeded, or runs <code>rlm.read</code> on the bounded remote-storage thread pool (metadata lookup → index → segment stream → first batch) before the delayed fetch completes.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>consumer / client response</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker (ReplicaManager · RSM)</span>
+  <span class="lgi"><span class="sw cat-coord"></span>throttle gate · remote read pool</span>
+  <span class="lgi"><span class="sw cat-storage"></span>metadata / index lookup</span>
+  <span class="lgi"><span class="sw cat-error"></span>shed (quota exceeded)</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = store / cache</span>
+  <span class="lgi">rounded = decision</span>
+  <span class="lgi"><span class="arr"></span>request flow</span>
+  <span class="lgi"><span class="arr cat-coord"></span>async on read-pool thread</span>
+</div></figure>
+
+<h3>RemoteIndexCache</h3>
+
+<p>Re-downloading index files for every remote fetch would be ruinous, so <code>RemoteIndexCache</code> keeps offset/time/txn indexes on local disk under <code>$logdir/remote-log-index-cache</code> and memory-maps them (<code>RemoteIndexCache.java:78</code>). It is a Caffeine cache weighted by entry byte size with maximum weight <code>remote.log.index.file.cache.total.size.bytes</code> (default 1 GiB) and optional <code>expireAfterAccess</code> = <code>remote.log.index.file.cache.ttl.ms</code> (default 900 000 ms; -1 disables) (<code>:171</code>). On a miss, <code>loadIndexFile</code> downloads via <code>RSM.fetchIndex</code> into a <code>.tmp</code> file and atomically renames it into place, then opens and sanity-checks the index; a missing transaction index (<code>RemoteResourceNotFoundException</code>) is tolerated by writing an empty file (<code>:362</code>, <code>:441</code>). On startup, <code>init()</code> deletes leftover <code>.tmp</code>/<code>.deleted</code> files and re-hydrates entries from any complete triplet on disk (<code>:275</code>).</p>
+
+<p>Eviction is two-phase to avoid mutating files under in-flight reads. The Caffeine <code>evictionListener</code> only <em>enqueues</em> the entry; the dedicated <code>remote-log-index-cleaner</code> <code>KafkaScheduler</code> thread runs <code>markForCleanup</code> (rename to <code>.deleted</code>) then <code>cleanup</code> (delete) after a <code>fileDeleteDelayMs</code> (10 s) delay (<code>:195</code>, <code>:248</code>). Concurrency uses a class-level <code>ReadWriteLock</code> (reads take the read lock; <code>close</code>/<code>resize</code> take the write lock) plus a per-<code>Entry</code> <code>ReentrantReadWriteLock</code> so cleanup never races a lookup (<code>:99</code>, <code>:518</code>). The class doc notes the policy is Caffeine's Window-TinyLfu.</p>
+
+<h2>The default RLMM: TopicBasedRemoteLogMetadataManager</h2>
+
+<p>The default metadata store persists every event as a record in the internal compaction-disabled topic <code>__remote_log_metadata</code> (<code>TopicBasedRemoteLogMetadataManagerConfig.java:44</code>). The topic defaults: 50 partitions, replication factor 3, <code>min.insync.replicas</code> 2, cleanup policy <code>delete</code>, retention <code>-1</code> (unlimited) (<code>:54</code>, <code>newRemoteLogMetadataTopic</code> at <code>TopicBasedRemoteLogMetadataManager.java:432</code>). Because retention is unlimited by default and the topic is delete-not-compact, the full event history is replayable.</p>
+
+<h3>Producing &amp; the read-your-writes guarantee</h3>
+
+<p><code>storeRemoteLogMetadata</code> publishes the event through <code>ProducerManager</code> (an idempotent, <code>acks=all</code> <code>KafkaProducer</code>; <code>ProducerManager.java:48</code>, <code>TopicBasedRemoteLogMetadataManagerConfig.java:238</code>) and then chains a stage that blocks until the local <code>ConsumerManager</code> has consumed up to that record's offset (<code>TopicBasedRemoteLogMetadataManager.java:153</code>). That is how the RLM's blocking <code>add(...).get()</code> / <code>update(...).get()</code> calls get strong consistency: the future does not complete until the in-memory cache reflects the write. The deterministic partition for a user partition is computed by <code>RemoteLogMetadataTopicPartitioner.metadataPartition</code> = <code>murmur2(hash(topicId, partition)) mod numMetadataPartitions</code> (<code>RemoteLogMetadataTopicPartitioner.java:35</code>) — both producer and consumer use it so all events for a user partition land on one metadata partition.</p>
+
+<h3>Consuming &amp; the in-memory cache</h3>
+
+<p>A single <code>ConsumerTask</code> thread polls the assigned metadata partitions and applies each deserialized event to a <code>RemotePartitionMetadataEventHandler</code> (<code>ConsumerTask.java:65</code>, <code>:166</code>). Assignment is keyed by <em>metadata</em> partition, not user partition: when partitions are assigned, the task computes the set of metadata partitions, <code>consumer.assign(...)</code>s them, seeks newly-assigned ones to the beginning (full replay) and others to the last processed offset (<code>:224</code>). A user partition is marked <em>ready</em> only once the consumer has read up to the metadata partition's end offset at assignment time, or the metadata partition is empty (<code>maybeMarkUserPartitionsAsReady</code>, <code>:185</code>); until then <code>isReady(tpId)</code> is false and the RLM skips that partition's tasks and read requests.</p>
+
+<p>The handler delegates to a per-user-partition <code>RemoteLogMetadataCache</code> (<code>RemoteLogMetadataCache.java:96</code>). It holds two maps: <code>idToSegmentMetadata</code> (segment-id → metadata for all non-terminal segments) and <code>leaderEpochEntries</code> (leader epoch → <code>RemoteLogLeaderEpochState</code> tracking the floor structure and highest offset per epoch). Lookups respect state: <code>remoteLogSegmentMetadata(epoch, offset)</code> returns only <code>COPY_SEGMENT_FINISHED</code> segments and verifies the offset lies within the epoch's boundary inside that segment (<code>:132</code>); <code>listRemoteLogSegments(epoch)</code> returns started, finished, and delete-started (for cleanup) but never delete-finished. State updates run through <code>checkStateTransition</code> and drop invalid transitions rather than corrupting the cache (<code>:344</code>); a <code>DELETE_SEGMENT_FINISHED</code> event removes the segment entirely (<code>:240</code>).</p>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>The default RLMM is <em>fail-fast on initialization</em>. <code>initializeResources</code> creates/validates the metadata topic and starts the producer/consumer; if it cannot succeed within <code>remote.log.metadata.initialization.retry.max.timeout.ms</code> (default 120 s) it calls <code>Exit.exit(1)</code> — the broker process terminates (<code>TopicBasedRemoteLogMetadataManager.java:316</code>, <code>:370</code>). Likewise, if the metadata topic's partition count drifts from the configured count, initialization fails. Initialization itself is deferred until <code>onBrokerReady()</code> so the local cluster is up before the broker tries to use it as a client (<code>:391</code>).</p></div>
+
+<h2>Concurrency &amp; threading</h2>
+
+<p>The RLM runs several distinct pools, all created in the constructor (<code>RemoteLogManager.java:256</code>):</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Pool / thread</th><th>Type</th><th>Threads (config)</th><th>Work</th></tr></thead>
+<tbody>
+<tr><td><code>RLMCopyThreadPool</code> (<code>kafka-rlm-copy-thread-pool-%d</code>)</td><td><code>ScheduledThreadPoolExecutor</code></td><td><code>remote.log.manager.copier.thread.pool.size</code> = 10</td><td>Runs <code>RLMCopyTask</code> per leader partition at fixed delay.</td></tr>
+<tr><td><code>RLMExpirationThreadPool</code> (<code>kafka-rlm-expiration-thread-pool-%d</code>)</td><td><code>ScheduledThreadPoolExecutor</code></td><td><code>remote.log.manager.expiration.thread.pool.size</code> = 10</td><td>Runs <code>RLMExpirationTask</code> per leader partition.</td></tr>
+<tr><td><code>RLMFollowerScheduledThreadPool</code> (<code>kafka-rlm-follower-thread-pool-%d</code>)</td><td><code>ScheduledThreadPoolExecutor</code></td><td><code>remote.log.manager.follower.thread.pool.size</code> = 2</td><td>Runs <code>RLMFollowerTask</code> to track highest-copied offset.</td></tr>
+<tr><td><code>remote-log-reader-%d</code></td><td><code>RemoteStorageThreadPool</code> (<code>ThreadPoolExecutor</code>)</td><td><code>remote.log.reader.threads</code> = 10, queue <code>remote.log.reader.max.pending.tasks</code> = 100</td><td>Executes <code>RemoteLogReader</code> / <code>RemoteLogOffsetReader</code> for remote fetch &amp; list-offsets.</td></tr>
+<tr><td><code>remote-log-index-cleaner</code></td><td><code>KafkaScheduler</code> (1 thread)</td><td>fixed</td><td>Renames &amp; deletes evicted index files after a delay.</td></tr>
+<tr><td><code>RLMMInitializationThread</code> + <code>ConsumerTask</code> thread</td><td>plain threads</td><td>1 each</td><td>RLMM bootstrap; consume <code>__remote_log_metadata</code>.</td></tr>
+</tbody>
+</table></div>
+
+<p>The scheduled pools set <code>removeOnCancelPolicy(true)</code> and disable running delayed/periodic tasks after shutdown (<code>RemoteLogManager.java:2324</code>). Each scheduled task starts with a fast <code>isCancelled()</code> / <code>isReady()</code> guard (<code>:826</code>) so a cancelled-then-rescheduled task exits cheaply. State that crosses threads is protected as follows:</p>
+
+<ul>
+<li><strong>Task registries</strong> — <code>leaderCopyRLMTasks</code>, <code>leaderExpirationRLMTasks</code>, <code>followerRLMTasks</code> are <code>ConcurrentHashMap</code>s, mutated with <code>computeIfAbsent</code>/<code>computeIfPresent</code> so install/cancel are atomic (<code>:184</code>).</li>
+<li><strong>In-flight copies</strong> — <code>segmentIdsBeingCopied</code> is a concurrent set; the expiration task consults it to avoid deleting a segment mid-copy (<code>:187</code>, <code>:1465</code>).</li>
+<li><strong>Copy quota</strong> — a fair <code>ReentrantLock</code> <code>copyQuotaManagerLock</code> with a <code>Condition</code> serializes copy threads so they wait and re-check the byte-rate together (<code>:169</code>, <code>:1028</code>).</li>
+<li><strong>Per-task offsets</strong> — <code>copiedOffsetOption</code>, <code>isLogStartOffsetUpdated</code>, <code>logDirectory</code> are <code>volatile</code> within each <code>RLMCopyTask</code> (single executor thread mutates them; reads may come from cancel paths) (<code>:870</code>).</li>
+<li><strong>Index cache</strong> — class-level <code>ReadWriteLock</code> + per-entry lock as described above.</li>
+</ul>
+
+<h2>Quotas &amp; throttling</h2>
+
+<p>Two independent <code>RLMQuotaManager</code>s bound aggregate (broker-global, all-partition) byte rates: copy (local→remote) and fetch (remote→local), both defaulting to <code>Long.MAX_VALUE</code> (unbounded) (<code>RemoteLogManager.java:366</code>, <code>:372</code>). Each uses a <code>SimpleRate</code> sensor over <code>num</code> windows of <code>window.size.seconds</code> (defaults 11 windows × 1 s) and a <code>Quota</code> bound; <code>getThrottleTimeMs</code> calls <code>sensor.checkQuotas()</code> and, on <code>QuotaViolationException</code>, returns <code>QuotaUtils.throttleTime(...)</code> (<code>RLMQuotaManager.java:80</code>). The two managers differ in <em>where</em> they apply: the copy quota makes the copy task <strong>wait</strong> before uploading a segment (back-pressure), whereas the fetch quota makes the read path <strong>shed</strong> the request — returning empty so the consumer retries later rather than queueing remote reads (<code>ReplicaManager.scala:1917</code>). Throttle times are surfaced via <code>remote-copy-throttle-time</code> / <code>remote-fetch-throttle-time</code> sensors (<code>RemoteLogManager.java:244</code>).</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Copy is back-pressured but fetch is shed because a queued remote read holds a slot in a bounded pool and would extend client latency unboundedly; shedding lets the broker keep serving local partitions and bounds tail latency. Tiered-storage quotas were added by <span class="pill kip">KIP-956</span> on top of the core tiered-storage design <span class="pill kip">KIP-405</span>. The copy/fetch rate limits are global per broker, which protects the object store and the broker NIC from saturation during catch-up.</p></div>
+
+<h2>Configuration reference</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>remote.log.storage.system.enable</code></td><td><code>false</code></td><td>Cluster-wide master switch; broker starts RLM services only when true.</td></tr>
+<tr><td><code>remote.log.storage.manager.class.name</code></td><td>(none)</td><td>FQCN of the RSM plugin (required to use tiered storage).</td></tr>
+<tr><td><code>remote.log.metadata.manager.class.name</code></td><td><code>TopicBasedRemoteLogMetadataManager</code></td><td>FQCN of the RLMM plugin.</td></tr>
+<tr><td><code>remote.log.storage.manager.impl.prefix</code> / <code>...metadata.manager.impl.prefix</code></td><td><code>rsm.config.</code> / <code>rlmm.config.</code></td><td>Prefixes whose stripped props are passed to the plugin's <code>configure</code>.</td></tr>
+<tr><td><code>log.local.retention.ms</code></td><td><code>-2</code> (→ <code>log.retention.ms</code>)</td><td>Local tail time retention; must be ≤ total retention.</td></tr>
+<tr><td><code>log.local.retention.bytes</code></td><td><code>-2</code> (→ <code>log.retention.bytes</code>)</td><td>Local tail size retention; must be ≤ total retention.</td></tr>
+<tr><td><code>log.remote.copy.lag.ms</code> / <code>.bytes</code></td><td><code>0</code> (immediate)</td><td>Delay before a sealed segment becomes upload-eligible (time/size). -1 ⇒ use real local retention as max delay.</td></tr>
+<tr><td><code>remote.log.manager.task.interval.ms</code></td><td><code>30000</code></td><td>Fixed delay between copy / expiration / follower task runs.</td></tr>
+<tr><td><code>remote.log.manager.copier.thread.pool.size</code></td><td><code>10</code></td><td>Copy task pool size (dynamic via <code>resizeCopierThreadPool</code>).</td></tr>
+<tr><td><code>remote.log.manager.expiration.thread.pool.size</code></td><td><code>10</code></td><td>Expiration task pool size.</td></tr>
+<tr><td><code>remote.log.manager.follower.thread.pool.size</code></td><td><code>2</code></td><td>Follower task pool size (replaces deprecated <code>remote.log.manager.thread.pool.size</code> since 4.2).</td></tr>
+<tr><td><code>remote.log.reader.threads</code></td><td><code>10</code></td><td>Remote read pool size.</td></tr>
+<tr><td><code>remote.log.reader.max.pending.tasks</code></td><td><code>100</code></td><td>Read queue bound; full queue ⇒ fetch served with an error.</td></tr>
+<tr><td><code>remote.log.index.file.cache.total.size.bytes</code></td><td><code>1073741824</code> (1 GiB)</td><td>Max bytes of cached remote index files (dynamic via <code>resizeCacheSize</code>).</td></tr>
+<tr><td><code>remote.log.index.file.cache.ttl.ms</code> (internal)</td><td><code>900000</code></td><td>Idle TTL for cache entries; -1 disables time-based eviction.</td></tr>
+<tr><td><code>remote.log.metadata.custom.metadata.max.bytes</code></td><td><code>128</code></td><td>Cap on RSM custom metadata; exceeding it cancels copy for the partition.</td></tr>
+<tr><td><code>remote.log.manager.copy.max.bytes.per.second</code></td><td><code>Long.MAX_VALUE</code></td><td>Global upload byte-rate cap (copy quota).</td></tr>
+<tr><td><code>remote.log.manager.fetch.max.bytes.per.second</code></td><td><code>Long.MAX_VALUE</code></td><td>Global remote-read byte-rate cap (fetch quota).</td></tr>
+<tr><td><code>remote.log.manager.{copy,fetch}.quota.window.num</code></td><td><code>11</code></td><td>Sample windows retained for the quota sensor.</td></tr>
+<tr><td><code>remote.log.manager.{copy,fetch}.quota.window.size.seconds</code></td><td><code>1</code></td><td>Width of each quota window.</td></tr>
+<tr><td><code>remote.fetch.max.wait.ms</code></td><td><code>500</code></td><td>Max wait for remote partitions in a fetch before responding.</td></tr>
+<tr><td><code>remote.list.offsets.request.timeout.ms</code></td><td><code>30000</code></td><td>Timeout for remote list-offsets resolution.</td></tr>
+<tr><td><code>remote.log.metadata.topic.num.partitions</code></td><td><code>50</code></td><td>Partitions of <code>__remote_log_metadata</code> (immutable after creation).</td></tr>
+<tr><td><code>remote.log.metadata.topic.replication.factor</code></td><td><code>3</code></td><td>Replication factor of the metadata topic.</td></tr>
+<tr><td><code>remote.log.metadata.topic.retention.ms</code></td><td><code>-1</code> (unlimited)</td><td>Should exceed the longest tiered topic retention to avoid metadata loss.</td></tr>
+<tr><td><code>remote.log.metadata.consume.wait.ms</code></td><td><code>120000</code></td><td>Max wait for the local consumer to observe a just-produced event.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+
+<ul>
+<li><strong>Crash mid-copy.</strong> If the broker dies after <code>COPY_SEGMENT_STARTED</code> but before <code>FINISHED</code>, the local segment is retained (deletion guard never advanced), and the started metadata sits dangling. The new leader simply re-copies with a fresh uuid; the dangling started-record is harmless and excluded from size/visibility, and the expiration task can clean up segments stuck in <code>DELETE_SEGMENT_STARTED</code>.</li>
+<li><strong>RSM retriable error.</strong> <code>RetriableRemoteStorageException</code> propagates up and the scheduled task retries on its next tick; the <code>run()</code> wrapper logs it at debug and does not cancel (<code>RemoteLogManager.java:848</code>).</li>
+<li><strong>RSM hard error during copy.</strong> The code best-effort deletes the partially-copied segment, marks <code>failedRemoteCopyRequestRate</code>, and rethrows; the started-metadata remains until the next cleanup pass (<code>:1114</code>).</li>
+<li><strong>Read for a compacted/missing offset.</strong> <code>read</code> iterates to the next segment if the first batch is not found; if the offset truly is not in remote, it throws <code>OffsetOutOfRangeException</code>, returned to the client (<code>:1856</code>, <code>:1870</code>).</li>
+<li><strong>Read queue full.</strong> <code>asyncRead</code> throws <code>RejectedExecutionException</code> when the 100-slot queue is full; the fetch is served with an error rather than blocking (<code>:2143</code>).</li>
+<li><strong>Missing transaction index.</strong> Old metadata may report <code>txnIdxEmpty=false</code> yet have no remote txn index; <code>getTransactionIndex</code> uses <code>ofNullable</code> for backward compatibility, and the index cache substitutes an empty index on <code>RemoteResourceNotFoundException</code> (<code>:2007</code>, <code>RemoteIndexCache.java:444</code>).</li>
+<li><strong>Partition deletion.</strong> <code>stopPartitions</code> cancels all three tasks, and when <code>deleteRemoteLog</code> is set, <code>deleteRemoteLogPartition</code> publishes DELETE_STARTED for every segment, deletes data via the RSM, clears the index cache, then publishes DELETE_FINISHED (<code>:524</code>, <code>:576</code>).</li>
+<li><strong>Metadata topic unavailable at boot.</strong> The default RLMM exits the JVM after the init timeout (see Caution above); operationally this means the metadata topic must be healthy for tiered brokers to start.</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+
+<ul>
+<li>A local segment is deleted only after its data is durably in remote (<code>highestOffsetInRemoteStorage</code> advanced post-FINISHED) — no data loss window (<code>UnifiedLog.java:1857</code>, <code>RemoteLogManager.java:1160</code>).</li>
+<li>Metadata is read-your-writes consistent: the RLM's blocking metadata calls return only after the local cache reflects the write (<code>TopicBasedRemoteLogMetadataManager.java:158</code>).</li>
+<li>Only <code>COPY_SEGMENT_FINISHED</code> segments are readable; started/deleting segments are invisible to fetch but available for cleanup (<code>RemoteLogMetadataCache.java:132</code>).</li>
+<li>Each copy attempt has a globally-unique id, so the copy/delete RSM operations are idempotent and overwriting (<code>RemoteLogSegmentId.java:24</code>).</li>
+<li>Retention &amp; size accounting are evaluated within the current leader-epoch lineage; segments outside it are treated as unreferenced (<code>RemoteLogManager.java:1728</code>).</li>
+<li>Local effective retention is always ≤ total retention: <code>log.local.retention.{ms,bytes}</code> defaults of <code>-2</code> resolve to the corresponding total-retention value (<code>RemoteLogManagerConfig.java:159</code>).</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+
+<ul>
+<li><a href="03-storage-log-engine.html">The Log Storage Engine</a> — <code>UnifiedLog</code> supplies sealed <code>LogSegment</code>s, the leader-epoch cache, producer-state snapshots, and <code>highestOffsetInRemoteStorage</code>; tiered storage reuses the same on-disk index/segment formats (<a href="01-record-format.html">Record Format &amp; Batches</a>) when streaming remote data.</li>
+<li><a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a> — local deletion is performed by <code>UnifiedLog.deleteOldSegments()</code> driven by local retention, gated by the remote copy state; tiered topics use <code>cleanup.policy=delete</code> only.</li>
+<li><a href="09-fetch-path.html">The Fetch Path &amp; Replica Fetchers</a> — <code>ReplicaManager</code> translates an out-of-range fetch into a <code>DelayedRemoteFetch</code> and consults the fetch quota; followers fetching a remote-only offset receive <code>OffsetMovedToTieredStorageException</code> (<code>ReplicaManager.scala:1914</code>).</li>
+<li><a href="08-replication.html">Replication, ISR &amp; High Watermark</a> — copy eligibility is bounded by the last-stable-offset so only committed data is tiered; leader/follower transitions install/cancel RLM tasks.</li>
+<li><a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a> — leadership and stop-partition events from the controller drive <code>onLeadershipChange</code>/<code>stopPartitions</code>; the default RLMM defers init until the broker is ready.</li>
+<li><a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a> — the remote read path reconstructs aborted-transaction lists from remote (then local) txn indexes for <code>read_committed</code> consumers.</li>
+<li><a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a> — RLM copy/fetch quotas are a separate <code>QuotaType</code> (<code>RLM_COPY</code>, <code>RLM_FETCH</code>) from client request/bandwidth quotas but share the metrics/sensor machinery.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+
+<p>Tiered storage was introduced by <span class="pill kip">KIP-405</span>, deliberately structured around two narrow SPIs so cloud object stores (S3/GCS/ABS) and HDFS-like systems can be plugged in without touching the broker. The metadata/data split — strongly-consistent metadata, eventually-consistent data — lets the broker reason about correctness from a replicated log of events (the default RLMM) while treating the object store as a dumb blob sink. Tiered-storage quotas (<span class="pill kip">KIP-956</span>) added the global copy/fetch byte-rate limiters to keep catch-up traffic from overwhelming the object store or the broker. The follower thread pool was split out from the legacy single thread pool and the old <code>remote.log.manager.thread.pool.size</code> deprecated in 4.2 (<code>RemoteLogManagerConfig.java:109</code>). Separating copier and expiration pools lets uploads and deletes scale independently.</p>
+
+<h2>Gotchas / operational notes</h2>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The number of partitions of <code>__remote_log_metadata</code> is fixed at first creation. If the configured <code>remote.log.metadata.topic.num.partitions</code> later differs from the existing topic, RLMM initialization <em>fails</em> and the broker exits (<code>TopicBasedRemoteLogMetadataManager.java:414</code>). Pick this value carefully up front.</p></div>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Set <code>remote.log.metadata.topic.retention.ms</code> longer than the longest retention of any tiered topic. The metadata topic is delete-not-compact; if its retention expires, the events describing live remote segments are lost and those segments become unreferenced (<code>TopicBasedRemoteLogMetadataManagerConfig.java:64</code>).</p></div>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Copy lag and remote-delete lag are exported per partition/topic (<code>recordRemoteCopyLagBytes</code>/<code>...Segments</code>, <code>recordRemoteDeleteLag...</code>; <code>RemoteLogManager.java:1166</code>, <code>:1362</code>). The copy task records lag as <code>onlyLocalLogSegmentsSize − activeSegmentSize</code> and <code>onlyLocalLogSegmentsCount − 1</code> — i.e. how much sealed local data still awaits upload — which is the primary health signal for whether tiering is keeping up (<code>:1183</code>).</p></div>
+
+<div class="callout note"><span class="callout-title">Note</span><p>Disabling further uploads for a topic without losing already-tiered data is done with the per-topic <code>remote.log.copy.disable</code> flag: when set, no <code>RLMCopyTask</code> is created and local deletion falls back to ordinary <code>retention.ms</code>/<code>.bytes</code> instead of the remote-aware guard (<code>RemoteLogManager.java:2157</code>, <code>UnifiedLog.java:1853</code>).</p></div>

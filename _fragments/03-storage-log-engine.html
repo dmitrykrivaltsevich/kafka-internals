@@ -1,0 +1,386 @@
+<h1>03 · The Log Storage Engine</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Every Kafka partition is an append-only log on disk: an ordered set of immutable <em>segments</em>, each a paired <code>.log</code> data file plus three sparse memory-mapped indexes (<code>.index</code>, <code>.timeindex</code>, <code>.txnindex</code>), fronted by per-partition producer-idempotency state and a leader-epoch checkpoint. This chapter dissects the layered abstraction <code>UnifiedLog → LocalLog → LogSegments → LogSegment</code>, the byte layouts of the index and snapshot files, the exact append and read-by-offset algorithms, segment rolling, crash recovery in <code>LogLoader</code>, and the concurrency model that lets a single writer coexist with lock-free readers. It is the physical substrate on which <a href="08-replication.html">replication</a>, the <a href="09-fetch-path.html">fetch path</a>, <a href="04-storage-management.html">retention/compaction</a>, and <a href="14-transactions-eos.html">transactions</a> all stand.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The log storage engine is the broker subsystem that turns a stream of record batches into durable, offset-addressable bytes and back again. Its concrete duties:</p>
+<ul>
+  <li><strong>Durable ordered storage.</strong> Assign a monotonically increasing 64-bit <em>offset</em> to every record and persist batches in offset order in pre-allocated segment files.</li>
+  <li><strong>Offset and timestamp lookup.</strong> Translate a logical offset (or a timestamp) into a physical file position for reads, using sparse indexes that fit in page cache.</li>
+  <li><strong>Boundary bookkeeping.</strong> Track the <em>log start offset</em> (LSO), <em>recovery point</em>, <em>log end offset</em> (LEO) and <em>high watermark</em> (HW), and expose them to replication and consumers.</li>
+  <li><strong>Idempotency &amp; transaction metadata.</strong> Maintain per-producer sequence state (dedup), snapshot it to <code>.snapshot</code> files, and record aborted transactions for <code>READ_COMMITTED</code> reads.</li>
+  <li><strong>Leader-epoch lineage.</strong> Persist the (epoch → start offset) map that drives truncation-safe follower replication.</li>
+  <li><strong>Crash recovery.</strong> On startup, validate segments, rebuild indexes, truncate corrupt tails, and reconstruct producer state.</li>
+</ul>
+
+<h2>Where it lives in the code</h2>
+<p>The engine was migrated from Scala (<code>kafka.log</code>) into a self-contained Java module, <code>org.apache.kafka.storage.internals.log</code>, so it can be reused by KRaft's metadata log and tiered storage.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Class / file</th><th>Path</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>UnifiedLog</code></td><td><code>storage/.../internals/log/UnifiedLog.java</code></td><td>Public façade for a partition log; offsets/HW/LSO, append &amp; read entry points, producer-state &amp; epoch-cache orchestration.</td></tr>
+<tr><td><code>LocalLog</code></td><td><code>storage/.../internals/log/LocalLog.java</code></td><td>The local on-disk log: holds <code>LogSegments</code>, the LEO (<code>nextOffsetMetadata</code>) and recovery point; does append-to-active-segment, multi-segment read, roll, truncate, flush.</td></tr>
+<tr><td><code>LogSegments</code></td><td><code>storage/.../internals/log/LogSegments.java</code></td><td>Thread-safe <code>ConcurrentSkipListMap&lt;baseOffset, LogSegment&gt;</code> with floor/higher/last navigation.</td></tr>
+<tr><td><code>LogSegment</code></td><td><code>storage/.../internals/log/LogSegment.java</code></td><td>One segment: a <code>FileRecords</code> log + lazy offset/time indexes + txn index; append, translate-offset, read, recover, roll-out.</td></tr>
+<tr><td><code>AbstractIndex</code></td><td><code>storage/.../internals/log/AbstractIndex.java</code></td><td>mmap'd sparse index base class; binary search with a "warm section" optimisation, resize/truncate/flush.</td></tr>
+<tr><td><code>OffsetIndex</code> / <code>TimeIndex</code></td><td><code>storage/.../internals/log/OffsetIndex.java</code>, <code>TimeIndex.java</code></td><td>8-byte (relOffset,position) and 12-byte (timestamp,relOffset) entries.</td></tr>
+<tr><td><code>TransactionIndex</code></td><td><code>storage/.../internals/log/TransactionIndex.java</code></td><td>Append-only list of aborted-txn records (no mmap).</td></tr>
+<tr><td><code>LazyIndex</code></td><td><code>storage/.../internals/log/LazyIndex.java</code></td><td>Defers mmap of an index until first access (startup-time optimisation).</td></tr>
+<tr><td><code>LogLoader</code></td><td><code>storage/.../internals/log/LogLoader.java</code></td><td>Loads &amp; recovers segments from disk; returns LSO, recovery point, LEO.</td></tr>
+<tr><td><code>LogValidator</code></td><td><code>storage/.../internals/log/LogValidator.java</code></td><td>Validates batches, assigns offsets/timestamps, stamps leader epoch, (de)compresses.</td></tr>
+<tr><td><code>ProducerStateManager</code></td><td><code>storage/.../internals/log/ProducerStateManager.java</code></td><td>Per-producer dedup state, snapshots, LSO/first-unstable-offset, aborted-txn tracking.</td></tr>
+<tr><td><code>LeaderEpochFileCache</code></td><td><code>storage/.../internals/epoch/LeaderEpochFileCache.java</code></td><td>(epoch → start offset) map + <code>leader-epoch-checkpoint</code> file.</td></tr>
+<tr><td><code>LogFileUtils</code></td><td><code>storage/.../internals/log/LogFileUtils.java</code></td><td>Segment file naming, suffix constants, offset-from-filename.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+  <dt>Offset</dt><dd>Monotonic 64-bit position of a record within a partition. Assigned by the leader at append time.</dd>
+  <dt>Base offset</dt><dd>The lowest possible offset a segment can hold; also its filename prefix and the origin for the index's <em>relative</em> offsets.</dd>
+  <dt>Active segment</dt><dd>The last (highest-base-offset) segment — the only one currently taking appends. <code>LogSegments.activeSegment()</code> = <code>lastSegment().get()</code> (<code>LogSegments.java:322</code>).</dd>
+  <dt>LEO — log end offset</dt><dd>Offset of the <em>next</em> record to be written; <code>LocalLog.nextOffsetMetadata.messageOffset</code> (<code>LocalLog.java:296</code>).</dd>
+  <dt>HW — high watermark</dt><dd>Highest offset replicated to all in-sync replicas; consumer-visible upper bound. Stored as <code>UnifiedLog.highWatermarkMetadata</code> (<code>UnifiedLog.java:160</code>). See <a href="08-replication.html">Replication</a>.</dd>
+  <dt>LSO — log start offset</dt><dd>Lowest retained offset; advanced by retention / <code>deleteRecords</code> / tiering. Field <code>logStartOffset</code> (<code>UnifiedLog.java:162</code>).</dd>
+  <dt>LSO — last stable offset</dt><dd>(Same acronym, different concept.) Upper bound of committed transactional data for <code>READ_COMMITTED</code>; <code>min(firstUnstableOffset, HW)</code>.</dd>
+  <dt>Recovery point</dt><dd>First offset not yet guaranteed fsync'd; recovery on restart starts here. <code>LocalLog.recoveryPoint</code> (<code>LocalLog.java:95</code>).</dd>
+  <dt>Sparse index</dt><dd>An index that holds an entry only every <code>index.interval.bytes</code> (default 4096) of log, not per-record.</dd>
+</dl>
+
+<h2>On-disk directory layout of a partition</h2>
+<p>A partition <code>orders-2</code> in a configured log directory is a sub-directory <code>orders-2/</code>. Segment files are named by their zero-padded 20-digit base offset (<code>LogFileUtils.filenamePrefixFromOffset</code>, <code>LogFileUtils.java:102</code>), which makes <code>ls</code> sort them numerically.</p>
+<figure class="diagram"><pre>
+&lt;log.dir&gt;/orders-2/
+├─ 00000000000000000000.log         ← segment data (FileRecords), baseOffset 0
+├─ 00000000000000000000.index       ← offset index  (8-byte entries, mmap)
+├─ 00000000000000000000.timeindex   ← time index    (12-byte entries, mmap)
+├─ 00000000000000000000.txnindex    ← aborted-txn index (created only if needed)
+├─ 00000000000000147001.log         ← next segment, baseOffset 147001
+├─ 00000000000000147001.index
+├─ 00000000000000147001.timeindex
+├─ 00000000000000146500.snapshot    ← producer-state snapshot (per roll)
+├─ 00000000000000147001.snapshot
+├─ leader-epoch-checkpoint          ← (epoch → startOffset) text file
+└─ partition.metadata               ← topic-id binding (version + UUID)
+</pre><figcaption>Files of a single partition. Suffix constants live in <code>LogFileUtils</code>; transient files carry <code>.deleted</code>, <code>.cleaned</code>, <code>.swap</code> suffixes during deletion/compaction/split.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="mono">00000000000000000000</span> = 20-digit zero-padded segment base offset</span>
+    <span class="lgi"><span class="mono">.log</span> = record-batch data &middot; <span class="mono">.index / .timeindex / .txnindex</span> = sparse indexes</span>
+    <span class="lgi"><span class="mono">.snapshot</span> = producer-state &middot; <span class="mono">leader-epoch-checkpoint / partition.metadata</span> = text metadata</span>
+    <span class="lgi">← annotation describing each file (not part of the name)</span>
+  </div></figure>
+<p>Per-directory (not per-partition) the engine also keeps <code>recovery-point-offset-checkpoint</code>, <code>log-start-offset-checkpoint</code>, and <code>replication-offset-checkpoint</code> (high-watermark) files managed by <code>LogManager</code> — see <a href="04-storage-management.html">Log Management</a>.</p>
+
+<h2>The layered abstraction</h2>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">callers</span><span class="nd"><code>Partition</code> · <code>KafkaApis</code></span></div>
+  <div class="conn" data-label="append / read"></div>
+  <div class="node cat-broker"><span class="nt">UnifiedLog</span><span class="nd">semantics: <code>appendAsLeader/Follower</code> · <code>read</code> · HW · LSO · <code>leaderEpochCache</code> · <code>producerStateManager</code></span></div>
+  <div class="conn" data-label="delegates byte-level work"></div>
+  <div class="node cat-broker"><span class="nt">LocalLog</span><span class="nd">local segment set + offsets: <code>nextOffsetMetadata</code> (LEO) · <code>recoveryPoint</code> · <code>append</code> · <code>read</code> · <code>roll</code> · <code>truncateTo</code></span></div>
+  <div class="conn" data-label="owns"></div>
+  <div class="node cat-storage"><span class="nt">LogSegments</span><span class="nd"><code>ConcurrentSkipListMap&lt;baseOffset, LogSegment&gt;</code></span></div>
+  <div class="conn" data-label="ordered set"></div>
+  <div class="node cat-storage store"><span class="nt">LogSegment</span><span class="nd">one file pair: <code>FileRecords</code> <code>.log</code> · <code>LazyIndex&lt;OffsetIndex&gt;</code> · <code>LazyIndex&lt;TimeIndex&gt;</code> · <code>TransactionIndex</code></span></div>
+</div><figcaption>Each layer narrows scope: <code>UnifiedLog</code> = semantics &amp; metadata; <code>LocalLog</code> = the local segment set &amp; offsets; <code>LogSegment</code> = one file pair.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-broker"></span><b>broker</b> &mdash; in-memory log abstraction / orchestration</span>
+    <span class="lgi"><span class="sw cat-storage"></span><b>storage</b> &mdash; the on-disk segment set &amp; files</span>
+    <span class="lgi"><span class="sw cat-storage cyl"></span>cylinder = a log / file store</span>
+    <span class="lgi"><span class="arr"></span>contains / delegates to (top → bottom)</span>
+    <span class="lgi"><span class="mono">Class</span> = Java type in <code>org.apache.kafka.storage.internals.log</code></span>
+  </div></figure>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p><code>UnifiedLog</code> owns all <em>semantics</em> (offset assignment, HW/LSO, producer state, epochs) and is the only class that synchronizes on the partition lock; <code>LocalLog</code> owns the <em>physical</em> segments and the LEO. A "unified" log can additionally front tiered (remote) segments, which is why local boundaries (<code>localLogStartOffset</code>) are tracked separately from <code>logStartOffset</code> — see <a href="05-tiered-storage.html">Tiered Storage</a>.</p></div>
+
+<h3>LogSegment: a file pair plus indexes</h3>
+<p>A <code>LogSegment</code> (<code>LogSegment.java:80–103</code>) bundles: a <code>FileRecords log</code> (the <code>.log</code>); <code>LazyIndex&lt;OffsetIndex&gt; lazyOffsetIndex</code>; <code>LazyIndex&lt;TimeIndex&gt; lazyTimeIndex</code>; a <code>TransactionIndex txnIndex</code>; the immutable <code>baseOffset</code>; <code>indexIntervalBytes</code>; and a per-roll random <code>rollJitterMs</code>. Two pieces of mutable bookkeeping drive indexing and rolling:</p>
+<ul>
+  <li><code>bytesSinceLastIndexEntry</code> — bytes appended since the last sparse index entry; when it exceeds <code>indexIntervalBytes</code>, the next batch triggers an index append (<code>LogSegment.java:271</code>).</li>
+  <li><code>maxTimestampAndOffsetSoFar</code> (<code>volatile TimestampOffset</code>) and <code>rollingBasedTimestamp</code> — the largest timestamp seen and the first-batch timestamp, used for the time index and time-based rolling.</li>
+</ul>
+<div class="callout warning"><span class="callout-title">Caution</span><p><code>LogSegment</code> is explicitly <strong>not thread-safe</strong> for mutation (<code>LogSegment.java:64</code>): <code>append</code>/<code>recover</code>/<code>truncateTo</code> assume the caller holds <code>UnifiedLog#lock</code>. Only the read-style methods (<code>translateOffset</code>, <code>read</code>, <code>readNextOffset</code>) are documented thread-safe, relying on the index's mmap and <code>FileRecords</code> positional reads.</p></div>
+
+<h2>Data structures: the index files, field by field</h2>
+<p>All three index types that are mmap'd share <code>AbstractIndex</code>; the transaction index is a plain append-only channel. Each index stores offsets <em>relative</em> to the segment base offset so a 64-bit offset fits in 4 bytes (<code>OffsetIndex.java:44–47</code>). <code>AbstractIndex.toRelative</code> rejects any offset whose delta exceeds <code>Integer.MAX_VALUE</code> (<code>AbstractIndex.java:555</code>) — the root cause of segment offset overflow.</p>
+
+<h3>OffsetIndex — relative offset → physical position</h3>
+<p>Entry size 8 bytes (<code>OffsetIndex.java:56</code>); the file is pre-allocated to a fixed maximum (<code>segment.index.bytes</code>, default 10 MiB) and trimmed when the segment goes inactive.</p>
+<figure class="diagram">
+  <div class="bytemap fixed">
+    <div class="bf" style="--w:4"><span class="bf-name">relativeOffset</span><span class="bf-meta">int32 · @0 · = absOffset − baseOffset</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">physicalPosition</span><span class="bf-meta">int32 · @4 · byte offset in .log</span></div>
+  </div>
+  <figcaption><code>OffsetIndex.parseEntry</code> / <code>append</code> (<code>OffsetIndex.java:143,199</code>). <code>append</code> rejects a non-increasing offset and a full index.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw" style="--c:var(--c-note-bg);border-color:var(--c-note)"></span><span class="sw" style="--c:var(--c-rationale-bg);border-color:var(--c-rationale)"></span>each coloured cell = one fixed-width field</span>
+    <span class="lgi"><b>8-byte entry</b>, repeated, sorted ascending by offset</span>
+    <span class="lgi"><span class="mono">@n</span> = byte offset within the entry &middot; <span class="mono">width</span> ∝ field size</span>
+    <span class="lgi"><b>lookup(target)</b> &mdash; binary-search the greatest entry ≤ target; <code>absOffset = baseOffset + relativeOffset</code></span>
+  </div>
+</figure>
+
+<h3>TimeIndex — max timestamp → relative offset (KIP-33)</h3>
+<p>Entry size 12 bytes (<code>TimeIndex.java:56</code>). An entry <code>(T, O)</code> asserts "the largest timestamp at or before offset <code>O</code> is <code>T</code>"; timestamps are monotonically increasing within the file. To find an offset by timestamp, <code>LogSegment.findOffsetByTimestamp</code> (<code>LogSegment.java:755</code>) binary-searches the time index for the largest <code>T ≤ target</code>, then resolves that offset through the offset index, then linearly scans the log from there.</p>
+<figure class="diagram">
+  <div class="bytemap fixed">
+    <div class="bf" style="--w:8"><span class="bf-name">timestamp</span><span class="bf-meta">int64 · @0</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">relativeOffset</span><span class="bf-meta">int32 · @8</span></div>
+  </div>
+  <figcaption>An entry <code>(T, O)</code> asserts &ldquo;the largest timestamp at or before offset <code>O</code> is <code>T</code>&rdquo; (<code>TimeIndex.java:56</code>).</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw" style="--c:var(--c-note-bg);border-color:var(--c-note)"></span><span class="sw" style="--c:var(--c-rationale-bg);border-color:var(--c-rationale)"></span>each coloured cell = one fixed-width field</span>
+    <span class="lgi"><b>12-byte entry</b>, repeated, monotonic in timestamp <em>and</em> offset</span>
+    <span class="lgi"><span class="mono">@n</span> = byte offset within the entry &middot; <span class="mono">width</span> ∝ field size</span>
+  </div>
+</figure>
+<div class="callout note"><span class="callout-title">Note</span><p><code>TimeIndex.isFull()</code> reserves one slot — it returns true at <code>entries ≥ maxEntries − 1</code> (<code>TimeIndex.java:122</code>). That last slot is filled when the segment rolls/closes via <code>maybeAppend(maxTs, offset, skipFullCheck=true)</code> so the segment's true max timestamp is always recorded (<code>LogSegment.onBecomeInactiveSegment</code>, <code>LogSegment.java:686</code>).</p></div>
+
+<h3>TransactionIndex — aborted transactions</h3>
+<p>Unlike the others this is <em>not</em> mmap'd, is created lazily (only when an abort is recorded), and is appended through a <code>FileChannel</code> (<code>TransactionIndex.java:64,202</code>). Each record is a version-prefixed <code>AbortedTxn</code> (schema <code>clients/.../message/AbortedTxn.json</code>, validVersions <code>0</code>): <code>ProducerId</code>, <code>FirstOffset</code>, <code>LastOffset</code>, <code>LastStableOffset</code> — four <code>int64</code>s after a 2-byte version, so 34 bytes. <code>collectAbortedTxns(fetchOffset, upperBoundOffset)</code> (<code>TransactionIndex.java:167</code>) returns every aborted txn overlapping the fetch range and signals whether the scan must continue into the next segment (when an entry's <code>lastStableOffset ≥ upperBoundOffset</code>). Used by the <a href="09-fetch-path.html">fetch path</a> for <code>READ_COMMITTED</code>.</p>
+
+<h3>AbstractIndex: mmap, the warm-section search, and locking</h3>
+<p>On construction the file is created (if new), pre-allocated to <code>roundDownToExactMultiple(maxIndexSize, entrySize)</code>, mapped <code>READ_WRITE</code> (or <code>READ_ONLY</code>), and the buffer position set to the last entry (<code>AbstractIndex.java:100–124,474–490</code>). <code>maxEntries = mmap.limit()/entrySize</code>; <code>isFull()</code> = <code>entries ≥ maxEntries</code>.</p>
+<p>Lookups use a custom, cache-friendly binary search. The pure binary search touches pages near the file start that go cold for low-traffic partitions, causing multi-hundred-millisecond page faults on the produce hot path. <code>AbstractIndex</code> instead keeps a <em>warm section</em> of the last <code>warmEntries() = 8192/entrySize</code> entries (<code>AbstractIndex.java:387</code>): if the target is within it, search only that range; otherwise search the cold prefix (<code>indexSlotRangeFor</code>, <code>AbstractIndex.java:495</code>). In-sync followers and tailing consumers, which always read near the end, stay entirely in warm pages.</p>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>8192 bytes is chosen so the three entries every warm lookup touches (<code>end</code>, <code>end−N</code>, <code>(2·end−N)/2</code>) always fall within ≤3 pages on a 4 KiB-page host, guaranteeing the warm section is genuinely resident. The 57-line comment at <code>AbstractIndex.java:330–386</code> records the original ~1 s produce-latency spike that motivated this.</p></div>
+
+<h2>Concurrency &amp; the index locks</h2>
+<p><code>AbstractIndex</code> holds two locks (<code>AbstractIndex.java:59–61</code>):</p>
+<ul>
+  <li><code>ReentrantLock lock</code> — serializes all <em>mutations</em> (<code>append</code>, <code>truncate</code>, <code>resize</code>, <code>flush</code>). Readers do <em>not</em> take it.</li>
+  <li><code>ReentrantReadWriteLock remapLock</code> — readers take the <em>read</em> lock (<code>inRemapReadLock</code>) while reading the buffer; <code>resize</code>/<code>closeHandler</code> take the <em>write</em> lock so the mmap can be safely unmapped and re-mapped (the buffer reference is swapped under exclusivity).</li>
+</ul>
+<div class="callout key"><span class="callout-title">Key idea</span><p>Lock-free reads against a <code>MappedByteBuffer</code> are safe because (a) readers always <code>mmap().duplicate()</code> to get a private position, and (b) clients only ever read <em>committed</em> data (below the HW/LSO). A follower that races an in-progress truncate may read stale bytes, but CRC and leader-epoch checks downstream reject it (<code>AbstractIndex.java:50–58</code>).</p></div>
+<p>Index files are force-unmapped on close rather than waiting for GC, because mmap cleanup can stall application threads reading metadata from a slow disk (KAFKA-4614, <code>AbstractIndex.closeHandler</code>, <code>AbstractIndex.java:287–293</code>). <code>LazyIndex</code> (<code>LazyIndex.java</code>) wraps the index so the file is only mmap'd on first <code>get()</code> — a startup-time win for brokers with very many segments (KIP-263).</p>
+
+<h2>The append path (leader)</h2>
+<p>Producer writes enter <code>UnifiedLog.appendAsLeader → append(...)</code> (<code>UnifiedLog.java:1020,1115</code>). The whole body runs inside <code>synchronized(lock)</code> — a single writer per partition.</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">maybeFlushMetadataFile()</span><span class="nd">persist topic-id before data</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">analyzeAndValidateRecords()</span><span class="nd">per-batch CRC / size / monotonicity</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">validBytes ≤ 0?</div>
+  <div class="row">
+    <div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error"><span class="nt">return</span><span class="nd">empty / duplicate</span></div></div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-broker"><span class="nt">trimInvalidBytes()</span></div>
+      <div class="conn"></div>
+      <div class="node cat-coord pill"><span class="nt">synchronized(lock)</span><span class="nd">single writer per partition ↓</span></div>
+      <div class="conn"></div>
+      <div class="node cat-broker"><span class="nt">firstOffset = LEO</span><span class="nd"><code>LocalLog.logEndOffset()</code></span></div>
+      <div class="conn"></div>
+      <div class="node cat-broker"><span class="nt">LogValidator</span><span class="nd">assign offsets/ts, stamp epoch (in-place if uncompressed)</span></div>
+      <div class="conn"></div>
+      <div class="node cat-control"><span class="nt">leaderEpochCache.assign(epoch, baseOffset)</span><span class="nd">per batch</span></div>
+      <div class="conn"></div>
+      <div class="node cat-broker decision">size &gt; segment.size?</div>
+      <div class="row">
+        <div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error"><span class="nt">RecordBatchTooLargeException</span></div></div>
+        <div class="col">
+          <div class="conn" data-label="no"></div>
+          <div class="node cat-broker"><span class="nt">maybeRoll()</span><span class="nd">roll if full (size / time / index)</span></div>
+          <div class="conn"></div>
+          <div class="node cat-coord"><span class="nt">analyzeAndValidateProducerState()</span><span class="nd">dedup + txn bookkeeping</span></div>
+          <div class="conn"></div>
+          <div class="node cat-broker decision">duplicate?</div>
+          <div class="row">
+            <div class="col"><div class="conn" data-label="yes"></div><div class="node cat-coord"><span class="nt">return duplicate's offsets</span></div></div>
+            <div class="col"><div class="conn ec-data" data-label="no"></div><div class="node cat-storage store"><span class="nt">LocalLog.append()</span><span class="nd">write bytes · LEO += n · updateHW · <code>producerStateManager.update</code> · <code>segment.updateTxnIndex</code> · <code>maybeIncrementFirstUnstableOffset</code> · flush if unflushed ≥ <code>flush.messages</code></span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>Leader append, condensed from <code>UnifiedLog.append</code> (<code>UnifiedLog.java:1115–1292</code>). Everything below <code>synchronized(lock)</code> runs single-writer per partition.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-broker"></span><b>broker</b> &mdash; <code>UnifiedLog</code> / validator step</span>
+    <span class="lgi"><span class="sw cat-control"></span><b>control</b> &mdash; leader-epoch metadata</span>
+    <span class="lgi"><span class="sw cat-coord"></span><b>coord</b> &mdash; lock / producer &amp; txn state</span>
+    <span class="lgi"><span class="sw cat-storage"></span><b>storage</b> &mdash; bytes hit the log</span>
+    <span class="lgi"><span class="sw cat-error dash"></span><b>error / early return</b></span>
+    <span class="lgi">rounded italic = decision</span>
+    <span class="lgi"><span class="sw cat-coord round"></span>pill = lock boundary</span>
+    <span class="lgi"><span class="arr"></span>control flow (top → bottom)</span>
+  </div></figure>
+
+<h3>Offset, timestamp &amp; epoch assignment (LogValidator)</h3>
+<p><code>LogValidator.validateMessagesAndAssignOffsets</code> (<code>LogValidator.java:123</code>) picks the cheapest viable strategy:</p>
+<ul>
+  <li><strong>In-place</strong> (<code>assignOffsetsNonCompressed</code>, <code>LogValidator.java:209</code>) when source and target are uncompressed and the magic already matches — it mutates each batch header: <code>setLastOffset(offsetCounter−1)</code>, <code>setPartitionLeaderEpoch(...)</code>, and <code>setMaxTimestamp(...)</code>, advancing a shared <code>offsetCounter</code> by one per record.</li>
+  <li><strong>Re-build</strong> (<code>convertAndAssignOffsetsNonCompressed</code>) when a format conversion is needed.</li>
+  <li><strong>Decompress/recompress</strong> (<code>validateMessagesAndAssignOffsetsCompressed</code>) for compressed data.</li>
+</ul>
+<p>If <code>message.timestamp.type=LogAppendTime</code>, all records take the broker wall-clock <code>now</code>; otherwise <code>CreateTime</code> values are validated against <code>message.timestamp.before/after.max.ms</code>. The leader epoch is stamped into every v2 batch header here, then re-asserted into the epoch cache in <code>UnifiedLog</code> at step 7. A regression to a pre-v2 magic causes the epoch cache to be <em>cleared</em> so the broker falls back to HW-based truncation (<code>UnifiedLog.java:1216–1224</code>).</p>
+
+<h3>Follower append</h3>
+<p><code>appendAsFollower</code> (<code>UnifiedLog.java:1080</code>) passes <code>validateAndAssignOffsets=false</code>: offsets are taken verbatim from the leader. The path still rebuilds producer state, updates the epoch cache from batch headers, and writes the txn index, but skips offset assignment and most validation. See <a href="09-fetch-path.html">Replica Fetchers</a>.</p>
+
+<h3>Writing into the segment &amp; the sparse index</h3>
+<p><code>LocalLog.append</code> (<code>LocalLog.java:527</code>) calls <code>activeSegment().append(lastOffset, records)</code> then bumps the LEO to <code>lastOffset+1</code> via <code>updateLogEndOffset</code> (which rebuilds <code>nextOffsetMetadata</code> from the active segment's base offset and current size, <code>LocalLog.java:304</code>). Inside <code>LogSegment.append</code> (<code>LogSegment.java:251</code>):</p>
+<ol>
+  <li>Record <code>physicalPosition = log.sizeInBytes()</code>; verify the largest offset is convertible to a relative offset (else <code>LogSegmentOffsetOverflowException</code>).</li>
+  <li><code>log.append(records)</code> writes the bytes to the channel.</li>
+  <li>For each batch: update <code>maxTimestampAndOffsetSoFar</code>; if <code>bytesSinceLastIndexEntry &gt; indexIntervalBytes</code>, append <code>(lastOffset → physicalPosition)</code> to the offset index and <code>(maxTs → offset)</code> to the time index, then reset the byte counter.</li>
+</ol>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Offsets in a segment's data file and offset-index are strictly increasing; the index is <em>sparse</em> (one entry per ≥<code>index.interval.bytes</code>). <code>OffsetIndex.append</code> throws <code>InvalidOffsetException</code> if asked to append a non-increasing offset (<code>OffsetIndex.java:156</code>), and the position must equal <code>entries·8</code> (<code>OffsetIndex.java:154</code>).</p></div>
+
+<h2>Segment rolling</h2>
+<p><code>maybeRoll</code> (<code>UnifiedLog.java:2146</code>) asks the active segment <code>shouldRoll(RollParams)</code> (<code>LogSegment.java:168</code>), which rolls when <strong>any</strong> of:</p>
+<ul>
+  <li>adding this batch would exceed <code>segment.bytes</code> (<code>size &gt; maxSegmentBytes − messagesSize</code>), or</li>
+  <li>the segment is non-empty and has waited longer than <code>segment.ms − rollJitterMs</code> (time measured from the <em>first batch's</em> timestamp if present, else create time — <code>timeWaitedForRoll</code>, <code>LogSegment.java:714</code>), or</li>
+  <li>the offset index or time index <code>isFull()</code>, or</li>
+  <li>the next offset cannot be expressed relative to the base offset (<code>canConvertToRelativeOffset</code>).</li>
+</ul>
+<p>The new base offset is normally <code>appendInfo.firstOffset()</code>; for pre-v2 formats where the first offset is unknown it is conservatively <code>maxOffsetInMessages − Integer.MAX_VALUE</code> (<code>UnifiedLog.java:2174</code>). <code>roll(expectedNextOffset)</code> (<code>UnifiedLog.java:2201</code>) then: snapshots producer state aligned to the new base offset, opens the new segment via <code>LocalLog.roll</code> (which calls <code>onBecomeInactiveSegment()</code> on the old segment to write the final time-index entry and trim indexes), updates the HW, and <em>asynchronously</em> flushes the old segment and snapshot on the scheduler thread to avoid holding the partition lock across fsync.</p>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>If <code>segment.index.bytes</code> is set so small that <code>maxEntries</code> rounds to 0, an empty active segment can report <code>isFull()==true</code> and try to roll onto its own base offset. <code>LocalLog.roll</code> has an explicit KAFKA-6388 branch that recreates the zero-size segment in place instead of throwing (<code>LocalLog.java:595–610</code>).</p></div>
+
+<h2>The read / fetch-by-offset path</h2>
+<p>Reads enter <code>UnifiedLog.read(startOffset, maxLength, isolation, minOneMessage)</code> (<code>UnifiedLog.java:1649</code>). The isolation level selects the upper bound: <code>LOG_END</code> → LEO, <code>HIGH_WATERMARK</code> → HW, <code>TXN_COMMITTED</code> → last stable offset. It then delegates to <code>LocalLog.read</code> (<code>LocalLog.java:463</code>):</p>
+<ol>
+  <li>Bound-check: throw <code>OffsetOutOfRangeException</code> if <code>startOffset &gt; LEO</code> or no floor segment exists.</li>
+  <li>If <code>startOffset == maxOffset</code> (e.g. caught up to HW) return an empty <code>FetchDataInfo</code> immediately.</li>
+  <li><code>segments.floorSegment(startOffset)</code> finds the segment whose base offset is ≤ start; iterate forward until a segment yields data.</li>
+  <li>Compute <code>maxPosition</code>: full segment size if the bound is in a later segment, else the bound's relative position, else empty.</li>
+  <li><code>segment.read(...)</code> → <code>translateOffset</code> → <code>offsetIndex().lookup(offset)</code> gives a greatest-lower-bound position, then <code>FileRecords.searchForOffsetFromPosition</code> scans forward to the exact batch (<code>LogSegment.java:399–464</code>). The result is a zero-copy <code>FileRecords.slice</code>.</li>
+  <li>For <code>TXN_COMMITTED</code>, <code>addAbortedTransactions</code> attaches the overlapping aborted-txn list (<code>LocalLog.java:532</code>).</li>
+</ol>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">read(offset O)</span><span class="nd">isolation bounds upper offset (LEO / HW / LSO)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage"><span class="nt">segments.floorSegment(O)</span><span class="nd">⇒ segment S with baseOffset ≤ O</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage store"><span class="nt">OffsetIndex.lookup(O)</span><span class="nd">⇒ (O′, pos): greatest indexed offset ≤ O (sparse — O′ may be below O)</span></div>
+  <div class="conn" data-label="scan ≤ index.interval.bytes"></div>
+  <div class="node cat-storage"><span class="nt">FileRecords.searchForOffsetFromPosition(O, pos)</span><span class="nd">scan batches from <code>pos</code> forward to the exact batch containing O</span></div>
+  <div class="conn ec-data"></div>
+  <div class="node cat-storage"><span class="nt">FileRecords.slice(startPosition, fetchSize)</span><span class="nd">zero-copy <code>FileRecords</code> view returned to the fetch path</span></div>
+</div><figcaption>Offset translation = sparse index lookup + short forward scan. The forward scan length is bounded by <code>index.interval.bytes</code>.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-broker"></span><b>broker</b> &mdash; <code>UnifiedLog.read</code> entry point</span>
+    <span class="lgi"><span class="sw cat-storage"></span><b>storage</b> &mdash; segment / index / file lookup</span>
+    <span class="lgi"><span class="sw cat-storage cyl"></span>cylinder = mmap'd index lookup</span>
+    <span class="lgi"><span class="arr"></span>step (top → bottom)</span>
+    <span class="lgi"><span class="mono">Class.method()</span> = exact call site</span>
+  </div></figure>
+
+<h2>Offset boundaries: LSO, LEO, HW, recovery point</h2>
+<p><code>UnifiedLog</code> maintains the offset invariants. The HW can never exceed the LEO (<code>maybeIncrementHighWatermark</code> guards <code>newHW.messageOffset &gt; logEndOffset()</code>, <code>UnifiedLog.java:564</code>) and increases monotonically (<code>maybeIncrementHighWatermark</code> only moves it forward). Advancing the LSO requires <code>newLogStartOffset ≤ HW</code> (<code>maybeIncrementLogStartOffset</code> throws <code>OffsetOutOfRangeException</code> otherwise, <code>UnifiedLog.java:1358</code>), and cascades into <code>leaderEpochCache.truncateFromStartAsyncFlush</code> and <code>producerStateManager.onLogStartOffsetIncremented</code>.</p>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><code>logStartOffset ≤ lastStableOffset ≤ highWatermark ≤ logEndOffset</code>, and <code>localLogStartOffset ≥ logStartOffset</code>. The HW and LSO are <code>volatile</code> so readers see updates without the lock; all <em>writes</em> happen under <code>synchronized(lock)</code>.</p></div>
+<p>The <strong>recovery point</strong> is decoupled from durability of bytes: <code>flush(offset, includingOffset)</code> (<code>UnifiedLog.java:2254</code>) only fsyncs and advances the recovery point when <code>flushOffset &gt; recoveryPoint</code>; an in-band flush fires when <code>unflushedMessages ≥ flush.messages</code> (default <code>Long.MAX_VALUE</code>, i.e. rely on OS), and <code>LogManager</code> additionally flushes on <code>flush.ms</code>. Crucially, the recovery point is advanced only at an actual flush, never speculatively — so a crash after a checkpoint but before fsync still re-recovers the unflushed tail (<code>LogLoader.java:500–511</code>).</p>
+
+<h2>Crash recovery &amp; startup: LogLoader</h2>
+<p><code>LogLoader.load()</code> (<code>LogLoader.java:128</code>) reconstructs a <code>UnifiedLog</code> from disk in a fixed sequence of passes:</p>
+<ol>
+  <li><strong>Clean temp files / resolve swaps.</strong> Delete stray <code>.deleted</code> files; collect <code>.swap</code> files; delete <code>.cleaned</code> files. A <code>.swap</code> whose base offset ≥ the smallest <code>.cleaned</code> offset is from an incomplete compaction split and is removed (KAFKA-6264, <code>LogLoader.java:261–314</code>).</li>
+  <li><strong>Delete superseded segments</strong> between min/max swap offsets, then <strong>rename surviving <code>.swap</code></strong> files to live segments.</li>
+  <li><strong>Load all segments</strong> (<code>loadSegmentFiles</code>, <code>LogLoader.java:357</code>) in ascending order. For each <code>.log</code>: open the segment, run <code>sanityCheck</code>; an orphan index without a <code>.log</code> is deleted. A missing offset index or a <code>CorruptIndexException</code> triggers <code>recoverSegment</code>.</li>
+  <li><strong>recoverLog</strong> (<code>LogLoader.java:456</code>): <em>skipped entirely</em> if a clean-shutdown marker existed (<code>hadCleanShutdown</code>). Otherwise every segment from the recovery point up is recovered: <code>LogSegment.recover</code> replays batches, validates each (<code>ensureValid()</code>), rebuilds the offset/time indexes, re-derives the leader-epoch cache and producer state, and truncates the first invalid byte onward (<code>LogSegment.java:483–529</code>). If a segment is truncated, all later segments are deleted.</li>
+  <li><strong>Reconcile offsets &amp; producer state.</strong> Compute the new LSO; truncate the epoch cache to the recovered next offset and to the LSO; require producer state to be empty; <code>removeStraySnapshots</code>; then <code>rebuildProducerState</code> from the most recent snapshot up to the LEO (<code>LogLoader.java:220–250</code>).</li>
+</ol>
+<div class="callout note"><span class="callout-title">Note</span><p><code>LogSegment.sanityCheck</code> deliberately validates only the txn index and (for a newly created time index) resizes it to 0 — it skips offset/time-index sanity because any segment above the recovery point is going to be re-recovered anyway (<code>LogSegment.java:181–192</code>). Combined with <code>LazyIndex</code>, this is KIP-263's startup-time optimisation; KAFKA-19200 later revisited reintroducing some index sanity checking.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>If the on-disk <code>log-start-offset-checkpoint</code> exceeds the actual log end offset (e.g. segment files were deleted out from under the broker), <code>deleteSegmentsIfLogStartGreaterThanLogEnd</code> wipes all segments, clears the epoch cache, and restarts the log empty at the checkpoint (<code>LogLoader.java:423–439</code>). Hand-deleting segment files is therefore data loss, not a recovery tactic.</p></div>
+
+<h2>ProducerStateManager: idempotency, snapshots &amp; transactions</h2>
+<p><code>ProducerStateManager</code> (<code>ProducerStateManager.java:70</code>) keeps the per-partition state that makes the idempotent producer and transactions work. Core in-memory structures:</p>
+<ul>
+  <li><code>Map&lt;Long, ProducerStateEntry&gt; producers</code> — keyed by producer id. Each <code>ProducerStateEntry</code> retains a deque of up to <code>NUM_BATCHES_TO_RETAIN = 5</code> <code>BatchMetadata</code> records (<code>ProducerStateEntry.java:35</code>), enabling duplicate detection across the producer's last five in-flight batches.</li>
+  <li><code>TreeMap&lt;Long, TxnMetadata&gt; ongoingTxns</code> and <code>unreplicatedTxns</code> — open transactions keyed by first offset, used to compute the first unstable offset and the last stable offset.</li>
+  <li><code>Map&lt;Long, VerificationStateEntry&gt; verificationStates</code> — transaction-verification guards (KIP-890). See <a href="14-transactions-eos.html">Transactions</a>.</li>
+</ul>
+<p>On append, <code>analyzeAndValidateProducerState</code> (<code>UnifiedLog.java:1388</code>) checks each producer batch against <code>lastEntry.findDuplicateBatch</code>; a hit short-circuits the write and returns the original batch's offsets to the client. <code>lastStableOffset(completedTxn)</code> returns the first offset of the next still-open txn, or <code>completedTxn.lastOffset+1</code> if none (<code>ProducerStateManager.java:526</code>).</p>
+
+<h3>Snapshot file format</h3>
+<p>A snapshot named <code>&lt;lastOffset&gt;.snapshot</code> captures the producer table at a given offset (taken on every roll, <code>UnifiedLog.roll</code>). The layout (schema <code>ProducerSnapshot.json</code>, validVersions <code>1</code>; offsets <code>ProducerStateManager.java:74–76</code>):</p>
+<figure class="diagram">
+  <div class="bytemap">
+    <div class="bf" style="--w:2"><span class="bf-name">Version</span><span class="bf-meta">int16 · @0</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">CRC</span><span class="bf-meta">uint32 · @2</span></div>
+    <div class="bf" style="--w:10"><span class="bf-name">ProducerEntries[]</span><span class="bf-meta">length-prefixed array · @6</span></div>
+  </div>
+  <div class="bytemap-legend"><span>File header. CRC = Crc32C over bytes from @6 (PRODUCER_ENTRIES_OFFSET) to EOF.</span></div>
+  <p style="margin:.6rem 0 .2rem;font-size:.82rem;color:var(--fg-muted)">Each <code>ProducerEntry</code> (46 bytes):</p>
+  <div class="bytemap">
+    <div class="bf" style="--w:8"><span class="bf-name">ProducerId</span><span class="bf-meta">int64 · @0</span></div>
+    <div class="bf" style="--w:2"><span class="bf-name">Epoch</span><span class="bf-meta">int16 · @8</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">LastSequence</span><span class="bf-meta">int32 · @10</span></div>
+    <div class="bf" style="--w:8"><span class="bf-name">LastOffset</span><span class="bf-meta">int64 · @14</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">OffsetDelta</span><span class="bf-meta">int32 · @22</span></div>
+    <div class="bf" style="--w:8"><span class="bf-name">Timestamp</span><span class="bf-meta">int64 · @26</span></div>
+    <div class="bf" style="--w:4"><span class="bf-name">CoordinatorEpoch</span><span class="bf-meta">int32 · @34</span></div>
+    <div class="bf" style="--w:8"><span class="bf-name">CurrentTxnFirstOffset</span><span class="bf-meta">int64 · @38 · −1 = none</span></div>
+  </div>
+  <figcaption><code>writeSnapshot</code>/<code>readSnapshot</code> (<code>ProducerStateManager.java:618,664</code>). A CRC mismatch throws <code>CorruptSnapshotException</code> and the snapshot is discarded.</figcaption>
+  <div class="legend">
+    <span class="lgi">each coloured cell = one fixed-width field (colour distinguishes adjacent fields only)</span>
+    <span class="lgi"><span class="mono">@n</span> = byte offset within the record &middot; <span class="mono">width</span> ∝ field size</span>
+    <span class="lgi"><b>header</b> = 6 B then a length-prefixed array of <b>46-byte</b> <code>ProducerEntry</code> records</span>
+    <span class="lgi"><span class="mono">int16/int32/int64/uint32</span> = field type &amp; size</span>
+  </div>
+</figure>
+<p>Recovery reads the most recent snapshot at or below the target offset and replays only the segments after it (<code>rebuildProducerState</code>, <code>UnifiedLog.java:2534</code>) — avoiding a full-log rescan. After a clean shutdown with <em>no</em> snapshots (an upgrade), it skips the scan and writes a fresh snapshot at the LEO.</p>
+
+<h2>LeaderEpochFileCache</h2>
+<p>This cache (<code>LeaderEpochFileCache.java:53</code>) maps each leader epoch to the first offset written in that epoch (<code>TreeMap&lt;Integer, EpochEntry&gt; epochs</code>, guarded by a <code>ReentrantReadWriteLock</code>). Its checkpoint is the plain-text <code>leader-epoch-checkpoint</code> file: a version line, a count line, then <code>epoch startOffset</code> per line (<code>LeaderEpochCheckpointFile.java:33–39,74</code>).</p>
+<p>The cache is the backbone of truncation-safe replication. <code>endOffsetFor(requestedEpoch, logEndOffset)</code> (<code>LeaderEpochFileCache.java:284</code>) answers an OffsetsForLeaderEpoch query: for the current epoch it returns the LEO; otherwise it returns the start offset of the <em>next</em> epoch (the requested epoch's exclusive end). A follower uses this to find exactly where its log diverged from the leader and truncate there — see <a href="08-replication.html">Replication &amp; ISR</a>. Truncations flush asynchronously (<code>truncateFromEndAsyncFlush</code>, <code>truncateFromStartAsyncFlush</code>) because they are called by <a href="09-fetch-path.html">replica-fetcher threads</a> where fsync latency would stall fetching.</p>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Epochs are append-only and strictly increasing; once assigned, an epoch's start offset is never reassigned (<code>LeaderEpochFileCache.assign</code>, <code>LeaderEpochFileCache.java:103</code>). The earliest cached epoch's start offset tracks the log start offset; the latest is the current leader epoch still being written.</p></div>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Config key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>segment.bytes</code></td><td><code>1073741824</code> (1 GiB)</td><td>Roll the active segment when it would exceed this size. Min 1 MiB. (<code>LogConfig.java:131</code>)</td></tr>
+<tr><td><code>segment.ms</code></td><td><code>604800000</code> (7 days)</td><td>Roll a non-empty segment after this much time (measured from first-batch timestamp). (<code>LogConfig.java:132</code>)</td></tr>
+<tr><td><code>segment.jitter.ms</code></td><td><code>0</code></td><td>Random jitter subtracted from <code>segment.ms</code> to de-synchronize rolling across partitions (<code>randomSegmentJitter</code>, <code>LogConfig.java:384</code>).</td></tr>
+<tr><td><code>segment.index.bytes</code></td><td><code>10485760</code> (10 MiB)</td><td>Pre-allocated max size of each offset/time index file; also bounds entries per segment (<code>ServerLogConfigs.LOG_INDEX_SIZE_MAX_BYTES_DEFAULT</code>).</td></tr>
+<tr><td><code>index.interval.bytes</code></td><td><code>4096</code></td><td>Approx. bytes of log between sparse index entries; smaller = denser index, faster lookup, more memory (<code>ServerLogConfigs.LOG_INDEX_INTERVAL_BYTES_DEFAULT</code>).</td></tr>
+<tr><td><code>flush.messages</code></td><td><code>Long.MAX_VALUE</code></td><td>Force an fsync after this many appended messages; default defers to the OS page cache (<code>LOG_FLUSH_INTERVAL_MESSAGES_DEFAULT</code>).</td></tr>
+<tr><td><code>flush.ms</code></td><td><code>Long.MAX_VALUE</code></td><td>Max time before forcing an fsync (driven by <code>LogManager</code>'s flush scheduler).</td></tr>
+<tr><td><code>preallocate</code></td><td><code>false</code></td><td>Pre-allocate the segment file to <code>segment.bytes</code> on creation (<code>initFileSize</code>, <code>LogConfig.java:398</code>); useful on Windows.</td></tr>
+</tbody>
+</table></div>
+<p>These are <em>topic-level</em> keys; the broker defaults come from <code>log.*</code> server configs of the same meaning. The <code>warmEntries()</code> size (8 KiB) is a hard-coded constant, not configurable.</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Offset overflow.</strong> A batch whose last offset cannot fit in 4 bytes relative to the base offset throws <code>LogSegmentOffsetOverflowException</code>; <code>LogLoader.retryOnOffsetOverflow</code> splits the legacy segment into compliant ones and retries (KAFKA-6264, <code>LogLoader.java:326</code>).</li>
+  <li><strong>Corrupt index.</strong> Indexes carry no checksum — on a <code>CorruptIndexException</code> or a missing index the segment is recovered and the index rebuilt from the log (<code>LogLoader.java:384</code>).</li>
+  <li><strong>Truncated/torn tail.</strong> <code>LogSegment.recover</code> stops at the first batch that fails <code>ensureValid()</code> and truncates the log + indexes to the last valid byte (<code>LogSegment.java:515–528</code>).</li>
+  <li><strong>Txn-index inconsistency after partial append.</strong> The data append and LEO bump happen <em>before</em> the txn-index write, so a failure between them can leave the txn index behind; the comment at <code>UnifiedLog.java:1256–1261</code> notes this is reconciled during recovery and the LSO simply does not advance.</li>
+  <li><strong>Disk failure.</strong> Mutating ops are wrapped by <code>maybeHandleIOException</code>, which signals the <code>LogDirFailureChannel</code> and converts to <code>KafkaStorageException</code>, taking the log dir offline rather than corrupting state.</li>
+  <li><strong>Unclean shutdown.</strong> Absence of the clean-shutdown marker forces full recovery from the recovery point; a clean marker skips it entirely.</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+<dl class="kv">
+  <dt><a href="01-record-format.html">Record format</a></dt><dd>The bytes a segment stores are v2 record batches; the engine reads batch headers (offsets, epoch, producer id, max timestamp) but never decompresses on the read hot path.</dd>
+  <dt><a href="08-replication.html">Replication &amp; ISR</a></dt><dd>The leader assigns offsets and the HW; followers append verbatim and use <code>LeaderEpochFileCache.endOffsetFor</code> to truncate. The HW gates consumer visibility.</dd>
+  <dt><a href="09-fetch-path.html">Fetch path</a></dt><dd><code>UnifiedLog.read</code> produces the zero-copy <code>FileRecords.slice</code> the fetch session returns; <code>collectAbortedTransactions</code> feeds <code>READ_COMMITTED</code>.</dd>
+  <dt><a href="04-storage-management.html">Log management</a></dt><dd><code>LogManager</code> owns the <code>UnifiedLog</code> instances, the recovery/HW/LSO checkpoint files, the flush scheduler, and retention/compaction (<code>deleteOldSegments</code>, the <code>LogCleaner</code>).</dd>
+  <dt><a href="05-tiered-storage.html">Tiered storage</a></dt><dd><code>localLogStartOffset</code>/<code>highestOffsetInRemoteStorage</code> let the local log be the hot tail while older segments live remotely.</dd>
+  <dt><a href="14-transactions-eos.html">Transactions / EOS</a></dt><dd><code>ProducerStateManager</code> + <code>TransactionIndex</code> implement idempotent dedup, the last stable offset, and aborted-txn reporting.</dd>
+  <dt><a href="10-kraft-consensus.html">KRaft</a></dt><dd>The controller quorum's metadata log is a specialised consumer of the same segment/index machinery (a Raft log over <code>FileRecords</code>).</dd>
+</dl>
+
+<h2>Design rationale &amp; evolution</h2>
+<ul>
+  <li><span class="pill kip">KIP-33</span> Added the time index (<code>.timeindex</code>) enabling offset-by-timestamp lookups — the structure and "max timestamp before offset" semantics described above.</li>
+  <li><span class="pill kip">KIP-263</span> Lazy index mmap (<code>LazyIndex</code>) + skipping sanity checks of inactive segments on startup, slashing broker restart time for log directories with many segments.</li>
+  <li><span class="pill kip">KIP-101</span>/<span class="pill kip">KIP-279</span> Introduced leader-epoch-based truncation, replacing HW-based truncation; the persisted <code>leader-epoch-checkpoint</code> and <code>endOffsetFor</code> logic are its on-disk footprint.</li>
+  <li><span class="pill kip">KIP-890</span> Transaction-verification guards (the <code>VerificationStateEntry</code> map) hardening hanging-transaction handling.</li>
+  <li>The Scala→Java migration of <code>kafka.log</code> into <code>org.apache.kafka.storage.internals.log</code> made the engine reusable by KRaft and tiered storage and is why <code>UnifiedLog</code> (not the old <code>kafka.log.Log</code>) is the entry point in 4.x.</li>
+</ul>
+
+<h2>Gotchas &amp; operational notes</h2>
+<ul>
+  <li><strong>Two different "LSO"s.</strong> "Log start offset" and "last stable offset" share the acronym; in code they are <code>logStartOffset</code> vs. the value from <code>lastStableOffset()</code>. Read the surrounding context.</li>
+  <li><strong>Indexes are disposable.</strong> Deleting <code>.index</code>/<code>.timeindex</code> files is safe — they are rebuilt on next recovery. Deleting <code>.log</code> files is data loss and can trip the "log start &gt; log end" wipe path.</li>
+  <li><strong>Snapshots gate fast recovery.</strong> Missing <code>.snapshot</code> files force a producer-state rescan from earlier in the log; routine roll-time snapshots keep recovery cheap.</li>
+  <li><strong>Default durability is OS-driven.</strong> With <code>flush.messages</code>/<code>flush.ms</code> at their maxima, Kafka relies on replication, not fsync, for durability; the recovery point stays well behind the LEO by design.</li>
+  <li><strong>Index density is a memory/latency trade.</strong> Lowering <code>index.interval.bytes</code> shortens the forward scan after a lookup but enlarges mmap'd index files and page-cache pressure.</li>
+</ul>
+
+<p>For the per-partition lifecycle that wraps this engine — assignment, leadership, and HW propagation — see <a href="08-replication.html">Replication, ISR &amp; High Watermark</a> and <a href="12-metadata-propagation.html">Metadata Propagation</a>; for retention, compaction, and the checkpoint files, see <a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a>.</p>

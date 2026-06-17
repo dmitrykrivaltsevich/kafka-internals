@@ -1,0 +1,13 @@
+# The Apache Kafka source clone — large (~111 MB), redundant, and not part of the
+# published site. The guide cites it by path:line; clone it yourself to follow along:
+#   git clone --depth 1 https://github.com/apache/kafka.git kafka-source
+kafka-source/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+Thumbs.db
+
+# Node
+node_modules/

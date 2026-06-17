@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security · Kafka Internals</title>
+<meta name="description" content="SASL/SSL/OAuth/SCRAM/Kerberos, delegation tokens, the Authorizer, KRaft ACLs, principal building.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="18-security">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>18 · Security: Authentication &amp; Authorization</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Kafka's security model has two largely independent halves. <strong>Wire security</strong> decides who a connection belongs to: every listener carries a <code>SecurityProtocol</code> that selects a pluggable <code>ChannelBuilder</code>, which wraps each socket in a <code>KafkaChannel</code> with an optional TLS <code>SslTransportLayer</code> and/or a SASL <code>Authenticator</code> exchanging <code>SaslHandshake</code>/<code>SaslAuthenticate</code> frames; the outcome is a <code>KafkaPrincipal</code>. <strong>Access control</strong> then decides what that principal may do: the broker calls a pluggable <code>Authorizer</code> &mdash; in KRaft the built-in <code>StandardAuthorizer</code>, whose ACL bindings are sourced from <code>AccessControlEntryRecord</code>s in the replicated metadata log, so ACLs propagate exactly like topic metadata. This chapter traces both paths from the byte level up: TLS and SASL channel construction, the SCRAM/PLAIN/GSSAPI/OAUTHBEARER mechanisms, principal building, and the deny-wins ACL evaluation algorithm invoked on every request.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The security subsystem sits at the boundary between the <a href="06-network-and-threading.html">network layer</a> and <a href="07-request-processing.html">request processing</a>. Its responsibilities:</p>
+<ul>
+<li><strong>Confidentiality &amp; integrity</strong> via TLS on <code>SSL</code> and <code>SASL_SSL</code> listeners (the JDK <code>SSLEngine</code> wrapped by <code>SslTransportLayer</code>).</li>
+<li><strong>Authentication</strong>: prove client (and broker) identity, either from a TLS client certificate (mutual TLS) or a SASL exchange (<code>PLAIN</code>, <code>SCRAM-SHA-256/512</code>, <code>GSSAPI</code>, <code>OAUTHBEARER</code>). The result is a <code>KafkaPrincipal</code> attached to the channel.</li>
+<li><strong>Principal building</strong>: map a TLS X.500 subject or a SASL authorization ID to a <code>KafkaPrincipal</code> via a configurable <code>KafkaPrincipalBuilder</code>.</li>
+<li><strong>Authorization</strong>: for each request action, evaluate ACLs and return <code>ALLOWED</code>/<code>DENIED</code>. ACL <em>storage</em> (in KRaft, the metadata log) and ACL <em>evaluation</em> are both owned here.</li>
+<li><strong>Credential management</strong>: persist SCRAM credentials and delegation tokens (as replicated metadata records / a token cache) and feed them to the SASL servers.</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Authentication and authorization are decoupled. Authentication runs once per connection (plus periodic re-auth) inside the network thread before any application request is read; authorization runs per-action on the request-handler thread using a locally cached, metadata-replicated ACL set. A connection can be authenticated yet authorized for nothing.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Principal class</th><th>File</th></tr></thead>
+<tbody>
+<tr><td>Channel factory dispatch</td><td><code>ChannelBuilders</code></td><td><code>clients/src/main/java/org/apache/kafka/common/network/ChannelBuilders.java</code></td></tr>
+<tr><td>TLS channel builder</td><td><code>SslChannelBuilder</code></td><td><code>clients/.../common/network/SslChannelBuilder.java</code></td></tr>
+<tr><td>SASL channel builder</td><td><code>SaslChannelBuilder</code></td><td><code>clients/.../common/network/SaslChannelBuilder.java</code></td></tr>
+<tr><td>TLS transport / handshake</td><td><code>SslTransportLayer</code></td><td><code>clients/.../common/network/SslTransportLayer.java</code></td></tr>
+<tr><td>SSL engine factory</td><td><code>SslFactory</code>, <code>DefaultSslEngineFactory</code></td><td><code>clients/.../common/security/ssl/SslFactory.java</code></td></tr>
+<tr><td>SASL server / client state machine</td><td><code>SaslServerAuthenticator</code>, <code>SaslClientAuthenticator</code></td><td><code>clients/.../common/security/authenticator/</code></td></tr>
+<tr><td>SCRAM server / crypto</td><td><code>ScramSaslServer</code>, <code>ScramFormatter</code></td><td><code>clients/.../common/security/scram/internals/</code></td></tr>
+<tr><td>Principal builder</td><td><code>DefaultKafkaPrincipalBuilder</code></td><td><code>clients/.../common/security/authenticator/DefaultKafkaPrincipalBuilder.java</code></td></tr>
+<tr><td>Authorizer SPI</td><td><code>Authorizer</code>, <code>Action</code>, <code>AuthorizationResult</code></td><td><code>clients/.../server/authorizer/</code></td></tr>
+<tr><td>KRaft authorizer</td><td><code>StandardAuthorizer</code>, <code>StandardAuthorizerData</code>, <code>AclCache</code></td><td><code>metadata/.../metadata/authorizer/</code></td></tr>
+<tr><td>ACL record on the wire/disk</td><td><code>StandardAcl</code>, <code>AccessControlEntryRecord</code></td><td><code>metadata/.../metadata/authorizer/StandardAcl.java</code>, <code>metadata/src/main/resources/common/metadata/AccessControlEntryRecord.json</code></td></tr>
+<tr><td>Controller ACL/SCRAM managers</td><td><code>AclControlManager</code>, <code>ScramControlManager</code></td><td><code>metadata/.../controller/</code></td></tr>
+<tr><td>Metadata-to-runtime publishers</td><td><code>AclPublisher</code>, <code>ScramPublisher</code></td><td><code>metadata/.../metadata/publisher/</code></td></tr>
+<tr><td>Broker-side authorize helper</td><td><code>AuthHelper</code></td><td><code>core/src/main/scala/kafka/server/AuthHelper.scala</code></td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+<dt>SecurityProtocol</dt><dd>Per-listener enum: <code>PLAINTEXT(0)</code>, <code>SSL(1)</code>, <code>SASL_PLAINTEXT(2)</code>, <code>SASL_SSL(3)</code> &mdash; <code>SecurityProtocol.java:28</code>. The numeric ids are permanent and must match across releases.</dd>
+<dt>KafkaPrincipal</dt><dd>A <code>(principalType, name)</code> pair; <code>type</code> is <code>"User"</code> for the default authorizer (<code>KafkaPrincipal.java:44</code>). Its <code>toString()</code> is <code>"User:name"</code>, which is exactly the string form used in ACLs and <code>super.users</code>.</dd>
+<dt>Authorization ID</dt><dd>The SASL-level identity (<code>SaslServer.getAuthorizationID()</code>) that the principal builder turns into a <code>KafkaPrincipal</code>.</dd>
+<dt>ACL binding</dt><dd>A <code>ResourcePattern</code> (type + name + <code>PatternType</code>) joined to an <code>AccessControlEntry</code> (principal, host, operation, permission). Stored as <code>StandardAcl</code>.</dd>
+<dt>PatternType</dt><dd><code>LITERAL(3)</code> (exact name, or <code>*</code> wildcard) or <code>PREFIXED(4)</code> (name prefix). <code>MATCH/ANY</code> exist only in filters.</dd>
+<dt>Action</dt><dd>What the broker asks the authorizer about: an <code>AclOperation</code> on a literal <code>ResourcePattern</code>, with <code>resourceReferenceCount</code> and <code>logIfAllowed/logIfDenied</code> hints (<code>Action.java:25</code>).</dd>
+</dl>
+
+<h2>Architecture &amp; control flow</h2>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">Listener</span><span class="nd">name + SecurityProtocol</span></div>
+  <div class="conn" data-label="serverChannelBuilder / clientChannelBuilder"></div>
+  <div class="node cat-broker decision">create(securityProtocol, mode)?<span class="nd">ChannelBuilders.java:109</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="PLAINTEXT"></div>
+      <div class="node cat-broker"><span class="nt">PlaintextChannelBuilder</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="SSL"></div>
+      <div class="node cat-broker"><span class="nt">SslChannelBuilder</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="SASL_*"></div>
+      <div class="node cat-broker"><span class="nt">SaslChannelBuilder</span><span class="nd">JaasContext per mechanism</span></div>
+    </div>
+  </div>
+  <div class="conn" data-label="buildChannel(id, key)"></div>
+  <div class="node cat-broker"><span class="nt">KafkaChannel</span><span class="nd">TransportLayer (Plaintext &#8739; SslTransportLayer) + Authenticator (lazy Supplier: none from TLS &#8739; SASL FSM)</span></div>
+  <div class="conn" data-label="prepare(): TLS handshake, then SASL exchange"></div>
+  <div class="node cat-coord"><span class="nt">Authenticator.principal()</span><span class="nd">&rArr; KafkaPrincipal</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">attached to every RequestContext</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">Authorizer.authorize(ctx, actions)</span></div>
+</div><figcaption>From listener security protocol to an authenticated principal feeding authorization: <code>create()</code> dispatches on the <code>SecurityProtocol</code> to one of three channel builders, each producing a <code>KafkaChannel</code> whose transport layer and authenticator together yield the <code>KafkaPrincipal</code>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker network / channel component</span>
+  <span class="lgi"><span class="sw cat-coord"></span>authentication outcome (principal)</span>
+  <span class="lgi">rounded = decision (protocol dispatch)</span>
+  <span class="lgi"><span class="arr"></span>construction / control flow (label = method or branch)</span>
+  <span class="lgi"><span class="mono">Class</span> = source identifier</span>
+</div></figure>
+
+<p>The two factory entry points are <code>serverChannelBuilder(...)</code> and <code>clientChannelBuilder(...)</code> in <code>ChannelBuilders.java:95</code> / <code>:63</code>; both funnel into the private <code>create(...)</code> at <code>ChannelBuilders.java:109</code>, which switches on the <code>SecurityProtocol</code>. For server SASL it loads one <code>JaasContext</code> per enabled mechanism (<code>ChannelBuilders.java:138</code>). Notably, for a <code>SASL_SSL</code> server listener, TLS client authentication is forced off unless explicitly re-enabled with a listener-prefixed <code>ssl.client.auth</code>: the code computes <code>sslClientAuthOverride = NONE</code> (<code>ChannelBuilders.java:152</code>) because SASL is the source of identity.</p>
+
+<h3>Where the principal comes from</h3>
+<p>For <code>PLAINTEXT</code>, the principal is always <code>KafkaPrincipal.ANONYMOUS</code> (<code>DefaultKafkaPrincipalBuilder.java:70</code>). For <code>SSL</code>, the principal is derived from the peer certificate's X.500 subject and run through the <code>SslPrincipalMapper</code> rules (<code>DefaultKafkaPrincipalBuilder.java:100</code>); if the peer presented no certificate (<code>SSLPeerUnverifiedException</code>), it falls back to <code>ANONYMOUS</code>. For SASL, <code>GSSAPI</code> authorization IDs are shortened via Kerberos rules, while all other mechanisms wrap the authorization ID directly as <code>User:&lt;authzId&gt;</code> (<code>DefaultKafkaPrincipalBuilder.java:78</code>).</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p>The principal builder is itself pluggable via <code>principal.builder.class</code> (default <code>DefaultKafkaPrincipalBuilder</code>, <code>BrokerSecurityConfigs.java:72</code>). Custom builders enable group/role principals, but the built-in <code>StandardAuthorizer</code> only understands a single <code>(type, name)</code> pair per ACL.</p></div>
+
+<h2>TLS: SslTransportLayer, SslFactory and mutual TLS</h2>
+<p>TLS is provided by the JDK <code>SSLEngine</code>. <code>SslFactory</code> (<code>SslFactory.java:54</code>) owns a pluggable <code>SslEngineFactory</code> (default <code>DefaultSslEngineFactory</code>, selected by <code>ssl.engine.factory.class</code>, <code>SslFactory.java:135</code>) which loads the keystore and truststore and stamps <code>ssl.client.auth</code> onto each engine. On a server listener, <code>createServerSslEngine(peerHost, peerPort)</code> is used; on a client, <code>createClientSslEngine(..., endpointIdentification)</code> is used and the engine performs hostname verification when <code>ssl.endpoint.identification.algorithm</code> is non-empty (default <code>https</code>).</p>
+
+<p><code>SslTransportLayer</code> drives the handshake as a non-blocking state machine inside the network thread. <code>handshake()</code> (<code>SslTransportLayer.java:280</code>) loops over <code>doHandshake()</code> (<code>:335</code>) dispatching on the engine's <code>HandshakeStatus</code>:</p>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker decision">doHandshake() &mdash; switch on HandshakeStatus<span class="nd">SslTransportLayer.java:335</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn" data-label="NEED_WRAP"></div>
+      <div class="node cat-broker"><span class="nt">handshakeWrap()</span><span class="nd">produce TLS records into netWriteBuffer, flush</span></div>
+      <div class="conn dashed" data-label="loop ↩"></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="NEED_UNWRAP"></div>
+      <div class="node cat-broker"><span class="nt">handshakeUnwrap()</span><span class="nd">read peer records from netReadBuffer, feed engine</span></div>
+      <div class="conn dashed" data-label="loop ↩"></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="NEED_TASK"></div>
+      <div class="node cat-broker"><span class="nt">runDelegatedTasks()</span><span class="nd">run blocking crypto tasks (e.g. cert validation)</span></div>
+      <div class="conn dashed" data-label="loop ↩"></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-data" data-label="FINISHED / NOT_HANDSHAKING"></div>
+      <div class="node cat-storage"><span class="nt">handshake complete</span><span class="nd">app data may flow</span></div>
+    </div>
+  </div>
+</div><figcaption>Non-blocking TLS handshake: <code>doHandshake()</code> loops, dispatching on the engine's <code>HandshakeStatus</code>. <code>OP_WRITE</code>/<code>OP_READ</code> interest is toggled as wrap/unwrap need more I/O; the three work branches re-enter the switch until the engine reports <code>FINISHED</code>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker network-thread step (handshake work)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>handshake complete (app data flows)</span>
+  <span class="lgi">rounded = decision (HandshakeStatus dispatch)</span>
+  <span class="lgi"><span class="arr"></span>branch taken (label = HandshakeStatus)</span>
+  <span class="lgi"><span class="arr dashed"></span>loop back into doHandshake()</span>
+  <span class="lgi"><span class="arr ec-data"></span>handshake finished</span>
+</div></figure>
+
+<p>The <code>ssl.client.auth</code> setting (enum <code>SslClientAuth</code>: <code>REQUIRED</code>, <code>REQUESTED</code>, <code>NONE</code>; default <code>NONE</code>, <code>BrokerSecurityConfigs.java:86</code>) controls mutual TLS. With <code>REQUIRED</code>, the client must present a trusted certificate; its X.500 subject becomes the principal. After the handshake, <code>SslTransportLayer.sslSession()</code> exposes the <code>SSLSession</code> that the principal builder reads.</p>
+
+<h3>Dynamic keystore reconfiguration</h3>
+<p>Brokers can hot-swap keystores without restart. <code>SslFactory.reconfigure()</code> (<code>SslFactory.java:125</code>) builds a fresh engine factory and, crucially, validates compatibility: you cannot add or remove a keystore/truststore on an existing listener, and by default the new certificate's Distinguished Name and Subject Alternative Names must match the old one's (<code>CertificateEntries.ensureCompatible</code>, <code>SslFactory.java:313</code>). These checks are relaxed only by <code>ssl.allow.dn.changes</code> / <code>ssl.allow.san.changes</code> (both default <code>false</code>, <code>BrokerSecurityConfigs.java:123</code>/<code>:128</code>). For inter-broker listeners, <code>SslEngineValidator</code> (<code>SslFactory.java:402</code>) runs a full in-memory client/server handshake to prove the new config interoperates before committing it.</p>
+
+<h2>SASL: the authentication state machine</h2>
+<p>On a SASL listener, application bytes cannot be read until authentication completes. <code>SaslServerAuthenticator</code> (<code>SaslServerAuthenticator.java:93</code>) implements a precise state machine, driven by repeated <code>authenticate()</code> calls from the network thread as bytes arrive. Each SASL frame on the wire is a 4-byte big-endian length followed by an opaque payload (<code>SaslServerAuthenticator.java:245</code>).</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">first frame: ApiVersions or SaslHandshake</span><span class="ta"></span></span>
+  <span class="st">INITIAL_REQUEST</span>
+  <span class="tr"><span class="tl">read first frame</span><span class="ta"></span></span>
+  <span class="st">HANDSHAKE_OR_VERSIONS_REQUEST</span>
+  <span class="tr"><span class="tl">ApiVersions (client discovers versions first)</span><span class="ta"></span></span>
+  <span class="st">HANDSHAKE_REQUEST</span>
+  <span class="tr"><span class="tl">SaslHandshake → createSaslServer (v1+ wraps tokens in SaslAuthenticate)</span><span class="ta"></span></span>
+  <span class="st">AUTHENTICATE</span>
+  <span class="tr"><span class="tl">saslServer.isComplete()</span><span class="ta"></span></span>
+  <span class="st accent">COMPLETE</span>
+  <span class="term end"></span>
+  <div class="note"><strong>Shortcut &amp; failure edges</strong> (off the main spine):
+    <br>· <span class="mono">HANDSHAKE_OR_VERSIONS_REQUEST → AUTHENTICATE</span> — first frame is already a SaslHandshake, so createSaslServer runs immediately (skips HANDSHAKE_REQUEST)
+    <br>· <span class="mono">AUTHENTICATE → FAILED</span> — AuthenticationException: send failure response, then throw (terminal)
+  </div>
+  <div class="note"><strong>Re-authentication</strong> (KIP-368, long-lived connection):
+    <br>· <span class="mono">◉ → REAUTH_PROCESS_HANDSHAKE</span> — a re-auth begins on the established connection
+    <br>· <span class="mono">REAUTH_PROCESS_HANDSHAKE → AUTHENTICATE</span> — same mechanism rejoins the normal authenticate loop
+    <br>· <span class="mono">REAUTH_PROCESS_HANDSHAKE → REAUTH_BAD_MECHANISM</span> — mechanism changed → throw (terminal)
+  </div>
+</div><figcaption>Server SASL state machine (<code>SaslServerAuthenticator.java:108</code>), driven by repeated <code>authenticate()</code> calls as frames arrive. The happy path runs <code>INITIAL_REQUEST → … → AUTHENTICATE → COMPLETE</code>; bad credentials reach the terminal <code>FAILED</code> state, and re-authentication rejoins at <code>AUTHENTICATE</code> only if the mechanism is unchanged.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw round"></span>pill = SASL authenticator state</span>
+  <span class="lgi"><span class="sw cat-storage round"></span>accent = COMPLETE (authenticated)</span>
+  <span class="lgi">◉ = initial · ◉ end = terminal (COMPLETE / FAILED)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger frame / call)</span>
+  <span class="lgi"><span class="mono">A → B</span> = off-spine edge (see notes)</span>
+</div></figure>
+
+<h3>Handshake details</h3>
+<p>The very first frame must be either an <code>ApiVersions</code> request (so the client can discover supported versions <em>before</em> authenticating &mdash; the broker answers with <code>apiVersionSupplier.apply(version)</code> at <code>SaslServerAuthenticator.java:583</code>) or a <code>SaslHandshakeRequest</code> (apiKey 17) naming a mechanism (<code>handleHandshakeRequest</code>, <code>:549</code>). If the requested mechanism is not in <code>sasl.enabled.mechanisms</code>, the server replies <code>UNSUPPORTED_SASL_MECHANISM</code> with the list of supported mechanisms and throws. When the handshake is v1 or higher, the server sets <code>enableKafkaSaslAuthenticateHeaders=true</code>, meaning subsequent SASL tokens are carried inside Kafka <code>SaslAuthenticate</code> requests/responses (apiKey 36) rather than raw bytes (<code>:552</code>). The opaque <code>SaslServer.evaluateResponse</code> challenge/response loop then runs in <code>handleSaslToken</code> (<code>:421</code>).</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>If the first frame is not parseable as a Kafka request, the server raises an <code>InvalidRequestException</code> with a pointed message: the client is likely configured with the wrong security protocol, doesn't support KIP-43, or isn't a Kafka client at all (e.g. an HTTP probe). A raw GSSAPI token starts with <code>0x60</code> and would trigger exactly this (<code>SaslServerAuthenticator.java:537</code>).</p></div>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>On a <code>SaslException</code> caused by bad credentials, the server deliberately does <strong>not</strong> echo the exception text to the client &mdash; it returns a generic "invalid credentials" message (<code>SaslServerAuthenticator.java:487</code>) to avoid leaking whether a user exists. Custom <code>ScramSaslServer</code> code carries the same warning in its Javadoc.</p></div>
+
+<h3>Re-authentication (KIP-368)</h3>
+<p>SASL connections are long-lived, so a token (e.g. OAUTHBEARER) embedded at connect time could outlive its validity. <span class="pill kip">KIP-368</span> adds <code>connections.max.reauth.ms</code> (default <code>0</code> = disabled, <code>BrokerSecurityConfigs.java:109</code>). When positive, on each successful authentication the server computes a session lifetime as <code>min(credentialExpirationMs - now, connectionsMaxReauthMs)</code> and ships it to the client in the <code>SaslAuthenticate</code> response's <code>SessionLifetimeMs</code> field (<code>calcCompletionTimesAndReturnSessionLifetimeMs</code>, <code>SaslServerAuthenticator.java:667</code>). After expiry, any non-re-auth use of the connection is rejected. Re-authentication starts in <code>REAUTH_PROCESS_HANDSHAKE</code>; the new mechanism must equal the original or it transitions to <code>REAUTH_BAD_MECHANISM</code> (<code>:656</code>), and <code>ReauthInfo.ensurePrincipalUnchanged</code> forbids changing identity across re-auth (<code>:642</code>).</p>
+
+<h2>SASL mechanisms</h2>
+<p>The server callback handler is chosen per mechanism in <code>SaslChannelBuilder.createServerCallbackHandlers</code> (<code>SaslChannelBuilder.java:316</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mechanism</th><th>Server callback handler</th><th>Credential source</th><th>TLS recommended?</th></tr></thead>
+<tbody>
+<tr><td><code>PLAIN</code></td><td><code>PlainServerCallbackHandler</code></td><td>JAAS config / custom handler</td><td>Yes (password in cleartext on wire)</td></tr>
+<tr><td><code>SCRAM-SHA-256/512</code></td><td><code>ScramServerCallbackHandler</code></td><td><code>CredentialCache</code> fed from metadata log</td><td>Optional (challenge-response)</td></tr>
+<tr><td><code>GSSAPI</code></td><td><code>SaslServerCallbackHandler</code></td><td>Kerberos KDC / keytab subject</td><td>Optional</td></tr>
+<tr><td><code>OAUTHBEARER</code></td><td><code>OAuthBearerUnsecuredValidatorCallbackHandler</code> (default) or custom</td><td>JWT validated against signing key</td><td>Yes (bearer token)</td></tr>
+</tbody>
+</table></div>
+<p>The enabled set comes from <code>sasl.enabled.mechanisms</code> (default <code>[GSSAPI]</code>, <code>BrokerSecurityConfigs.java:97</code>); the inter-broker mechanism is <code>sasl.mechanism.inter.broker.protocol</code> (default <code>GSSAPI</code>, from <code>SaslConfigs.DEFAULT_SASL_MECHANISM</code>, wired at <code>BrokerSecurityConfigs.java:175</code>). Clients pick one via <code>sasl.mechanism</code> (default <code>GSSAPI</code>, <code>SaslConfigs.java:35</code>).</p>
+
+<h3>SCRAM: salted challenge-response</h3>
+<p>SCRAM (RFC 5802) never sends the password and never stores it. Two mechanisms exist, differing only in hash/HMAC and iteration bounds (<code>ScramMechanism.java:32</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mechanism</th><th>type byte</th><th>hash</th><th>MAC</th><th>min / max iterations</th></tr></thead>
+<tbody>
+<tr><td><code>SCRAM-SHA-256</code></td><td>1</td><td>SHA-256</td><td>HmacSHA256</td><td>4096 / 16384</td></tr>
+<tr><td><code>SCRAM-SHA-512</code></td><td>2</td><td>SHA-512</td><td>HmacSHA512</td><td>4096 / 16384</td></tr>
+</tbody>
+</table></div>
+
+<p>The stored credential is a <code>ScramCredential</code> = <code>{salt, storedKey, serverKey, iterations}</code> (<code>ScramCredential.java:24</code>). The crypto in <code>ScramFormatter</code> (<code>ScramFormatter.java:40</code>) derives these from the password:</p>
+<pre><code>saltedPassword = Hi(Normalize(password), salt, iterations)   // PBKDF2-style, ScramFormatter.java:93
+clientKey      = HMAC(saltedPassword, "Client Key")          // :97
+storedKey      = H(clientKey)                                 // :101
+serverKey      = HMAC(saltedPassword, "Server Key")           // :144</code></pre>
+
+<figure class="diagram"><div class="dseq" style="--cols:2">
+  <div class="lanes"><span class="actor cat-client">client</span><span class="actor cat-broker">server (ScramSaslServer)</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">client-first &nbsp; n,,n=user,r=cNonce</span><span class="ln"></span></div>
+    <div class="note">RECEIVE_CLIENT_FIRST_MESSAGE — look up ScramCredential via NameCallback</div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">server-first &nbsp; r=cNonce+sNonce, s=salt, i=iters</span><span class="ln"></span></div>
+    <div class="note">ServerFirstMessage.toBytes() :135</div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">client-final &nbsp; c=biws, r=…, p=clientProof</span><span class="ln"></span></div>
+    <div class="note">RECEIVE_CLIENT_FINAL_MESSAGE — verifyClientProof() :227 · storedKey' = H(clientSig XOR proof) · MessageDigest.isEqual(storedKey', storedKey)</div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">server-final &nbsp; v=serverSignature</span><span class="ln"></span></div>
+    <div class="note">COMPLETE — client verifies the server via serverSignature</div>
+  </div>
+</div><figcaption>SCRAM exchange (top → bottom). The server proves the client knows the password without ever seeing it &mdash; it compares a reconstructed <code>storedKey'</code> against the stored one in constant time &mdash; and the client verifies the server via <code>serverSignature</code>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client</span>
+  <span class="lgi"><span class="sw cat-broker"></span>server (ScramSaslServer)</span>
+  <span class="lgi"><span class="arr"></span>client → server message</span>
+  <span class="lgi"><span class="arr dashed"></span>server → client reply</span>
+  <span class="lgi">grey box = server-side step / verification</span>
+  <span class="lgi"><span class="mono">field=value</span> = SCRAM wire attributes</span>
+</div></figure>
+
+<p>Verification is constant-time via <code>MessageDigest.isEqual</code> (<code>ScramSaslServer.java:232</code>). The server rejects credentials whose stored iteration count is below the mechanism minimum (<code>:133</code>) and rejects a mismatched authorization id (<code>:130</code>). On any failure it scrubs the in-memory credential (<code>clearCredentials</code>, <code>:239</code>). SCRAM provides neither integrity nor privacy for the channel itself &mdash; <code>wrap</code>/<code>unwrap</code> throw (<code>:204</code>), so use <code>SASL_SSL</code> for confidentiality.</p>
+
+<h4>Where SCRAM credentials live in KRaft</h4>
+<p>SCRAM credentials are cluster metadata. The controller's <code>ScramControlManager</code> handles <code>AlterUserScramCredentials</code> (<span class="pill kip">KIP-554</span>): it validates iteration bounds (4096..16384, <code>ScramControlManager.java:290</code>), converts the client-supplied <code>saltedPassword</code> into <code>storedKey</code>/<code>serverKey</code> (<code>finishUpsertion</code>, <code>:260</code>), and emits a <code>UserScramCredentialRecord</code> &mdash; whose fields are exactly <code>{Name, Mechanism(int8), Salt(bytes), StoredKey(bytes), ServerKey(bytes), Iterations(int32)}</code> (<code>UserScramCredentialRecord.json</code>). These records replicate through the metadata log; on every broker the <code>ScramPublisher</code> applies the delta to a <code>CredentialProvider</code>/<code>CredentialCache</code> (<code>ScramPublisher.java:51</code>), which is precisely the cache the <code>ScramServerCallbackHandler</code> reads at authentication time (<code>ScramServerCallbackHandler.java</code>). The <code>toString()</code> of <code>ScramCredentialData</code> redacts every field as <code>[hidden]</code> (<code>ScramCredentialData.java:82</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>SCRAM requires a metadata version that supports it (<code>metadataVersion.isScramSupported()</code>, <code>ScramControlManager.java:183</code>); otherwise alterations fail with <code>UNSUPPORTED_VERSION</code>. The plaintext password never reaches the controller &mdash; the client computes <code>saltedPassword</code>, and only the derived keys are persisted.</p></div>
+
+<h3>OAUTHBEARER: JWT bearer tokens</h3>
+<p>OAUTHBEARER (RFC 7628) carries an OAuth2 bearer token. The client obtains an <code>OAuthBearerToken</code> (interface: <code>value()</code>, <code>scope()</code>, <code>lifetimeMs()</code>, <code>principalName()</code>, <code>OAuthBearerToken.java:42</code>) via its login module and stores it in the <code>Subject</code>'s private credentials (<code>OAuthBearerLoginModule.commit</code>, <code>OAuthBearerLoginModule.java:387</code>); a refreshing login (<code>OAuthBearerRefreshingLogin</code>) renews it before expiry. The server validates the token through a <code>JwtValidator</code>. The production validator <code>BrokerJwtValidator</code> wraps a jose4j <code>JwtConsumer</code> (<code>BrokerJwtValidator.java:79</code>) that resolves the signing key, requires an expiration time, and optionally enforces expected audience/issuer and clock skew; the principal is the configured subject claim (default <code>sub</code>). The token's expiry feeds the KIP-368 re-auth lifetime via the negotiated property <code>CREDENTIAL_LIFETIME_MS</code>. The default callback handler is the <em>unsecured</em> validator, intended only for testing.</p>
+
+<h3>GSSAPI / Kerberos</h3>
+<p>For <code>GSSAPI</code>, <code>SaslServerAuthenticator.createSaslKerberosServer</code> (<code>SaslServerAuthenticator.java:219</code>) determines the service principal and hostname from the broker's JAAS-authenticated <code>Subject</code> (keytab) and creates a JDK GSS <code>SaslServer</code>. Kerberos authorization IDs like <code>user/host@REALM</code> are reduced to short names by <code>KerberosShortNamer</code> using <code>sasl.kerberos.principal.to.local.rules</code> (default <code>DEFAULT</code>, <code>BrokerSecurityConfigs.java:63</code>). Optional native GSS credentials are wired up when <code>sun.security.jgss.native=true</code> (<code>SaslChannelBuilder.java:373</code>).</p>
+
+<h3>Delegation tokens (KIP-48)</h3>
+<p>Delegation tokens are a lightweight, SCRAM-backed secondary credential issued to an already-authenticated principal &mdash; useful for distributed jobs that should not ship a keytab. A token authenticates via the SCRAM mechanisms: when a client sets the SCRAM extension <code>tokenauth=true</code>, <code>ScramSaslServer</code> uses a <code>DelegationTokenCredentialCallback</code> instead of the normal credential callback, looks the token up in the <code>DelegationTokenCache</code>, and sets the authorization id to the <em>token owner</em> (<code>ScramSaslServer.java:112</code>). The resulting <code>KafkaPrincipal</code> is flagged <code>tokenAuthenticated(true)</code> (<code>SaslServerAuthenticator.java:313</code>), a flag carried through to authorization and serialized in <code>DefaultPrincipalData</code>. Token metadata and lifecycle are managed by <code>DelegationTokenManager</code> (<code>server-common/.../security/DelegationTokenManager.java</code>) and replicated like SCRAM via a <code>DelegationTokenPublisher</code>.</p>
+
+<h2>Authorization: the Authorizer SPI</h2>
+<p>The pluggable contract is <code>org.apache.kafka.server.authorizer.Authorizer</code> (<code>Authorizer.java:81</code>), enabled with <code>authorizer.class.name</code>. The lifecycle is explicit in its Javadoc: the broker constructs and configures the authorizer, the authorizer begins loading its metadata, and for each listener the broker waits on the <code>CompletionStage</code> returned by <code>start(AuthorizerServerInfo)</code> before accepting connections on that listener. Key methods:</p>
+<ul>
+<li><code>List&lt;AuthorizationResult&gt; authorize(ctx, List&lt;Action&gt;)</code> &mdash; synchronous, called on the request thread; must avoid blocking.</li>
+<li><code>createAcls</code> / <code>deleteAcls</code> &mdash; asynchronous (return <code>CompletionStage</code>s) so updates can round-trip to a controller without tying up request threads.</li>
+<li><code>acls(filter)</code> &mdash; enumerate bindings for <code>DescribeAcls</code>.</li>
+<li><code>authorizeByResourceType(ctx, op, resourceType)</code> &mdash; default method (<code>Authorizer.java:184</code>) answering "may this principal do <em>op</em> on <em>any</em> resource of this type?", used e.g. for idempotent-producer checks; it implements its own prefix-domination logic over allow/deny patterns.</li>
+</ul>
+
+<p>On the broker side, the Scala <code>AuthHelper</code> (<code>AuthHelper.scala:42</code>) adapts <code>KafkaApis</code> calls into <code>Action</code> lists. <code>authorize(...)</code> builds a single literal <code>ResourcePattern</code> action and returns a boolean (<code>:43</code>); <code>filterByAuthorized</code> groups N resource references by name, authorizes each unique name once with the count as <code>resourceReferenceCount</code>, and returns the allowed set (<code>:100</code>). If no authorizer is configured, every call short-circuits to "allowed" (<code>authorizer.forall</code>). <code>KafkaApis</code> invokes these helpers densely &mdash; e.g. <code>READ GROUP</code> for offset commit, <code>WRITE TRANSACTIONAL_ID</code> and <code>WRITE TOPIC</code> for produce, <code>CLUSTER_ACTION CLUSTER</code> for inter-broker fetch (<code>KafkaApis.scala:284</code>, <code>:402</code>, <code>:589</code>).</p>
+
+<h3>Operation implication and resource types</h3>
+<p>Operations are a fixed enum (<code>AclOperation</code>): <code>READ(3)</code>, <code>WRITE(4)</code>, <code>CREATE(5)</code>, <code>DELETE(6)</code>, plus <code>ALTER</code>, <code>DESCRIBE</code>, <code>CLUSTER_ACTION</code>, <code>DESCRIBE_CONFIGS</code>, <code>ALTER_CONFIGS</code>, <code>IDEMPOTENT_WRITE</code>, token operations, etc. Which operations are meaningful per resource type is encoded in <code>AclEntry.supportedOperations</code> (<code>AclEntry.java:53</code>) &mdash; e.g. <code>TOPIC</code> supports <code>READ, WRITE, CREATE, DESCRIBE, DELETE, ALTER, DESCRIBE_CONFIGS, ALTER_CONFIGS</code>; <code>TRANSACTIONAL_ID</code> supports <code>DESCRIBE, WRITE, TWO_PHASE_COMMIT</code>; <code>USER</code> supports the delegation-token operations <code>CREATE_TOKENS, DESCRIBE_TOKENS</code>.</p>
+
+<h2>The KRaft StandardAuthorizer</h2>
+<p><code>StandardAuthorizer</code> (<span class="pill kip">KIP-801</span>) is the built-in authorizer for KRaft clusters; it stores ACLs in <code>__cluster_metadata</code> rather than any external store. It is a thin, thread-safe shell around an immutable <code>StandardAuthorizerData</code> held in a single <code>volatile</code> field (<code>StandardAuthorizer.java:72</code>). Every mutation (config change, ACL add/remove, snapshot load) produces a <em>new</em> <code>StandardAuthorizerData</code> and reassigns the volatile reference; readers grab the current reference once per call (<code>curData = data</code>, <code>:144</code>) and run lock-free.</p>
+
+<h3>On-disk / replicated ACL representation</h3>
+<p>An ACL on the metadata log is an <code>AccessControlEntryRecord</code> (apiKey 18) with fields <code>{Id(uuid), ResourceType(int8), ResourceName(string), PatternType(int8), Principal(string), Host(string), Operation(int8), PermissionType(int8)}</code> (<code>AccessControlEntryRecord.json</code>). In memory this becomes a <code>StandardAcl</code> record (<code>StandardAcl.java:34</code>) plus its UUID. Deletions emit a <code>RemoveAccessControlEntryRecord</code> referencing the UUID. The controller's <code>AclControlManager</code> validates new bindings (no <code>UNKNOWN/ANY</code> types, only <code>LITERAL/PREFIXED</code> patterns, non-empty name, parseable principal &mdash; <code>AclControlManager.java:135</code>), assigns a random unique UUID, and on <code>replay</code> maintains both a <code>TimelineHashMap&lt;Uuid, StandardAcl&gt;</code> and a <code>TimelineHashSet&lt;StandardAcl&gt;</code> for dedup (<code>:228</code>).</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">AdminClient CreateAcls</span></div>
+  <div class="conn"></div>
+  <div class="node cat-control"><span class="nt">QuorumController</span></div>
+  <div class="conn"></div>
+  <div class="node cat-control"><span class="nt">AclControlManager.createAcls()</span></div>
+  <div class="conn ec-data" data-label="emits AccessControlEntryRecord"></div>
+  <div class="node cat-storage store"><span class="nt">__cluster_metadata</span><span class="nd">Raft-replicated</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn dashed ec-async" data-label="replayed on every node"></div>
+      <div class="node cat-control"><span class="nt">controller in-memory</span><span class="nd">TimelineHashMap</span></div>
+    </div>
+    <div class="col">
+      <div class="conn dashed ec-async" data-label="replayed on every node"></div>
+      <div class="node cat-broker"><span class="nt">broker MetadataLoader</span><span class="nd">&rArr; AclPublisher.onMetadataUpdate</span></div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn" data-label="SNAPSHOT"></div>
+          <div class="node cat-broker"><span class="nt">loadSnapshot(allAcls)</span><span class="nd">replace whole set atomically</span></div>
+        </div>
+        <div class="col">
+          <div class="conn" data-label="DELTA"></div>
+          <div class="node cat-broker"><span class="nt">addAcl / removeAcl</span><span class="nd">in LinkedHashMap order</span></div>
+        </div>
+      </div>
+      <div class="conn"></div>
+      <div class="node cat-broker store"><span class="nt">StandardAuthorizer.data</span><span class="nd">volatile reference</span></div>
+    </div>
+  </div>
+</div><figcaption>ACLs are ordinary metadata: written by the controller, replicated by Raft, and applied on every node by <code>AclPublisher</code> &mdash; either as an atomic snapshot load or as in-order deltas swapped into the authorizer's single volatile data reference.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>admin client</span>
+  <span class="lgi"><span class="sw cat-control"></span>controller / metadata writer</span>
+  <span class="lgi"><span class="sw cat-storage"></span><code>__cluster_metadata</code> log</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker-side publisher / authorizer</span>
+  <span class="lgi"><span class="sw cat-broker dash"></span>cylinder = log / volatile data store</span>
+  <span class="lgi"><span class="arr ec-data"></span>record emitted</span>
+  <span class="lgi"><span class="arr dashed ec-async"></span>Raft replay (every node)</span>
+</div></figure>
+
+<p><code>AclPublisher</code> (<code>AclPublisher.java:57</code>) is careful about ordering. A snapshot load replaces the whole set atomically via <code>loadSnapshot</code>; an incremental delta applies <code>addAcl</code>/<code>removeAcl</code> <em>in the LinkedHashMap iteration order</em> so that, e.g., a <code>DENY ALL</code> followed by an <code>ALLOW topic foo</code> is never transiently visible in reverse order. The first snapshot load also calls <code>completeInitialLoad()</code>, which flips <code>loadingComplete=true</code> and completes the future that gates request acceptance (<code>StandardAuthorizer.java:91</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Until the initial ACL load finishes, <code>authorize()</code> throws <code>AuthorizerNotReadyException</code> for non-super-users (<code>StandardAuthorizerData.java:239</code>). Super-users are still allowed, and early-start listeners (e.g. the controller-to-controller listener) bypass the wait via <code>earlyStartListeners</code> (<code>StandardAuthorizer.java:129</code>). This prevents a fail-open window during startup.</p></div>
+
+<h3>In-memory index: the reverse-sorted NavigableSet</h3>
+<p><code>AclCache</code> (<code>AclCache.java:32</code>) holds two persistent structures: an <code>ImmutableMap&lt;Uuid, StandardAcl&gt;</code> by id, and an <code>ImmutableNavigableSet&lt;StandardAcl&gt;</code> ordered by <code>StandardAcl.compareTo</code>. The ordering is the clever part (<code>StandardAcl.java:83</code>): sort by <code>resourceType</code>, then by resource name <strong>reversed</strong>, then pattern type, operation, principal, host, permission. Reverse-name ordering makes all prefix ACLs that could match a given resource name contiguous, so the matcher can walk them with a bounded scan instead of examining every ACL.</p>
+
+<h3>The authorize() evaluation algorithm</h3>
+<p><code>StandardAuthorizerData.authorize</code> (<code>StandardAuthorizerData.java:226</code>) requires the action's pattern to be <code>LITERAL</code> (the request side always passes a concrete resource name) and proceeds:</p>
+<ol>
+<li><strong>Super-user shortcut.</strong> If <code>principal.toString()</code> is in <code>super.users</code>, return <code>ALLOWED</code> immediately (rule = <code>SuperUserRule</code>). Super-users bypass even <code>DENY</code> ACLs (<code>:237</code>).</li>
+<li><strong>Readiness check.</strong> Else if loading is incomplete, throw <code>AuthorizerNotReadyException</code>.</li>
+<li><strong>Find matching ACLs.</strong> <code>findAclRule</code> scans the index twice: first for ACLs whose resource name is a prefix of (or equal to) the request name (<code>checkSection</code> starting at an exemplar keyed on the resource name), then for wildcard ACLs stored as <code>LITERAL "*"</code> (<code>:354</code>).</li>
+<li><strong>Match each candidate.</strong> <code>findResult</code> (<code>:483</code>) checks: principal &isin; {requestPrincipal, <code>User:*</code>}; host equals the ACL host or <code>*</code>; and operation matches &mdash; with the <em>implication rule</em> below.</li>
+<li><strong>Deny wins.</strong> The first matching <code>DENY</code> short-circuits and returns <code>DENIED</code> (<code>checkSection</code> returns immediately on deny, <code>:428</code>). Otherwise a matching <code>ALLOW</code> yields <code>ALLOWED</code>.</li>
+<li><strong>Default.</strong> If no ACL referenced the resource at all, return the configured default (<code>allow.everyone.if.no.acl.found</code>); if ACLs existed for the resource but none matched the principal/op, return <code>DENIED</code> (<code>MatchingRuleBuilder.build</code>, <code>:584</code>).</li>
+</ol>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">authorize(ctx, action)</span><span class="nd">StandardAuthorizerData.java:226</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">principal &isin; super.users?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-data" data-label="yes"></div>
+      <div class="node cat-storage"><span class="nt">ALLOWED</span><span class="nd">SuperUserRule — bypasses DENY</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-broker decision">!loadingComplete?</div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn ec-err" data-label="yes"></div>
+          <div class="node cat-error"><span class="nt">throw AuthorizerNotReadyException</span></div>
+        </div>
+        <div class="col">
+          <div class="conn" data-label="no"></div>
+          <div class="node cat-broker"><span class="nt">findAclRule(principals={user, User:*}, host, action)</span><span class="nd">§1 prefix/literal ACLs (reverse-sorted scan) · §2 wildcard ACLs (LITERAL '*')</span></div>
+          <div class="conn"></div>
+          <div class="node cat-broker decision">per candidate: principal + host + operation (+implication) match?</div>
+          <div class="conn"></div>
+          <div class="row">
+            <div class="col">
+              <div class="conn ec-err" data-label="DENY matched"></div>
+              <div class="node cat-error"><span class="nt">DENIED</span><span class="nd">deny wins — STOP</span></div>
+            </div>
+            <div class="col">
+              <div class="conn ec-data" data-label="ALLOW matched"></div>
+              <div class="node cat-storage"><span class="nt">ALLOWED</span></div>
+            </div>
+            <div class="col">
+              <div class="conn ec-err" data-label="resource has ACLs, none matched"></div>
+              <div class="node cat-error"><span class="nt">DENIED</span></div>
+            </div>
+            <div class="col">
+              <div class="conn" data-label="no ACL for resource"></div>
+              <div class="node"><span class="nt">default</span><span class="nd">allow.everyone.if.no.acl.found</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><figcaption>Deny-wins evaluation: super-user &gt; DENY &gt; ALLOW &gt; default, over a name-prefix-contiguous scan (operation matching applies implicit <code>DESCRIBE</code> on ALLOW ACLs only). The first matching <code>DENY</code> short-circuits to <code>DENIED</code>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>authorizer step</span>
+  <span class="lgi"><span class="sw cat-storage"></span>ALLOWED outcome</span>
+  <span class="lgi"><span class="sw cat-error"></span>DENIED / not-ready outcome</span>
+  <span class="lgi">rounded = decision</span>
+  <span class="lgi"><span class="arr ec-data"></span>allow branch</span>
+  <span class="lgi"><span class="arr ec-err"></span>deny / throw branch</span>
+  <span class="lgi"><span class="arr"></span>continue / default branch</span>
+</div></figure>
+
+<h4>Operation implication</h4>
+<p>For <code>ALLOW</code> ACLs only, certain operations imply others (<code>StandardAuthorizerData.java:436</code>): an allow of <code>READ/WRITE/DELETE/ALTER</code> (or <code>DESCRIBE</code> itself) implies <code>DESCRIBE</code>; an allow of <code>ALTER_CONFIGS</code> (or <code>DESCRIBE_CONFIGS</code>) implies <code>DESCRIBE_CONFIGS</code>; and <code>ALL</code> implies everything. This implication does <strong>not</strong> apply to <code>DENY</code> ACLs &mdash; a <code>DENY READ</code> does not deny <code>DESCRIBE</code> (<code>:502</code>).</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Precedence is <strong>super-user &gt; DENY &gt; ALLOW &gt; default</strong>. A single matching <code>DENY</code> beats any number of <code>ALLOW</code>s, regardless of LITERAL vs PREFIXED specificity. The only thing that beats a <code>DENY</code> is being a super-user.</p></div>
+
+<h3>Prefix-matching walk (the tricky bit)</h3>
+<p><code>checkSection</code> (<code>StandardAuthorizerData.java:380</code>) exploits the reverse-name sort. Starting from an exemplar at <code>(resourceType, resourceName, UNKNOWN, ...)</code> &mdash; where <code>PatternType.UNKNOWN</code> sorts first &mdash; it iterates forward. For each ACL it computes <code>matchesUpTo</code> (the common-prefix length, <code>:366</code>):</p>
+<ul>
+<li>If the ACL name is fully a prefix of the request name: a <code>LITERAL</code> ACL only matches on an exact full-length match (otherwise it is skipped while continuing to scan for <code>PREFIXED</code> ACLs); a <code>PREFIXED</code> ACL matches.</li>
+<li>If the ACL name diverges from the request name (and is not the wildcard <code>*</code>), the scan has left the relevant region; it <em>jumps</em> by rebuilding the exemplar truncated to the divergence point and re-seeking, so it can still find shorter prefix ACLs (<code>:411</code>).</li>
+<li>It stops as soon as the <code>resourceType</code> changes (the section boundary, <code>:392</code>).</li>
+</ul>
+<p>The worked example in the source comment (<code>:324</code>) shows how, scanning candidates for topic <code>foobar</code>, the iterator visits the relevant <code>PREFIX</code>/<code>LITERAL</code> entries and skips irrelevant ones by re-seeking. This keeps authorization sub-linear in the total ACL count.</p>
+
+<h2>Concurrency &amp; threading</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Owner thread(s)</th><th>Guard</th></tr></thead>
+<tbody>
+<tr><td>TLS handshake buffers, SASL state machine</td><td>The single network/<code>Processor</code> thread owning the connection</td><td>None needed &mdash; one thread per <code>KafkaChannel</code> (see <a href="06-network-and-threading.html">ch.06</a>)</td></tr>
+<tr><td><code>StandardAuthorizer.data</code></td><td>Read on request-handler threads; replaced on the metadata-publish thread</td><td><code>volatile</code> field + fully immutable <code>StandardAuthorizerData</code>/<code>AclCache</code></td></tr>
+<tr><td>Controller ACL/SCRAM maps</td><td>The single QuorumController event-loop thread</td><td><code>TimelineHashMap</code>/<code>TimelineHashSet</code> (snapshot-versioned, single-writer)</td></tr>
+<tr><td>SCRAM <code>CredentialCache</code></td><td>Written by <code>ScramPublisher</code>; read by SASL servers on network threads</td><td>Concurrent cache; per-user replace</td></tr>
+</tbody>
+</table></div>
+<p>The authorizer's design comment is explicit: "we expect one writer and multiple readers" (<code>StandardAuthorizer.java:68</code>). Because each data snapshot is immutable and swapped atomically, readers never see a partially-updated ACL set; the cost is that each ACL add allocates a new persistent-collection node rather than mutating in place (<code>AclCache.addAcl</code> returns a new <code>AclCache</code>, <code>AclCache.java:75</code>).</p>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Config key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>authorizer.class.name</code></td><td>unset (no authz)</td><td>Authorizer implementation; <code>org.apache.kafka.metadata.authorizer.StandardAuthorizer</code> for KRaft.</td></tr>
+<tr><td><code>super.users</code></td><td><code>""</code></td><td>Semicolon-separated <code>User:name</code> list; these bypass all ACLs incl. DENY (<code>StandardAuthorizer.java:58</code>).</td></tr>
+<tr><td><code>allow.everyone.if.no.acl.found</code></td><td><code>false</code> (&rarr; DENIED)</td><td>Default result when no ACL references a resource (<code>StandardAuthorizer.java:210</code>).</td></tr>
+<tr><td><code>principal.builder.class</code></td><td><code>DefaultKafkaPrincipalBuilder</code></td><td>Maps auth context &rarr; <code>KafkaPrincipal</code> (<code>BrokerSecurityConfigs.java:72</code>).</td></tr>
+<tr><td><code>ssl.client.auth</code></td><td><code>none</code></td><td><code>required</code>/<code>requested</code>/<code>none</code> mutual-TLS policy (<code>BrokerSecurityConfigs.java:86</code>).</td></tr>
+<tr><td><code>ssl.principal.mapping.rules</code></td><td><code>DEFAULT</code></td><td>Rewrite X.500 DN &rarr; principal name (<code>BrokerSecurityConfigs.java:53</code>).</td></tr>
+<tr><td><code>ssl.endpoint.identification.algorithm</code></td><td><code>https</code></td><td>Client-side hostname verification of the server cert.</td></tr>
+<tr><td><code>ssl.allow.dn.changes</code> / <code>ssl.allow.san.changes</code></td><td><code>false</code> / <code>false</code></td><td>Permit DN/SAN changes on dynamic keystore update (<code>BrokerSecurityConfigs.java:123</code>/<code>:128</code>).</td></tr>
+<tr><td><code>sasl.enabled.mechanisms</code></td><td><code>[GSSAPI]</code></td><td>Mechanisms the broker will accept (<code>BrokerSecurityConfigs.java:97</code>).</td></tr>
+<tr><td><code>sasl.mechanism.inter.broker.protocol</code></td><td><code>GSSAPI</code></td><td>Mechanism brokers use to talk to each other (<code>BrokerSecurityConfigs.java:175</code>).</td></tr>
+<tr><td><code>sasl.mechanism</code></td><td><code>GSSAPI</code></td><td>Client-selected mechanism (<code>SaslConfigs.java:35</code>).</td></tr>
+<tr><td><code>connections.max.reauth.ms</code></td><td><code>0</code> (disabled)</td><td>KIP-368 forced re-auth interval (<code>BrokerSecurityConfigs.java:109</code>).</td></tr>
+<tr><td><code>sasl.server.max.receive.size</code></td><td><code>524288</code></td><td>Max bytes accepted before/during initial SASL auth (<code>BrokerSecurityConfigs.java:117</code>).</td></tr>
+<tr><td><code>sasl.kerberos.principal.to.local.rules</code></td><td><code>DEFAULT</code></td><td>Kerberos short-namer rules (<code>BrokerSecurityConfigs.java:63</code>).</td></tr>
+<tr><td><code>sasl.jaas.config</code></td><td>unset</td><td>Inline JAAS for a listener/mechanism (<code>SaslConfigs.java:37</code>).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+<li><strong>Authentication failure delivery.</strong> On failure, the server builds a response but defers sending it; <code>handleAuthenticationFailure()</code> &rarr; <code>sendAuthenticationFailureResponse()</code> flushes the error and then the connection is closed (<code>SaslServerAuthenticator.java:599</code>). The client surfaces a <code>SaslAuthenticationException</code>; a small delay before disconnect mitigates auth-failure brute forcing (<code>DelayedResponseAuthenticationException</code>).</li>
+<li><strong>Wrong security protocol.</strong> A plaintext client hitting a TLS port (or vice-versa) fails the handshake/first-frame parse with the diagnostic <code>InvalidRequestException</code> described above.</li>
+<li><strong>Unsupported mechanism.</strong> Returns <code>UNSUPPORTED_SASL_MECHANISM</code> plus the supported list, letting well-behaved clients renegotiate.</li>
+<li><strong>Re-auth mechanism/principal change.</strong> Rejected with explicit messages (<code>REAUTH_BAD_MECHANISM</code>; <code>ensurePrincipalUnchanged</code>).</li>
+<li><strong>Authorizer not yet loaded.</strong> Non-super-user requests get <code>AuthorizerNotReadyException</code> rather than a fail-open allow; the listener future also gates connection acceptance.</li>
+<li><strong>Oversized SASL frame.</strong> A receive exceeding <code>sasl.server.max.receive.size</code> raises an <code>InvalidReceiveException</code> rethrown as <code>SaslAuthenticationException</code> (<code>SaslServerAuthenticator.java:265</code>), preventing pre-auth memory exhaustion.</li>
+<li><strong>Bulk ACL delete cap.</strong> A single <code>deleteAcls</code> filter that would remove more than <code>MAX_RECORDS_PER_USER_OP</code> ACLs fails the whole request (<code>BoundedListTooLongException</code>, <code>AclControlManager.java:207</code>) rather than partially applying.</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>ACL consistency.</strong> Because ACLs are metadata-log records, every node converges to the same ACL set at a given log offset, and <code>AclPublisher</code> applies deltas in commit order. There is no window where a later ALLOW is visible before an earlier DENY (<code>AclPublisher.java:80</code>).</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Deny supremacy.</strong> For non-super-users, a matching DENY always wins; ALLOW can never override DENY regardless of pattern specificity (<code>StandardAuthorizerData.java:424</code>).</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Identity stability.</strong> A connection's <code>KafkaPrincipal</code> is fixed at authentication and cannot change across re-authentication (<code>SaslServerAuthenticator.java:642</code>).</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Secret minimization.</strong> Passwords are never stored; only SCRAM-derived <code>storedKey</code>/<code>serverKey</code> reach the controller, and credential <code>toString()</code> redacts them (<code>ScramCredentialData.java:82</code>).</p></div>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+<li><a href="06-network-and-threading.html">Network &amp; threading</a>: the authenticator and TLS transport are driven non-blockingly by the same processor thread that owns the socket; the principal lands in the channel before any request is dispatched.</li>
+<li><a href="07-request-processing.html">Request processing (KafkaApis)</a>: every handler funnels through <code>AuthHelper</code>/<code>Authorizer.authorize</code>; <code>AclApis</code> serves <code>CreateAcls</code>/<code>DeleteAcls</code>/<code>DescribeAcls</code>.</li>
+<li><a href="11-kraft-controller.html">KRaft controller</a>: <code>AclControlManager</code> and <code>ScramControlManager</code> live in the controller and emit the ACL/credential records.</li>
+<li><a href="12-metadata-propagation.html">Metadata propagation</a>: ACLs and SCRAM credentials ride the same metadata-log replication and are applied locally by <code>AclPublisher</code>/<code>ScramPublisher</code>.</li>
+<li><a href="10-kraft-consensus.html">KRaft consensus</a>: the controller-quorum listener typically authenticates inter-controller traffic and is an early-start listener for the authorizer.</li>
+<li><a href="14-transactions-eos.html">Transactions</a> and <a href="13-group-coordination.html">group coordination</a> rely on <code>WRITE TRANSACTIONAL_ID</code> and <code>READ/DESCRIBE GROUP</code> ACLs respectively; <a href="19-quotas.html">quotas</a> are keyed partly on the same principal.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Storing ACLs in <code>__cluster_metadata</code> (<span class="pill kip">KIP-801</span>) removes the last reason to keep an external coordination store for security in KRaft: ACLs become ordinary replicated records with the same durability, ordering and snapshot semantics as topic metadata, and the immutable-snapshot authorizer gives lock-free reads on the hot authorize path.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>SCRAM (RFC 5802) was adopted so that a password store can live in the cluster without the cluster ever holding the cleartext password; <span class="pill kip">KIP-554</span> exposes SCRAM credential management over the Kafka API (<code>AlterUserScramCredentials</code>) so it works in a ZooKeeper-free world.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p><span class="pill kip">KIP-368</span> added periodic SASL re-authentication chiefly to bound the validity window of OAUTHBEARER tokens on long-lived connections; the SASL_AUTHENTICATE API was bumped to v1 to carry <code>SessionLifetimeMs</code> back to the client.</p></div>
+<p>Other relevant history: <span class="pill kip">KIP-43</span>/KIP-12 introduced the SASL handshake and mechanism negotiation; <span class="pill kip">KIP-48</span> added delegation tokens; <span class="pill kip">KIP-684</span> added the <code>ssl.principal.mapping.rules</code> used by the default builder; and ZooKeeper-based ACL/SCRAM storage was removed entirely in the 4.0 KRaft-only line.</p>
+
+<h2>Gotchas / operational notes</h2>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>On a <code>SASL_SSL</code> listener, TLS client-cert auth is disabled by default even if <code>ssl.client.auth=required</code> is set broker-wide &mdash; you must set the <em>listener-prefixed</em> <code>listener.name.&lt;name&gt;.ssl.client.auth</code> to re-enable it; otherwise the broker logs a warning and forces <code>NONE</code> (<code>ChannelBuilders.java:152</code>). With both SASL and mTLS, the SASL authorization id wins as the principal.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>An empty <code>super.users</code> plus the default <code>allow.everyone.if.no.acl.found=false</code> means that the moment you enable the authorizer, <em>everything</em> is denied until you add ACLs &mdash; including inter-broker traffic, unless your broker principals are listed as super-users or have explicit <code>CLUSTER_ACTION</code> ACLs.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The authorize fast path requires a <code>LITERAL</code> action pattern and throws otherwise (<code>StandardAuthorizerData.java:230</code>); <code>PREFIXED</code> patterns exist only in stored ACLs, not in the per-request action. Custom authorizers must respect the same contract that <code>AuthHelper</code> always passes literal resources.</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>Audit logging is emitted to the <code>kafka.authorizer.logger</code> logger: denies that were explicitly requested log at <code>INFO</code>, allows at <code>DEBUG</code>, and "filter/describe" style checks (where no access is actually granted) only at <code>TRACE</code> (<code>StandardAuthorizerData.java:279</code>). The <code>logIfAllowed</code>/<code>logIfDenied</code> flags on each <code>Action</code> control this.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Producer Client · Kafka Internals</title>
+<meta name="description" content="KafkaProducer, the RecordAccumulator, BufferPool, the Sender thread, partitioning, idempotence.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="16-producer-client">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>16 · The Producer Client</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">The <code>KafkaProducer</code> is an asynchronous, thread-safe client that turns user records into compact, compressed record batches and ships them to partition leaders. A user thread calling <code>send()</code> never touches a socket: it serializes the key/value, picks a partition, and appends the bytes into a per-partition queue inside the <code>RecordAccumulator</code>, returning a <code>Future</code> immediately. A single background <em>Sender</em> I/O thread drains ready batches, groups them by leader broker, builds <code>ProduceRequest</code>s, pushes them through the <code>NetworkClient</code> pipeline, and dispatches retries, backoff, and completion callbacks. Idempotence (default-on since 3.0) stamps each batch with a producer id, epoch, and per-partition sequence number so the broker can deduplicate retries while preserving order. This chapter traces the entire path from <code>send()</code> to broker ack, field by field and lock by lock.</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The producer client sits at the boundary between application code and the Kafka cluster. Its responsibilities are:</p>
+<ul>
+  <li><strong>Serialization &amp; interception.</strong> Convert typed keys/values to <code>byte[]</code> via configured <code>Serializer</code>s, after optionally rewriting the record through a chain of <code>ProducerInterceptor</code>s.</li>
+  <li><strong>Partition selection.</strong> Honour an explicit partition, else hash the key, else delegate to the adaptive sticky <code>BuiltInPartitioner</code> (or a user <code>Partitioner</code>).</li>
+  <li><strong>Batching &amp; buffering.</strong> Coalesce records destined for the same <code>(topic, partition)</code> into <code>ProducerBatch</code> objects backed by a bounded <code>BufferPool</code>, trading a little latency (<code>linger.ms</code>) for throughput.</li>
+  <li><strong>Transmission.</strong> Decide which batches are ready, group them by destination node, encode <code>ProduceRequest</code>s, and pipeline them with at most <code>max.in.flight.requests.per.connection</code> outstanding per broker.</li>
+  <li><strong>Reliability.</strong> Classify responses as success / retriable / fatal; reenqueue retriable batches with exponential backoff; enforce a hard <code>delivery.timeout.ms</code> deadline; and, when idempotence or transactions are on, manage producer ids, epochs, and sequence numbers (see <a href="14-transactions-eos.html">Transactions &amp; EOS</a>).</li>
+</ul>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Class</th><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>KafkaProducer&lt;K,V&gt;</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java</code></td><td>Public entry point; <code>send()</code>, <code>flush()</code>, <code>close()</code>, transaction API; owns and wires every subsystem.</td></tr>
+<tr><td><code>RecordAccumulator</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java</code></td><td>Per-partition deque of batches; append, ready-check, drain, reenqueue, expiry.</td></tr>
+<tr><td><code>ProducerBatch</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/ProducerBatch.java</code></td><td>One MemoryRecords builder plus its callbacks (thunks), state machine, and split logic.</td></tr>
+<tr><td><code>BufferPool</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/BufferPool.java</code></td><td>Bounded <code>buffer.memory</code> allocator with a free-list of poolable buffers and fair waiter queue.</td></tr>
+<tr><td><code>Sender</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java</code></td><td><code>Runnable</code> run by the I/O thread; the drain → request → response → retry loop.</td></tr>
+<tr><td><code>BuiltInPartitioner</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/BuiltInPartitioner.java</code></td><td>Adaptive uniform sticky partitioner (one per topic).</td></tr>
+<tr><td><code>TransactionManager</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java</code></td><td>Producer id/epoch/sequence state for idempotence and transactions.</td></tr>
+<tr><td><code>NetworkClient</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/NetworkClient.java</code></td><td>Connection management and the per-broker in-flight request pipeline.</td></tr>
+<tr><td><code>ProducerConfig</code></td><td><code>clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java</code></td><td>Config keys, defaults, and idempotence post-validation.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+<dt>RecordAccumulator</dt><dd>The in-memory staging area. A <code>ConcurrentMap&lt;String, TopicInfo&gt;</code> keyed by topic; each <code>TopicInfo</code> holds a <code>ConcurrentMap&lt;Integer, Deque&lt;ProducerBatch&gt;&gt;</code> keyed by partition (<span class="cite">RecordAccumulator.java:1301</span>).</dd>
+<dt>ProducerBatch</dt><dd>A single record batch under construction (one <code>MemoryRecordsBuilder</code>) plus a list of <em>thunks</em> (callback + future pairs). Not thread-safe; guarded by the owning deque's monitor (<span class="cite">ProducerBatch.java:58</span>).</dd>
+<dt>Thunk</dt><dd>A <code>(Callback, FutureRecordMetadata)</code> pair kept for every appended record so callbacks can fire and so the batch can be split and resent if rejected (<span class="cite">ProducerBatch.java:426</span>).</dd>
+<dt>BufferPool</dt><dd>A <code>buffer.memory</code>-bounded allocator. Buffers of exactly <code>batch.size</code> ("poolable size") are recycled on a free list; larger ones are tracked as raw byte counts (<span class="cite">BufferPool.java:45</span>).</dd>
+<dt>Sender / I/O thread</dt><dd>The lone background thread named <code>kafka-producer-network-thread | &lt;clientId&gt;</code> that owns all network interaction (<span class="cite">KafkaProducer.java:251</span>, <span class="cite">KafkaProducer.java:475</span>).</dd>
+<dt>Sticky partition</dt><dd>The current target partition for keyless records, held in an <code>AtomicReference&lt;StickyPartitionInfo&gt;</code> and rotated after roughly <code>batch.size</code> bytes (<span class="cite">BuiltInPartitioner.java:48</span>).</dd>
+<dt>Muting</dt><dd>When <code>max.in.flight=1</code> (so ordering must be exact even without idempotence) the Sender <em>mutes</em> a partition while a batch is in flight to forbid concurrent draining (<span class="cite">Sender.java:420</span>).</dd>
+</dl>
+
+<h2>The send pipeline, end to end</h2>
+<p>Everything below the public <code>send(record, callback)</code> happens on the calling thread. The interceptor chain runs first and outside the try/catch, so it sees every record even on later failure (<span class="cite">KafkaProducer.java:1092</span>); the heavy lifting is in <code>doSend</code> (<span class="cite">KafkaProducer.java:1125</span>).</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">send(record, cb)</span><span class="nd">user thread · returns a Future immediately</span></div>
+  <div class="conn"></div>
+  <div class="node cat-client"><span class="nt">interceptors.onSend · waitOnMetadata · serialize K/V</span><span class="nd">may block up to max.block.ms on metadata</span></div>
+  <div class="conn"></div>
+  <div class="node cat-client"><span class="nt">partition() · ensureValidRecordSize</span></div>
+  <div class="conn" data-label="append bytes"></div>
+  <div class="node cat-storage store"><span class="nt">RecordAccumulator.append</span><span class="nd">topic &rarr; TopicInfo &rarr; partition &rarr; Deque&lt;ProducerBatch&gt; (last open) · BufferPool.allocate may block</span></div>
+  <div class="conn"></div>
+  <div class="node cat-client"><span class="nt">if batchIsFull or newBatchCreated: sender.wakeup()</span><span class="nd">then return Future&lt;RecordMetadata&gt;</span></div>
+  <div class="sep">— hand-off — the lone Sender (I/O) thread drains the accumulator in its runOnce() loop —</div>
+  <div class="conn dashed ec-async" data-label="drain ready batches"></div>
+  <div class="node cat-broker"><span class="nt">ready(metadata)</span><span class="nd">which leader nodes have sendable batches</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">drain(node, maxSize)</span><span class="nd">Map&lt;nodeId, List&lt;ProducerBatch&gt;&gt;</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">build ProduceRequest</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">client.send(req) · client.poll()</span><span class="nd">NetworkClient pipeline</span></div>
+  <div class="conn dashed" data-label="ProduceResponse"></div>
+  <div class="node cat-broker"><span class="nt">handleProduceResponse</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">complete / retry / fail · fire thunk callbacks</span></div>
+</div><figcaption>From <code>send()</code> to broker ack: the user thread fills the accumulator and returns a <code>Future</code>; the single Sender (I/O) thread drains ready batches, builds the request, and completes the callbacks. The <code>RecordAccumulator</code> (cylinder) is the shared hand-off between the two threads.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>user-thread stage (<code>send</code> path)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>accumulator (shared store)</span>
+  <span class="lgi"><span class="sw cat-broker"></span>Sender / network stage</span>
+  <span class="lgi"><span class="sw cat-coord"></span>completion / callbacks</span>
+  <span class="lgi"><span class="sw cat-storage dash"></span>cylinder = log / in-memory store</span>
+  <span class="lgi"><span class="arr"></span>control / data flow</span>
+  <span class="lgi"><span class="arr dashed"></span>cross-thread hand-off / response</span>
+</div></figure>
+
+<h3>1. Metadata wait</h3>
+<p><code>waitOnMetadata</code> returns immediately if the cluster already knows the topic's partition count (and the requested partition is in range); otherwise it adds the topic to the metadata set, calls <code>sender.wakeup()</code> to nudge the I/O thread into issuing a <code>MetadataRequest</code>, and blocks on <code>metadata.awaitUpdate</code> until the topic appears or <code>max.block.ms</code> elapses — at which point it throws <code>TimeoutException</code> (<span class="cite">KafkaProducer.java:1244</span>). This is the first of two places <code>send()</code> can block. See <a href="12-metadata-propagation.html">Metadata Propagation</a>.</p>
+
+<h3>2. Serialization &amp; size validation</h3>
+<p>Key and value serializers run on the user thread; a <code>ClassCastException</code> is rewrapped as <code>SerializationException</code> (<span class="cite">KafkaProducer.java:1150</span>). After serialization, headers are frozen read-only and the upper-bound serialized size is computed via <code>AbstractRecords.estimateSizeInBytesUpperBound</code>. <code>ensureValidRecordSize</code> rejects records larger than <code>max.request.size</code> or <code>buffer.memory</code> with <code>RecordTooLargeException</code> (<span class="cite">KafkaProducer.java:1313</span>). The record timestamp defaults to "now" when the user did not supply one (<span class="cite">KafkaProducer.java:1176</span>).</p>
+
+<h3>3. Partition selection</h3>
+<p><code>partition()</code> resolves the target partition in priority order (<span class="cite">KafkaProducer.java:1625</span>):</p>
+<ol>
+  <li>If <code>record.partition()</code> is non-null, use it verbatim.</li>
+  <li>Else if a custom <code>partitioner.class</code> is configured, call it (a negative result is an <code>IllegalArgumentException</code>).</li>
+  <li>Else if the serialized key is non-null and <code>partitioner.ignore.keys=false</code>, hash it: <code>Utils.toPositive(Utils.murmur2(serializedKey)) % numPartitions</code> (<span class="cite">BuiltInPartitioner.java:397</span>). Keyed records are <em>always</em> distributed this way; the adaptive logic never touches them.</li>
+  <li>Else return <code>RecordMetadata.UNKNOWN_PARTITION</code> (the sentinel <code>-1</code>), deferring the choice to the <code>BuiltInPartitioner</code> inside the accumulator.</li>
+</ol>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>For keyless records the partition is <em>not</em> chosen in <code>partition()</code>. It is chosen inside <code>RecordAccumulator.append</code> under the deque lock, so the sticky partition can be peeked, validated against concurrent switches, and committed atomically with the byte append. The chosen partition is reported back to the caller through <code>AppendCallbacks.setPartition</code> (<span class="cite">RecordAccumulator.java:314</span>).</p></div>
+
+<h3>4. The adaptive sticky partitioner (KIP-794 / KIP-480)</h3>
+<p>There is one <code>BuiltInPartitioner</code> per topic. It keeps the chosen partition in an <code>AtomicReference&lt;StickyPartitionInfo&gt;</code>; each <code>StickyPartitionInfo</code> carries an immutable partition index and an <code>AtomicInteger producedBytes</code> counter (<span class="cite">BuiltInPartitioner.java:381</span>). The append protocol is a careful lock-free peek / lock / re-validate dance (<span class="cite">BuiltInPartitioner.java:156</span>):</p>
+<ol>
+  <li><code>peekCurrentPartitionInfo</code> returns the current sticky info, creating one via <code>nextPartition</code> on first use (CAS-guarded against racing creators).</li>
+  <li>The caller locks the partition's batch deque.</li>
+  <li><code>isPartitionChanged</code> confirms no other thread switched partitions; if it did, <code>append</code> loops and retries (<span class="cite">RecordAccumulator.java:319</span>).</li>
+  <li>Bytes are appended.</li>
+  <li><code>updatePartitionInfo</code> adds the appended bytes and may rotate the sticky partition.</li>
+</ol>
+<p><strong>When to switch.</strong> The partition rotates once <code>producedBytes ≥ stickyBatchSize</code> (which is <code>batch.size</code>) <em>and</em> switching is enabled, or unconditionally once <code>producedBytes ≥ 2 × stickyBatchSize</code> (<span class="cite">BuiltInPartitioner.java:251</span>). Switching is disabled while the deque has an incomplete (non-full) last batch, so the producer does not strand half-filled 4 KB batches when <code>linger.ms</code> is high — the cap at 2× prevents pathological non-switching (<span class="cite">RecordAccumulator.java:327</span>, <span class="cite">RecordAccumulator.java:355</span>).</p>
+<p><strong>Where to switch.</strong> <code>nextPartition</code> picks the next partition. With adaptive partitioning <em>disabled</em> (<code>partitioner.adaptive.partitioning.enable=false</code>) or before stats exist, it chooses uniformly at random among partitions that have a leader (<span class="cite">BuiltInPartitioner.java:79</span>). With adaptive partitioning <em>enabled</em>, it draws from a <strong>cumulative frequency table</strong> weighted inversely by queue depth: each partition's weight is <code>maxQueueSize + 1 − queueSize</code>, folded into a running sum, then a uniform random in <code>[0, total)</code> is mapped via binary search (<span class="cite">BuiltInPartitioner.java:270</span>, <span class="cite">BuiltInPartitioner.java:111</span>). Partitions with shorter queues — i.e. faster brokers — get proportionally more records.</p>
+
+<figure class="diagram"><table>
+<thead><tr><th>Partition</th><th>Queue depth</th><th>Weight (max+1−depth, max=3)</th><th>Cumulative sum (CFT)</th><th>Random <code>r</code> range</th><th>Probability</th></tr></thead>
+<tbody>
+<tr><td><code>p0</code></td><td>0 (idle)</td><td>4</td><td>4</td><td><code>0 1 2 3</code></td><td>4/8</td></tr>
+<tr><td><code>p1</code></td><td>3 (slowest)</td><td>1</td><td>5</td><td><code>4</code></td><td>1/8</td></tr>
+<tr><td><code>p2</code></td><td>1</td><td>3</td><td>8</td><td><code>5 6 7</code></td><td>3/8</td></tr>
+</tbody>
+</table><figcaption>Adaptive partition selection: a queue-depth-weighted cumulative frequency table (KIP-794). A longer queue means a slower broker and a smaller weight; a uniform random <code>r</code> in <code>[0, 8)</code> is mapped via binary search, so the idle <code>p0</code> wins most often.</figcaption></figure>
+
+<p>The stats feeding this table are recomputed by the Sender thread during <code>ready()</code>: <code>partitionReady</code> gathers per-partition deque sizes and calls <code>updatePartitionLoadStats</code> (<span class="cite">RecordAccumulator.java:653</span>). If <code>partitioner.availability.timeout.ms &gt; 0</code>, a partition whose leader has not drained data for that long is excluded from the available set entirely, so the partitioner stops sending to a stuck broker (<span class="cite">RecordAccumulator.java:729</span>). When <code>partitioner.rack.aware=true</code>, a parallel rack-local CFT is built and preferred when non-empty (<span class="cite">BuiltInPartitioner.java:104</span>, <span class="cite">BuiltInPartitioner.java:345</span>).</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The original sticky partitioner (<span class="pill kip">KIP-480</span>) batched keyless records to one partition per batch but sent uniformly, so a slow broker built a backlog. <span class="pill kip">KIP-794</span> made the partitioner adaptive: it weights partition choice by observed queue depth and broker latency, producing larger batches to faster brokers and uniform <em>data</em> distribution rather than uniform <em>record-count</em> distribution. Adaptive logic is skipped entirely when a custom partitioner is configured (<span class="cite">KafkaProducer.java:447</span>).</p></div>
+
+<h2>RecordAccumulator: batching &amp; the append algorithm</h2>
+<p><code>append</code> is the hot path shared by all user threads (<span class="cite">RecordAccumulator.java:280</span>). It increments <code>appendsInProgress</code> (so <code>abortIncompleteBatches</code> on close can't miss in-flight appends) and runs a retry loop:</p>
+<pre><code>computeIfAbsent topic → TopicInfo (creates per-topic BuiltInPartitioner)
+loop:
+  if partition == UNKNOWN: peek sticky partition else use explicit partition
+  setPartition(callbacks, effectivePartition)
+  dq = topicInfo.batches.computeIfAbsent(partition, ArrayDeque::new)
+  synchronized (dq):
+     if partitionChanged(...) continue          // racey switch; retry
+     r = tryAppend(...) on last batch
+     if r != null: updatePartitionInfo; return r // fit into existing batch
+  // no room: allocate a fresh buffer (may block on BufferPool up to maxTimeToBlock)
+  buffer = free.allocate(max(batch.size, estimatedRecordSize), remainingBlockMs)
+  synchronized (dq):
+     if partitionChanged(...) continue
+     r = appendNewBatch(...)                     // create ProducerBatch, append, addLast
+     if r.newBatchCreated: buffer = null          // buffer now owned by the batch
+     updatePartitionInfo; return r
+finally: free.deallocate(buffer); appendsInProgress--</code></pre>
+<p><code>tryAppend</code> calls <code>ProducerBatch.tryAppend</code>, which checks <code>recordsBuilder.hasRoomFor</code> and returns <code>null</code> when the batch is full; on a full batch it eagerly calls <code>closeForRecordAppends()</code> to release compression buffers (<span class="cite">RecordAccumulator.java:430</span>, <span class="cite">ProducerBatch.java:147</span>). The buffer is sized as <code>max(batch.size, upperBound(record))</code>, so an over-sized record gets its own larger-than-<code>batch.size</code> buffer (<span class="cite">RecordAccumulator.java:334</span>). Note the careful buffer ownership transfer: when a new batch is created the local <code>buffer</code> is nulled so the <code>finally</code> block does not return it to the pool.</p>
+
+<h3>What "ready" and "full" mean</h3>
+<p>A batch counts as <em>full</em> when the deque has more than one batch (so all but the last are sealed) or the last batch's builder reports <code>isFull()</code> (<span class="cite">RecordAccumulator.java:719</span>). A <em>node</em> is ready to send if it has at least one non-muted, non-backing-off partition where any of these hold (<span class="cite">RecordAccumulator.java:613</span>):</p>
+<ul>
+  <li>the batch is full, or</li>
+  <li>it has lingered ≥ <code>linger.ms</code> (or, when retrying, ≥ the exponential retry backoff), or</li>
+  <li>the BufferPool is exhausted (threads are blocked waiting), or</li>
+  <li>the accumulator is closed, or a <code>flush()</code> is in progress, or the transaction is completing.</li>
+</ul>
+<p>The <code>RecordAppendResult</code> returned to <code>doSend</code> carries <code>batchIsFull</code> and <code>newBatchCreated</code>; if either is true, <code>doSend</code> wakes the Sender so it does not wait out a full poll timeout (<span class="cite">KafkaProducer.java:1192</span>).</p>
+
+<h2>BufferPool &amp; back-pressure</h2>
+<p>The pool is bounded by <code>buffer.memory</code> (default 32 MiB) and guarded by a single <code>ReentrantLock</code> (<span class="cite">BufferPool.java:70</span>). Free memory is the sum of <code>nonPooledAvailableMemory</code> plus the recycled free-list count times <code>poolableSize</code> (which equals <code>batch.size</code>). <code>allocate(size, maxTimeToBlockMs)</code>:</p>
+<ul>
+  <li>returns a recycled buffer instantly if <code>size == poolableSize</code> and the free list is non-empty;</li>
+  <li>otherwise, if enough memory is on hand, reserves it (freeing pooled buffers as needed via <code>freeUp</code>);</li>
+  <li>otherwise blocks the caller on a per-request <code>Condition</code> appended to a FIFO <code>waiters</code> deque, accumulating memory incrementally as buffers are returned, until it has enough or <code>maxTimeToBlockMs</code> elapses — on timeout it throws <code>BufferExhaustedException</code> (<span class="cite">BufferPool.java:159</span>).</li>
+</ul>
+<p>The <code>maxTimeToBlockMs</code> passed in is the <em>remaining</em> <code>max.block.ms</code> budget after the metadata wait already consumed part of it (<span class="cite">KafkaProducer.java:1146</span>). This is the second place <code>send()</code> can block. The waiter queue is strictly FIFO and memory is handed to the longest-waiting thread first, preventing starvation when a large request must wait for several small buffers to return (<span class="cite">BufferPool.java:38</span>). <code>deallocate</code> returns exact-<code>poolableSize</code> buffers to the free list and signals the head waiter (<span class="cite">BufferPool.java:260</span>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><code>availableMemory() = nonPooledAvailableMemory + free.size() × poolableSize ≤ totalMemory</code> at all times. Memory reserved by a thread that ultimately throws is returned in the allocate <code>finally</code> block (<span class="cite">BufferPool.java:185</span>), so a timed-out or interrupted allocation never leaks pool memory.</p></div>
+
+<h2>ProducerBatch: structure, futures, and the state machine</h2>
+<p>A <code>ProducerBatch</code> wraps one <code>MemoryRecordsBuilder</code> (the actual on-wire v2 batch — see <a href="01-record-format.html">Record Format &amp; Batches</a>) and a <code>List&lt;Thunk&gt;</code>. Each appended record produces a <code>FutureRecordMetadata</code> chained to the batch's shared <code>ProduceRequestResult</code>; that future is what <code>send()</code> hands back (<span class="cite">ProducerBatch.java:147</span>). Key mutable fields: <code>recordCount</code>, <code>maxRecordSize</code>, an <code>AtomicInteger attempts</code>, and an <code>AtomicReference&lt;FinalState&gt;</code> (<span class="cite">ProducerBatch.java:64</span>).</p>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">batch created (no final state)</span><span class="ta"></span></span>
+  <span class="st">Open</span>
+  <span class="tr"><span class="tl">done(success) → set baseOffset, logAppendTime</span><span class="ta"></span></span>
+  <span class="st accent">SUCCEEDED</span>
+  <span class="tr"><span class="tl">terminal — any further change ⇒ IllegalStateException</span><span class="ta"></span></span>
+  <span class="term end"></span>
+  <div class="note"><strong>Failure branches</strong> (off the success spine — all converge on SUCCEEDED only via a late broker write):
+    <br>· <span class="mono">Open → FAILED</span> — completeExceptionally (e.g. delivery.timeout expiry)
+    <br>· <span class="mono">Open → ABORTED</span> — abort(reason)
+    <br>· <span class="mono">FAILED → FAILED</span> — ignored (idempotent re-fail)
+    <br>· <span class="mono">FAILED → SUCCEEDED</span> — logged: late broker success after local expiry
+    <br>· <span class="mono">ABORTED → SUCCEEDED</span> — logged: late broker success after abort
+  </div>
+</div><figcaption>ProducerBatch final-state machine. The first <code>compareAndSet</code> on <code>finalState</code> wins; <code>done()</code> tolerates the double-completion races (FAILED&rarr;FAILED is ignored, FAILED/ABORTED&rarr;SUCCEEDED is logged) but throws on any transition out of SUCCEEDED, which is terminal (<span class="cite">ProducerBatch.java:262</span>).</figcaption><div class="legend">
+  <span class="lgi"><span class="sw round"></span>pill = batch final-state (Open / FAILED / ABORTED)</span>
+  <span class="lgi"><span class="sw round cat-storage"></span>accent = SUCCEEDED (committed)</span>
+  <span class="lgi">&#9678; = initial (batch created) · &#9678; end = terminal (SUCCEEDED)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = triggering call)</span>
+  <span class="lgi"><span class="mono">A &rarr; B</span> = off-spine transition (see notes)</span>
+</div></figure>
+
+<p>The double-completion tolerance matters: an in-flight batch may expire on <code>delivery.timeout.ms</code> (set FAILED) yet still have been written by the broker (a later SUCCEEDED attempt). The CAS-based <code>done()</code> ignores FAILED→FAILED and ABORTED→FAILED, logs the rare FAILED/ABORTED→SUCCEEDED, and throws only on SUCCEEDED→anything (<span class="cite">ProducerBatch.java:280</span>). <code>completeFutureAndFireCallbacks</code> sets the future, then invokes every thunk's callback in append order, swallowing exceptions thrown by user callbacks so one bad callback cannot poison the rest (<span class="cite">ProducerBatch.java:297</span>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Callbacks for records sent to the <em>same</em> partition fire in send order. This holds because records keep their append order within a batch (thunks are a <code>List</code>), and batches for a partition are completed in deque order; reenqueued retries are reinserted in sequence order (<span class="cite">RecordAccumulator.java:557</span>).</p></div>
+
+<h2>The Sender thread: drain, encode, transmit, complete</h2>
+<p>The I/O thread runs <code>Sender.run</code>, which loops <code>runOnce()</code> until <code>running</code> is cleared, then drains residual data and closes the client (<span class="cite">Sender.java:240</span>). <code>runOnce</code> first services the <code>TransactionManager</code> (coordinator discovery, <code>InitProducerId</code>, <code>AddPartitions</code>, commit/abort, idempotent epoch bumps), then calls <code>sendProducerData</code> followed by <code>client.poll</code> (<span class="cite">Sender.java:310</span>).</p>
+
+<h3>sendProducerData</h3>
+<p>One iteration (<span class="cite">Sender.java:380</span>):</p>
+<ol>
+  <li><code>accumulator.ready(metadataSnapshot, now)</code> → the set of ready leader nodes, the next-check delay, and topics with unknown leaders (which trigger a metadata refresh).</li>
+  <li>For each ready node, gate on <code>client.ready(node, now)</code>; nodes whose connection isn't established are dropped this round, and node latency stats are nudged.</li>
+  <li><code>accumulator.drain(metadataSnapshot, readyNodes, maxRequestSize, now)</code> → <code>Map&lt;nodeId, List&lt;ProducerBatch&gt;&gt;</code>.</li>
+  <li><code>addToInflightBatches</code> records them for delivery-timeout tracking; if <code>guaranteeMessageOrder</code> (i.e. <code>max.in.flight==1</code>), every drained partition is <em>muted</em>.</li>
+  <li>Expire batches that blew <code>delivery.timeout.ms</code> (both queued and in-flight) via <code>failExpiredBatches</code>.</li>
+  <li><code>sendProduceRequests</code> encodes and sends one <code>ProduceRequest</code> per node.</li>
+</ol>
+
+<h3>drainBatchesForOneNode</h3>
+<p>For a node, the accumulator walks that node's partitions starting at a per-node round-robin <code>drainIndex</code> (so no single topic-partition starves the others), and for each it pulls the head batch while (<span class="cite">RecordAccumulator.java:860</span>): the partition isn't muted; the batch isn't in retry backoff; adding it won't exceed <code>max.request.size</code> (unless the batch is the first and alone); and idempotence ordering permits it (<code>shouldStopDrainBatchesForPartition</code>). When idempotence is on and the drained batch has no sequence yet, it is stamped here: <code>batch.setProducerState(producerIdAndEpoch, sequenceNumber(tp), isTransactional)</code>, the per-partition sequence is advanced by <code>recordCount</code>, and the batch is registered as in-flight (<span class="cite">RecordAccumulator.java:911</span>). The batch is then <code>close()</code>d (header written, compression finalized) outside the lock because closing is expensive.</p>
+
+<h3>Building and sending the ProduceRequest</h3>
+<p><code>sendProduceRequest</code> assembles a <code>ProduceRequestData</code> with the configured <code>acks</code> and <code>request.timeout.ms</code>, grouping batches by topic (using topic <em>id</em> where available; modern <code>ProduceRequest</code> v13 drops topic names in favour of ids) and setting each batch's <code>MemoryRecords</code> as the partition payload (<span class="cite">Sender.java:896</span>). For transactional producers it stamps the <code>transactionalId</code> and selects the request version. Each batch is marked <code>setInflight(true)</code>. The client request is created with <code>expectResponse = acks != 0</code> — for <code>acks=0</code> there is no response and batches complete as soon as the bytes are written (<span class="cite">Sender.java:945</span>, <span class="cite">Sender.java:653</span>).</p>
+
+<h3>Handling the response</h3>
+<p><code>handleProduceResponse</code> demultiplexes per-partition results, resolving the <code>TopicPartition</code> by topic id (v13) or name (older) and dispatching each to <code>completeBatch</code> (<span class="cite">Sender.java:580</span>). Disconnects map to <code>NETWORK_EXCEPTION</code>, timeouts to <code>REQUEST_TIMED_OUT</code>, version mismatches to <code>UNSUPPORTED_VERSION</code>. The response may carry updated leader id/epoch which is fed back into the metadata cache for <code>NOT_LEADER_OR_FOLLOWER</code> / <code>FENCED_LEADER_EPOCH</code> errors (<span class="cite">Sender.java:638</span>).</p>
+
+<h3>completeBatch: the success / split / retry / fail decision</h3>
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">completeBatch · setInflight(false)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage decision">MESSAGE_TOO_LARGE and recordCount &ge; 2 and (v2 or compressed)?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-data" data-label="yes"></div>
+      <div class="node"><span class="nt">splitAndReenqueue</span><span class="nd">split into &le; batch.size pieces · NO attempt charged</span></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="no"></div>
+      <div class="node cat-broker decision">error &ne; NONE?</div>
+      <div class="conn"></div>
+      <div class="row">
+        <div class="col">
+          <div class="conn" data-label="no"></div>
+          <div class="node cat-storage"><span class="nt">complete success</span><span class="nd">baseOffset, logAppendTime</span></div>
+        </div>
+        <div class="col">
+          <div class="conn" data-label="yes"></div>
+          <div class="node cat-coord decision">canRetry?</div>
+          <div class="conn"></div>
+          <div class="row">
+            <div class="col">
+              <div class="conn dashed ec-async" data-label="yes"></div>
+              <div class="node cat-coord"><span class="nt">reenqueue(batch)</span><span class="nd">retriable</span></div>
+            </div>
+            <div class="col">
+              <div class="conn" data-label="no"></div>
+              <div class="node cat-error decision">DUPLICATE_SEQUENCE_NUMBER?</div>
+              <div class="conn"></div>
+              <div class="row">
+                <div class="col">
+                  <div class="conn" data-label="yes"></div>
+                  <div class="node cat-storage"><span class="nt">complete success</span><span class="nd">offset unknown</span></div>
+                </div>
+                <div class="col">
+                  <div class="conn ec-err" data-label="no"></div>
+                  <div class="node cat-error"><span class="nt">failBatch</span><span class="nd">fatal for this batch</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="sep">reenqueue · duplicate · failBatch then check &mdash; InvalidMetadataException? &rarr; metadata.requestUpdate()</div>
+  <div class="node cat-broker"><span class="nt">if guaranteeMessageOrder: unmutePartition</span><span class="nd">end of completion (all paths converge here)</span></div>
+</div><figcaption>The per-batch completion decision. The split path charges no retry attempt; the retry/duplicate/fail paths additionally call <code>metadata.requestUpdate()</code> when the error is an <code>InvalidMetadataException</code>; every path ends by un-muting the partition when <code>guaranteeMessageOrder</code> is set (<span class="cite">Sender.java:671</span>).</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>Sender / completion step</span>
+  <span class="lgi"><span class="sw cat-storage"></span>success outcome / split</span>
+  <span class="lgi"><span class="sw cat-coord"></span>retry path</span>
+  <span class="lgi"><span class="sw cat-error"></span>fatal / failure path</span>
+  <span class="lgi">rounded = decision (yes / no branch)</span>
+  <span class="lgi"><span class="arr"></span>control flow</span>
+  <span class="lgi"><span class="arr dashed"></span>reenqueue (async retry)</span>
+</div></figure>
+
+<p><code>canRetry</code> is the retriability gate (<span class="cite">Sender.java:876</span>): the batch must not have reached <code>delivery.timeout.ms</code>, must have <code>attempts() &lt; retries</code>, must not be already done, and the error must be a <code>RetriableException</code> — or, when idempotence is on, must satisfy <code>TransactionManager.canRetry</code>, which additionally retries certain <code>UNKNOWN_PRODUCER_ID</code> and <code>OUT_OF_ORDER_SEQUENCE_NUMBER</code> cases and may request an epoch bump (<span class="cite">TransactionManager.java:1043</span>).</p>
+
+<h2>Ordering &amp; idempotence</h2>
+<p>Idempotence is <strong>on by default</strong> (<code>enable.idempotence=true</code>, <span class="cite">ProducerConfig.java:541</span>). When enabled, the <code>TransactionManager</code> is instantiated even with no <code>transactional.id</code> ("an idempotent producer"; <span class="cite">KafkaProducer.java:612</span>). On first send the producer fetches a producer id and epoch via <code>InitProducerId</code> (<span class="cite">TransactionManager.java:691</span>), then stamps each batch with <code>(producerId, epoch, baseSequence)</code> at drain time. The broker retains the last five batches per producer-partition and rejects duplicates (a retried batch with an already-committed sequence) and gaps (<code>OUT_OF_ORDER_SEQUENCE_NUMBER</code>), giving exactly-once <em>delivery</em> within a producer session.</p>
+
+<div class="callout key"><span class="callout-title">Why max.in.flight ≤ 5 preserves ordering</span><p>With idempotence, the broker enforces strictly increasing per-partition sequences, so even with up to five concurrent in-flight requests it rejects anything out of order; the client reorders and resends from its queue. Therefore ordering holds for any <code>max.in.flight ∈ [1,5]</code>. <code>ProducerConfig</code> hard-caps idempotent producers at 5 (<code>MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE</code>); a larger value is a <code>ConfigException</code> (<span class="cite">ProducerConfig.java:639</span>). Without idempotence, only <code>max.in.flight=1</code> guarantees order (enforced by partition muting); larger values can reorder on retry.</p></div>
+
+<p><strong>Reorder-on-retry handling.</strong> Once a batch is retried, the accumulator must keep the partition's queue in sequence order. <code>reenqueue</code> adds the batch to the <em>front</em> via <code>insertInSequenceOrder</code>, which linearly scans the in-flight batches and inserts so base sequences stay ascending (<span class="cite">RecordAccumulator.java:557</span>). To avoid writing a new-epoch sequence-0 batch ahead of older batches, <code>shouldStopDrainBatchesForPartition</code> stops draining new (sequence-less) batches while the partition has in-flight batches with a stale producer id/epoch, has unresolved sequences, or has an earlier in-flight batch being retried — effectively collapsing to one in-flight request for that partition during recovery (<span class="cite">RecordAccumulator.java:823</span>).</p>
+
+<p><strong>Epoch bumps.</strong> On a fatal sequence gap an idempotent (non-transactional) producer bumps its epoch locally and restarts sequences at 0 for the affected partition. An <code>OutOfOrderSequenceException</code> from the broker calls <code>requestIdempotentEpochBumpForPartition</code>; on the next <code>runOnce</code>, <code>bumpIdempotentEpochAndResetIdIfNeeded</code> increments the epoch (or, at <code>Short.MAX_VALUE</code>, resets to a brand-new producer id) and rewrites in-flight sequences from the beginning (<span class="cite">TransactionManager.java:827</span>, <span class="cite">TransactionManager.java:673</span>). An expired in-flight batch also marks the partition's sequence unresolved so no new batch is drained until the gap resolves (<span class="cite">Sender.java:373</span>).</p>
+
+<h2>acks, timeouts &amp; retries</h2>
+<dl class="kv">
+<dt>acks=0</dt><dd>Fire-and-forget. No response is requested; the batch completes when written to the socket and <code>RecordMetadata.offset()</code> is <code>-1</code>. Incompatible with idempotence.</dd>
+<dt>acks=1</dt><dd>Leader-only durability. The leader acks after writing to its log, before followers replicate. Incompatible with idempotence.</dd>
+<dt>acks=all (-1)</dt><dd>The leader acks only after the in-sync replica set has the record (subject to <code>min.insync.replicas</code>). The only value compatible with idempotence; it is the default (<span class="cite">ProducerConfig.java:403</span>). See <a href="08-replication.html">Replication, ISR &amp; High Watermark</a>.</dd>
+</dl>
+<p>Three timeouts compose (<span class="cite">KafkaProducer.java:589</span>): <code>request.timeout.ms</code> bounds one network round trip; <code>retries</code> bounds the number of attempts; and <code>delivery.timeout.ms</code> is the hard wall-clock deadline from when the record enters the accumulator until success or failure is reported, spanning lingering, backoff, and all retries. The constructor enforces <code>delivery.timeout.ms ≥ linger.ms + request.timeout.ms</code>, raising <code>ConfigException</code> if the user set an inconsistent value or silently bumping the default otherwise. Because <code>retries</code> defaults to <code>Integer.MAX_VALUE</code>, in practice <code>delivery.timeout.ms</code> (default 120 s) is what actually terminates retrying — the docs and code both steer users to tune it instead of <code>retries</code> (<span class="cite">ProducerConfig.java:402</span>).</p>
+
+<h3>Error classification</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Class</th><th>Examples</th><th>Producer action</th></tr></thead>
+<tbody>
+<tr><td>Retriable (transient)</td><td><code>NETWORK_EXCEPTION</code>, <code>REQUEST_TIMED_OUT</code>, <code>NOT_LEADER_OR_FOLLOWER</code>, <code>NOT_ENOUGH_REPLICAS</code></td><td>Reenqueue with exponential backoff until <code>retries</code> or <code>delivery.timeout.ms</code> exhausted (<span class="cite">Sender.java:692</span>).</td></tr>
+<tr><td>Too large</td><td><code>MESSAGE_TOO_LARGE</code> on a multi-record batch</td><td>Split into ≤ <code>batch.size</code> batches and resend; does not consume a retry attempt (<span class="cite">Sender.java:676</span>, <span class="cite">ProducerBatch.java:326</span>).</td></tr>
+<tr><td>Idempotence-recoverable</td><td><code>OUT_OF_ORDER_SEQUENCE_NUMBER</code>, <code>UNKNOWN_PRODUCER_ID</code></td><td>Retry, possibly bumping epoch / resetting sequences (<span class="cite">TransactionManager.java:1043</span>).</td></tr>
+<tr><td>Duplicate</td><td><code>DUPLICATE_SEQUENCE_NUMBER</code></td><td>Treated as success but with unknown offset/timestamp (<span class="cite">Sender.java:700</span>).</td></tr>
+<tr><td>Fatal</td><td><code>TOPIC_AUTHORIZATION_FAILED</code>, <code>CLUSTER_AUTHORIZATION_FAILED</code>, <code>RecordTooLargeException</code> (single record), <code>UnsupportedVersionException</code></td><td>Fail the batch's futures/callbacks; for txn producers transition to an abortable/fatal error (<span class="cite">Sender.java:770</span>).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Compression</h2>
+<p>Compression is configured once via <code>compression.type</code> (default <code>none</code>; <code>gzip</code>/<code>snappy</code>/<code>lz4</code>/<code>zstd</code> supported, with optional per-codec level) and applied at the <em>batch</em> level by the <code>MemoryRecordsBuilder</code> as records are appended (<span class="cite">KafkaProducer.java:562</span>, <span class="cite">RecordAccumulator.java:409</span>). The producer maintains a per-(topic, codec) <code>CompressionRatioEstimator</code> so it can size buffers realistically; on <code>close()</code> each batch updates the estimate (<span class="cite">ProducerBatch.java:518</span>). Because compression operates on whole batches, larger batches (higher <code>linger.ms</code>/<code>batch.size</code>) compress better. When a compressed batch nonetheless exceeds <code>max.request.size</code> on the broker, the split path resets the estimate conservatively to avoid repeated splits (<span class="cite">RecordAccumulator.java:516</span>).</p>
+
+<h2>flush() and close()</h2>
+<p><code>flush()</code> makes every buffered record immediately sendable and blocks until all in-flight requests complete. It increments <code>flushesInProgress</code> (which makes <code>ready()</code> return everything as sendable), wakes the Sender, then awaits each incomplete batch's <code>ProduceRequestResult</code> — using <code>awaitAllDependents()</code> so split batches are also awaited (<span class="cite">KafkaProducer.java:1366</span>, <span class="cite">RecordAccumulator.java:1106</span>). Calling <code>flush()</code> from inside a callback throws, because the callback runs on the I/O thread and would deadlock waiting on itself (<span class="cite">KafkaProducer.java:1368</span>).</p>
+<p><code>close(timeout)</code> closes the accumulator first (so no new appends are accepted), clears <code>running</code>, and joins the I/O thread, which drains residual batches and completes in-flight requests up to the timeout; if the deadline passes it <code>forceClose()</code>s, failing all incomplete batches via <code>abortIncompleteBatches</code> (<span class="cite">KafkaProducer.java:1546</span>, <span class="cite">Sender.java:295</span>). Called from a callback, <code>close()</code> degrades to a non-blocking <code>close(0)</code> to avoid a self-join (<span class="cite">KafkaProducer.java:1554</span>).</p>
+
+<h2>Concurrency &amp; threading model</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Guarded by</th><th>Accessed by</th></tr></thead>
+<tbody>
+<tr><td>Per-partition <code>Deque&lt;ProducerBatch&gt;</code></td><td>the deque object's monitor (<code>synchronized(dq)</code>)</td><td>user threads (append) and Sender (ready/drain)</td></tr>
+<tr><td><code>topicInfoMap</code>, <code>TopicInfo.batches</code></td><td><code>CopyOnWriteMap</code> (lock-free reads)</td><td>both</td></tr>
+<tr><td>Sticky partition</td><td><code>AtomicReference</code> + deque lock for the peek/validate/update protocol</td><td>both</td></tr>
+<tr><td>BufferPool free list / waiters</td><td>one <code>ReentrantLock</code> + per-waiter <code>Condition</code></td><td>user threads (allocate) and Sender (deallocate)</td></tr>
+<tr><td><code>ProducerBatch.finalState</code>, <code>attempts</code></td><td><code>AtomicReference</code> / <code>AtomicInteger</code></td><td>Sender; user threads read via futures</td></tr>
+<tr><td><code>muted</code>, <code>nodesDrainIndex</code>, <code>inFlightBatches</code></td><td>unsynchronized — Sender-thread-only</td><td>Sender only (<span class="cite">RecordAccumulator.java:90</span>, <span class="cite">Sender.java:126</span>)</td></tr>
+<tr><td>Transaction/idempotence state</td><td><code>synchronized</code> methods on <code>TransactionManager</code></td><td>Sender and (for the public txn API) user threads</td></tr>
+<tr><td><code>appendsInProgress</code>, <code>flushesInProgress</code></td><td><code>AtomicInteger</code></td><td>both</td></tr>
+</tbody>
+</table></div>
+<p>The design keeps user threads off the network entirely and confines all socket I/O, retry bookkeeping, and the in-flight pipeline to one Sender thread, so the only cross-thread contention is the short critical section around each partition's deque and the BufferPool lock. The hot <code>ready()</code>/<code>partitionReady()</code> loop is deliberately minimal under the deque lock to avoid contending with appends at large partition counts (a documented hot path; <span class="cite">RecordAccumulator.java:697</span>).</p>
+
+<h2>The NetworkClient pipeline</h2>
+<p>The Sender sends through a <code>NetworkClient</code> configured with <code>max.in.flight.requests.per.connection</code>. <code>canSendRequest</code> returns true only when the connection is ready, the channel is writable, and <code>InFlightRequests.canSendMore(node)</code> holds; the latter is true when the node has no outstanding requests, or the oldest send has completed <em>and</em> the queue size is below the max (<span class="cite">NetworkClient.java:544</span>, <span class="cite">InFlightRequests.java:96</span>). This is the mechanism that bounds pipelining per broker. Throttling from <a href="19-quotas.html">quotas</a> is observed as a <code>throttleDelayMs</code> on the connection, which the Sender folds into its poll timeout. The wire encoding of <code>ProduceRequest</code>/<code>ProduceResponse</code> is covered in <a href="02-wire-protocol.html">Wire Protocol &amp; RPC Framework</a>.</p>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Metadata never arrives.</strong> <code>send()</code> blocks up to <code>max.block.ms</code> then throws <code>TimeoutException</code>; if a partial wait already elapsed, the BufferPool gets the remainder (<span class="cite">KafkaProducer.java:1146</span>).</li>
+  <li><strong>Buffer exhausted.</strong> <code>allocate</code> blocks up to the remaining <code>max.block.ms</code>, then throws <code>BufferExhaustedException</code> (a subclass of <code>TimeoutException</code>), incrementing <code>buffer-exhausted-records</code> (<span class="cite">BufferPool.java:159</span>).</li>
+  <li><strong>Delivery timeout.</strong> A batch that exceeds <code>delivery.timeout.ms</code> in queue or in flight is failed with <code>TimeoutException</code> regardless of remaining retries (<span class="cite">Sender.java:362</span>). With idempotence this triggers a sequence-unresolved marker and eventual epoch bump.</li>
+  <li><strong>Leader change.</strong> <code>NOT_LEADER_OR_FOLLOWER</code>/<code>FENCED_LEADER_EPOCH</code> are retriable; the response's new leader info updates metadata, and the batch tracks the new leader epoch so backoff is skipped when retrying to a fresh leader (<span class="cite">ProducerBatch.java:116</span>, <span class="cite">RecordAccumulator.java:804</span>).</li>
+  <li><strong>Forced close.</strong> <code>abortIncompleteBatches</code> loops until <code>appendsInProgress == 0</code> so no batch from a racing appender is missed, then aborts all incomplete batches (<span class="cite">RecordAccumulator.java:1135</span>).</li>
+  <li><strong>Batch still in network use (KAFKA-19012).</strong> A batch sent to the <code>NetworkClient</code> may have its pooled buffer in use; deallocation is deferred (<code>maybeRemoveAndDeallocateBatchLater</code>) until the request truly completes, to prevent reusing a buffer that the selector is still reading (<span class="cite">Sender.java:854</span>, <span class="cite">RecordAccumulator.java:1168</span>).</li>
+  <li><strong>Authorization mid-transaction.</strong> <code>TransactionalIdAuthorizationException</code>/<code>ClusterAuthorizationException</code> fail pending requests and transition the manager to <code>UNINITIALIZED</code> so the user need not reconstruct the producer (<span class="cite">Sender.java:351</span>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A user thread never performs network I/O. <code>send()</code> only serializes, partitions, and appends; the Sender thread alone talks to the cluster. The two bounded waits a user thread can experience are metadata refresh and buffer allocation, both capped by <code>max.block.ms</code>.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>With idempotence on and <code>acks=all</code>, retries never produce duplicates and never reorder records within a partition, for any <code>max.in.flight ∈ [1,5]</code>, within a single producer session. Across sessions, only a <code>transactional.id</code> provides recovery (see <a href="14-transactions-eos.html">Transactions &amp; EOS</a>).</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Every accepted record's future and callback fires exactly once — on success with a valid offset, or on failure with an exception — bounded by <code>delivery.timeout.ms</code>.</p></div>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>acks</code></td><td><code>all</code></td><td>Durability level; <code>all</code> required for idempotence (<span class="cite">ProducerConfig.java:403</span>).</td></tr>
+<tr><td><code>enable.idempotence</code></td><td><code>true</code></td><td>Dedup + ordered retries via producer id/epoch/sequence (<span class="cite">ProducerConfig.java:541</span>).</td></tr>
+<tr><td><code>batch.size</code></td><td><code>16384</code></td><td>Target batch size and BufferPool poolable size; <code>max(1, …)</code> applied (<span class="cite">ProducerConfig.java:413</span>, <span class="cite">KafkaProducer.java:458</span>).</td></tr>
+<tr><td><code>linger.ms</code></td><td><code>5</code></td><td>Max time to wait filling a batch before it is ready (<span class="cite">ProducerConfig.java:418</span>).</td></tr>
+<tr><td><code>buffer.memory</code></td><td><code>33554432</code> (32 MiB)</td><td>Total accumulator memory; over-budget sends block (<span class="cite">ProducerConfig.java:401</span>).</td></tr>
+<tr><td><code>max.block.ms</code></td><td><code>60000</code></td><td>Combined cap on metadata wait + buffer allocation in <code>send()</code> (<span class="cite">ProducerConfig.java:449</span>).</td></tr>
+<tr><td><code>max.in.flight.requests.per.connection</code></td><td><code>5</code></td><td>Pipeline depth per broker; capped at 5 with idempotence (<span class="cite">ProducerConfig.java:487</span>).</td></tr>
+<tr><td><code>retries</code></td><td><code>2147483647</code></td><td>Max attempts; prefer <code>delivery.timeout.ms</code> (<span class="cite">ProducerConfig.java:402</span>).</td></tr>
+<tr><td><code>delivery.timeout.ms</code></td><td><code>120000</code></td><td>Hard deadline for success/failure; must be ≥ <code>linger.ms</code> + <code>request.timeout.ms</code> (<span class="cite">ProducerConfig.java:419</span>).</td></tr>
+<tr><td><code>request.timeout.ms</code></td><td><code>30000</code></td><td>Per-round-trip timeout (<span class="cite">ProducerConfig.java:455</span>).</td></tr>
+<tr><td><code>retry.backoff.ms</code></td><td><code>100</code> (common default)</td><td>Base of exponential reenqueue backoff (<span class="cite">ProducerConfig.java:432</span>).</td></tr>
+<tr><td><code>compression.type</code></td><td><code>none</code></td><td>Batch-level codec: none/gzip/snappy/lz4/zstd (<span class="cite">ProducerConfig.java:409</span>).</td></tr>
+<tr><td><code>max.request.size</code></td><td><code>1048576</code> (1 MiB)</td><td>Rejects over-sized records; bounds drained request size (<span class="cite">ProducerConfig.java:424</span>).</td></tr>
+<tr><td><code>partitioner.class</code></td><td><code>null</code></td><td>Custom partitioner; null ⇒ built-in (<span class="cite">ProducerConfig.java:517</span>).</td></tr>
+<tr><td><code>partitioner.adaptive.partitioning.enable</code></td><td><code>true</code></td><td>Weight keyless partition choice by broker load (<span class="cite">ProducerConfig.java:414</span>).</td></tr>
+<tr><td><code>partitioner.ignore.keys</code></td><td><code>false</code></td><td>If true, never use the key for partitioning (<span class="cite">ProducerConfig.java:416</span>).</td></tr>
+<tr><td><code>partitioner.availability.timeout.ms</code></td><td><code>0</code> (off)</td><td>Exclude partitions whose leader hasn't drained for this long (<span class="cite">ProducerConfig.java:415</span>).</td></tr>
+<tr><td><code>transactional.id</code></td><td><code>null</code></td><td>Enables transactions and cross-session recovery; forces idempotence on (<span class="cite">ProducerConfig.java:551</span>).</td></tr>
+<tr><td><code>transaction.timeout.ms</code></td><td><code>60000</code></td><td>Broker-side max open-transaction time (<span class="cite">ProducerConfig.java:546</span>).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="01-record-format.html">Record Format &amp; Batches</a> — the v2 batch the <code>MemoryRecordsBuilder</code> emits, including producer id/epoch/baseSequence header fields.</li>
+  <li><a href="02-wire-protocol.html">Wire Protocol</a> — <code>ProduceRequest</code>/<code>ProduceResponse</code> schemas and versioning (topic ids in v13).</li>
+  <li><a href="08-replication.html">Replication, ISR &amp; HWM</a> — what <code>acks=all</code> and <code>min.insync.replicas</code> actually require on the broker.</li>
+  <li><a href="14-transactions-eos.html">Transactions &amp; EOS</a> — the <code>TransactionManager</code> state machine, <code>AddPartitions</code>, and the consume-transform-produce pattern via <code>sendOffsetsToTransaction</code>.</li>
+  <li><a href="12-metadata-propagation.html">Metadata Propagation</a> — how the producer learns partition leaders and reacts to leader changes.</li>
+  <li><a href="19-quotas.html">Quotas &amp; Throttling</a> — produce throttling surfaced as connection poll delays.</li>
+  <li><a href="06-network-and-threading.html">Network Layer</a> and <a href="07-request-processing.html">Request Processing</a> — the broker side that the Sender talks to.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Idempotence and <code>acks=all</code> became the defaults in 3.0 under <span class="pill kip">KIP-679</span> to give the strongest delivery guarantee out of the box. <code>ProducerConfig.postProcessAndValidateIdempotenceConfigs</code> silently disables idempotence if the user explicitly set a weaker <code>acks</code> or <code>retries=0</code> (to preserve old behaviour), but throws if the user explicitly asked for idempotence with conflicting settings (<span class="cite">ProducerConfig.java:610</span>). The original idempotent/transactional producer landed under KIP-98.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The partitioner evolved from round-robin → sticky (<span class="pill kip">KIP-480</span>, better batching) → adaptive uniform sticky (<span class="pill kip">KIP-794</span>, load- and latency-aware). The built-in partitioner is intentionally <em>not</em> a <code>Partitioner</code> implementation — it lives inside <code>RecordAccumulator</code> so it can observe per-partition queue depth, which an external <code>Partitioner</code> cannot see (<span class="cite">BuiltInPartitioner.java:34</span>).</p></div>
+
+<h2>Gotchas &amp; operational notes</h2>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>User callbacks run on the single Sender I/O thread. A slow or blocking callback stalls delivery for <em>every</em> partition. Offload heavy work to your own executor (<span class="cite">KafkaProducer.java:1075</span>).</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>batch.size=0</code> does not disable batching; the constructor coerces it to <code>1</code>, so you still get a 1-byte-target batch per record rather than zero batching (<span class="cite">KafkaProducer.java:456</span>).</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The adaptive partitioner needs a batch scheduled for <em>every</em> partition before it engages; until then it falls back to uniform selection, and it also bails to uniform when all queue depths are equal (<span class="cite">RecordAccumulator.java:661</span>, <span class="cite">BuiltInPartitioner.java:322</span>).</p></div>
+<div class="callout warning"><span class="callout-title">Caution</span><p>Application-level resends defeat idempotence — the broker can only deduplicate the producer's own retries, not a fresh record with a new sequence. If a <code>send()</code> ultimately fails even with infinite retries (e.g. a delivery-timeout expiry), the safe recovery is to close the producer and inspect the last produced offset rather than blindly resend (<span class="cite">KafkaProducer.java:177</span>).</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>A <code>send()</code> that fails synchronously with an <code>ApiException</code> still fires the user callback and interceptor <code>onSendError</code>, and returns a pre-completed <code>FutureFailure</code> rather than throwing — only non-API exceptions (e.g. <code>SerializationException</code>, <code>InterruptException</code>) propagate to the caller (<span class="cite">KafkaProducer.java:1200</span>).</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

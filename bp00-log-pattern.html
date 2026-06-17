@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Distributed Log as a Pattern · Kafka Internals</title>
+<meta name="description" content="The pattern abstracted from Kafka — its invariants and the universal problems a replicated log solves.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="bp00-log-pattern">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>III · 00 · The Distributed Log as a Pattern</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Architectural analysis grounded in the source-verified Part I and cited comparative sources.</blockquote>
+
+<p class="lead">Strip Kafka of its brand, its config keys, and its 700-page operator manual, and what remains is a single, surprisingly small idea: an <strong>append-only, per-shard totally-ordered, partitioned, replicated, offset-addressed, retention-bounded sequence of immutable records that consumers read at a position they own</strong>. That sentence is the whole pattern. Everything else in this book — the ISR, KRaft, tiered storage, exactly-once — is machinery in service of making that abstraction fast, durable, and operable at scale. This chapter abstracts the pattern away from the product. It defines the log's essence and its <em>invariants</em>; the universal problems a log solves that nothing else solves as cleanly (temporal decoupling, spatial fan-out, replay, ordering, durability, and collapsing integration sprawl); the sharp lines that separate a log from a <em>queue</em> and from a <em>database</em>; and why the same primitive keeps reappearing — in database redo logs, in Raft and Paxos, in event sourcing, even in blockchains. We ground each claim in Kafka's realization (cross-linked to <a href="03-storage-log-engine.html">the storage engine</a>, <a href="08-replication.html">replication</a>, and <a href="op03-partitioning.html">partitioning</a>), but the goal is the abstraction itself — a blueprint you can carry into systems that have nothing to do with Kafka.</p>
+
+<h2>The essence: seven words, each load-bearing</h2>
+
+<p>A definition is only useful if every word does work. Drop any one of these seven and you get a different, weaker primitive. Here is the anatomy of the distributed log, term by term, with the Kafka mechanism that realizes each and — more importantly — what each word buys you and what it costs.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Property</th><th>What it means</th><th>Kafka realization</th><th>What it buys / what it costs</th></tr></thead>
+<tbody>
+<tr><td><strong>Append-only</strong></td><td>Writes only ever add to the end; nothing in the middle is updated or moved.</td><td>The active segment takes appends at the log end offset (LEO); records are never rewritten in place (<a href="03-storage-log-engine.html">Storage Engine</a>).</td><td>Buys sequential I/O, lock-free reads, and a stable history. Costs: no in-place update — mutation is modeled as <em>a new record</em>, and "current value" requires a fold or a compacted projection.</td></tr>
+<tr><td><strong>Per-shard total order</strong></td><td>Within one shard, every record has a definite predecessor and successor; <em>across</em> shards, order is undefined.</td><td>Each partition is one totally-ordered log; there is no global order across partitions (<a href="op03-partitioning.html">Partitioning</a>).</td><td>Buys deterministic replay and ordered processing per key. Costs: global ordering requires a single partition (sacrificing all parallelism) — the central tension of the pattern.</td></tr>
+<tr><td><strong>Partitioned</strong></td><td>The logical stream is split into N independent logs that can live on different machines.</td><td>A topic is N partitions; <code>partition = murmur2(key) % N</code> places keyed records deterministically (<a href="16-producer-client.html">Producer</a>).</td><td>Buys linear horizontal scale — appends on different shards need no coordination. Costs: N is near-immutable for keyed topics, and order is now only partition-local.</td></tr>
+<tr><td><strong>Replicated</strong></td><td>Each shard is copied to several machines so the loss of one does not lose data.</td><td>Each partition has a leader and RF−1 followers; the in-sync replica set (ISR) tracks who is caught up (<a href="08-replication.html">Replication</a>).</td><td>Buys durability and availability across machine/disk/AZ failure. Costs: write amplification (RF× bytes), cross-AZ network, and a latency floor from waiting on replicas.</td></tr>
+<tr><td><strong>Offset-addressed</strong></td><td>Each record's position is a stable, monotonic integer; that integer <em>is</em> its address forever.</td><td>A 64-bit offset assigned by the leader at append; immutable for the life of the record (<a href="03-storage-log-engine.html">Storage Engine</a>).</td><td>Buys a cheap, durable cursor and random access by position — the "time machine." Costs: the address is positional, not content-based — no lookup <em>by value</em>.</td></tr>
+<tr><td><strong>Retention-bounded</strong></td><td>The log is finite: old records age out by time, size, or are compacted to last-value-per-key.</td><td>Time/size retention or <code>cleanup.policy=compact</code>; tiered storage extends the bound to object stores (<a href="04-storage-management.html">Storage Management</a>, <a href="05-tiered-storage.html">Tiered Storage</a>).</td><td>Buys bounded cost and a tunable replay window. Costs: history is not infinite by default — "replay from the beginning" only works inside the retention horizon.</td></tr>
+<tr><td><strong>Consumer-owned position</strong></td><td>The reader, not the broker, tracks where it is; many readers read independently at zero marginal broker cost.</td><td>Consumers commit offsets to <code>__consumer_offsets</code>; the broker does not track per-message delivery (<a href="17-consumer-client.html">Consumer</a>, <a href="13-group-coordination.html">Group Coordination</a>).</td><td>Buys fan-out and replay (rewind the cursor). Costs: the broker cannot do per-message acknowledgement, redelivery, or selective routing — that is a <em>queue's</em> job (and why <a href="15-share-groups.html">share groups</a> were added).</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout key"><span class="callout-title">The reusable mental model</span><p>Read the table as a ledger of <em>forces</em>, not features. Every property is simultaneously a strength and a constraint, and they are coupled: partitioning gives scale but breaks global order; replication gives durability but adds a latency floor; the consumer-owned cursor gives fan-out and replay but removes per-message delivery semantics. When you evaluate any log-shaped system — Kafka, Pulsar, Kinesis, a Raft library, your own event store — walk these seven properties and ask which the system keeps, which it relaxes, and what it pays for the relaxation. That walk is the whole of <a href="bp06-comparative.html">comparative architecture</a> in miniature.</p></div>
+
+<h2>The invariants — the contract a log promises</h2>
+
+<p>Beneath the seven properties sit four <em>invariants</em>: statements the system guarantees to hold at all times, which downstream design is allowed to rely on absolutely. They are what makes the log composable — you can build a cache, an index, a join, or a ledger on top precisely because these never bend.</p>
+
+<dl class="kv">
+  <dt>I1 · Immutability</dt><dd>Once a record is written and acknowledged, its bytes never change. A record is a <em>fact that happened</em>, not a mutable cell. Kafka enforces this physically: appended batches in a segment are never edited (<a href="03-storage-log-engine.html">Storage Engine</a>). Corollary: there is no "update record 47" — only "append record 92 that supersedes 47."</dd>
+  <dt>I2 · Per-partition order</dt><dd>If record A was appended before record B in the same partition, every reader sees A before B, always, on every replica, across every replay. This is the ordering invariant the leader-epoch machinery protects through leader changes (<a href="08-replication.html">Replication</a>). It does <em>not</em> extend across partitions — that non-guarantee is itself a load-bearing fact.</dd>
+  <dt>I3 · Offset stability</dt><dd>A record's offset is a permanent address. Reading offset 5,001 tomorrow returns the same record as today (until retention removes it). Crucially, <strong>compaction and retention remove records but never renumber survivors</strong> — a consumer's committed offset stays meaningful (<a href="04-storage-management.html">Storage Management</a>). This is what lets a cursor be a durable bookmark rather than a fragile pointer.</dd>
+  <dt>I4 · Decoupling</dt><dd>Producers and consumers share no clock and no liveness dependency. A producer can write while every consumer is offline; a consumer can read records written years (within retention) before it existed. They are decoupled in <em>time</em> (the log buffers) and in <em>space</em> (they never address each other, only the log).</dd>
+</dl>
+
+<figure class="diagram"><div class="logstrip"><div class="ls-head"><span class="ttl">one partition — the only ordering domain that exists</span><span class="append">append →</span></div><div class="cells"><div class="cell committed">off 0<span class="tag hw">immutable (I1)</span></div><div class="cell committed">off 1</div><div class="cell committed">off 2</div><div class="cell committed">off 3</div><div class="cell committed">off 4</div><div class="cell next">off 5<span class="tag leo">LEO — next write</span></div></div></div>
+<figcaption>The log is a numbered line of immutable cells. Order and offset are defined <em>within this partition only</em> (I2, I3). Producers append at the right edge; any number of independent readers hold their own cursor anywhere along the line (I4).</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-storage"></span> committed, immutable record (offset is its permanent address)</span>
+  <span class="lgi"><span class="mono">off n</span> = 64-bit offset &middot; <span class="mono">LEO</span> = log end offset (next append position)</span>
+  <span class="lgi"><span class="arr"></span> the single append direction — writes only ever extend the right edge</span>
+</div></figure>
+
+<div class="callout rationale"><span class="callout-title">Why immutability is the keystone, not append-only</span><p>Engineers often summarize the log as "append-only," but the deeper invariant is <em>immutability of acknowledged records</em>. Append-only is the mechanism; immutability is the contract. It is immutability that makes the log a valid <strong>system of record</strong> — if records could change after the fact, no derived view could trust its inputs, replay would be non-deterministic, and the offset could not be a stable address. Every powerful thing a log does (replay, CDC, event sourcing, audit) is downstream of "a written fact is final." When you design a log-shaped system, protect immutability the way a database protects durability: it is the invariant the rest of the architecture leans on.</p></div>
+
+<h2>The universal problems a log solves</h2>
+
+<p>A pattern earns the name by solving a recurring class of problems better than the alternatives. The distributed log solves six, and they recur in nearly every non-trivial data architecture. We take them in turn — and for each, name where it is the <em>wrong</em> tool, because an honest pattern catalog includes the boundaries.</p>
+
+<h3>1 · Temporal decoupling — a durable buffer that absorbs rate mismatches</h3>
+
+<p>Two systems rarely run at the same speed at the same instant. A burst of orders arrives faster than the fraud service can score them; a nightly batch dwarfs the daytime trickle; a downstream database is mid-failover. Without a buffer, the fast side must block on the slow side (back-pressure all the way to the user) or drop data. The log is a <strong>durable, ordered buffer</strong>: the producer writes at its own pace and returns; the consumer drains at its own pace, possibly hours later. The "buffer" is bounded only by retention and disk, not by RAM — Kafka can hold days of backlog on disk because reads are served from the page cache via zero-copy (<a href="09-fetch-path.html">Fetch Path</a>), so a deep backlog does not degrade the write path the way an in-memory queue would.</p>
+
+<div class="callout gotcha"><span class="callout-title">Where temporal decoupling bites back</span><p>A buffer that absorbs mismatches also <em>hides</em> them. Lag is silent until you measure it: a consumer falling behind looks healthy from the producer's side right up until the retention horizon eats un-consumed data (<a href="op07-failure-modes.html">Failure Modes</a>). And a deep historical read can evict the hot tail from the page cache — the <strong>"catch-up tax,"</strong> where a back-filling consumer spikes producer p99 from ~2 ms to ~250 ms by forcing disk I/O (empirical: <em>azguards; Pinterest</em>; mitigated by <a href="05-tiered-storage.html">tiered storage</a>). Decoupling is not free; it relocates the failure from "drop on the floor immediately" to "lag, then mass-expire silently." Consumer-lag alerting is the price of admission.</p></div>
+
+<h3>2 · Spatial decoupling — fan-out to many readers at zero marginal broker cost</h3>
+
+<p>This is the property that most cleanly separates a log from a queue, and it is the quiet superpower of the pattern. Because the reader owns its cursor (I4) and the broker does not track per-message delivery, <strong>adding a consumer costs the broker almost nothing</strong>: a new consumer group is just another set of offsets reading the same immutable bytes. One <code>payments</code> topic can feed fraud scoring, the data warehouse, a real-time dashboard, an audit sink, and a search indexer — five independent readers, each at its own position, each immune to the others' speed or failure. In a point-to-point queue, fan-out means the producer must enumerate and write to every consumer (coupling), or the broker must copy the message per subscriber (cost that scales with subscribers).</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:4">
+  <div class="lanes"><span class="actor cat-client">Producer</span><span class="actor cat-storage">payments log</span><span class="actor cat-coord">Fraud (off 9001)</span><span class="actor cat-coord">Warehouse (off 12)</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i><i></i><i></i></div>
+    <div class="note">One immutable copy on disk. Each reader holds its own offset — the broker stores the bytes once, not once-per-subscriber.</div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">append (returns after ISR ack)</span><span class="ln"></span></div>
+    <div class="m r" style="--from:3;--to:2"><span class="ml">fetch from 9001 (near tail · live)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:3"><span class="ml">records → zero-copy from page cache</span><span class="ln"></span></div>
+    <div class="m r" style="--from:4;--to:2"><span class="ml">fetch from 12 (deep backfill · same bytes)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:4"><span class="ml">records → may read from disk</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>Spatial decoupling: two readers consume the same single on-disk copy at wildly different positions, fully independent. A third, fourth, fifth reader adds offset bookkeeping, not data copies — the marginal broker cost of a new <em>independent</em> consumer is near zero.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span> producer &nbsp; <span class="sw cat-storage"></span> the single log copy &nbsp; <span class="sw cat-coord"></span> independent reader (owns its offset)</span>
+  <span class="lgi"><span class="arr"></span> request (append / fetch) &nbsp; <span class="arr dashed"></span> response (records)</span>
+  <span class="lgi">time flows top → down</span>
+</div></figure>
+
+<div class="callout note"><span class="callout-title">"Zero marginal cost" is about <em>independent</em> readers, not consumers within a group</span><p>The near-free fan-out applies to <em>distinct consumer groups</em>, each replaying the full stream. Adding a consumer <em>within</em> one group does not multiply reads — it <em>splits</em> the partitions, and is capped at one active consumer per partition (<a href="op03-partitioning.html">Partitioning</a>). So the log fans out cheaply across <em>use cases</em> (groups) but parallelizes <em>within</em> a use case only up to N. Conflating the two is a common sizing error.</p></div>
+
+<h3>3 · Replay — the offset is a time machine</h3>
+
+<p>Because records are immutable (I1) and offsets are stable (I3), a consumer can move its cursor <em>backward</em> and reprocess history. This single capability dissolves whole categories of operational pain that are intractable in a fire-and-forget queue:</p>
+<ul>
+  <li><strong>Bug recovery.</strong> A consumer shipped a serialization bug and corrupted a day of derived state? Fix the code, reset the offset to before the bad window, reprocess. The source of truth was never mutated.</li>
+  <li><strong>New consumers join late.</strong> A team builds a search index six months after the topic launched; it reads from offset 0 (within retention) and bootstraps its entire state from history — no special backfill pipeline.</li>
+  <li><strong>Reprocessing with new logic.</strong> A better fraud model, a changed aggregation — run it over the retained log and rebuild the output. This is the basis of <strong>Kappa architecture</strong>: rather than maintain a separate batch path (Lambda), you reprocess by replaying the log into a fresh output and swapping (empirical: <em>Kreps, "Questioning the Lambda Architecture"</em>).</li>
+</ul>
+
+<div class="callout gotcha"><span class="callout-title">Replay is bounded, and side effects don't rewind</span><p>Two honest limits. First, replay only reaches back to the <strong>log start offset</strong> — retention (or compaction) defines the horizon; "replay from the beginning of time" requires infinite retention, which is a deliberate, costly choice now made affordable, not free, by <a href="05-tiered-storage.html">tiered storage</a>. Second, the <em>log</em> rewinds but the <em>world</em> does not: reprocessing a payments stream re-emits "charge the card" unless your consumer is idempotent or writes to a fresh output you then swap in. Replay is a superpower for <em>derived state</em>; for <em>external side effects</em> it is a loaded gun. Design replayable consumers to be idempotent or output-swapping, never to re-fire effects.</p></div>
+
+<h3>4 · Ordering — deterministic, per key, for free</h3>
+
+<p>Many correctness properties reduce to "process these events in the order they happened": apply account debits before the closing balance read; honor "add to cart" before "checkout"; respect a CDC stream's insert-before-update. The log gives this <em>per partition</em> as invariant I2, and you get per-<em>key</em> ordering by partitioning on the key (all events for account 42 land in the same partition, in order). It is deterministic and costs nothing extra at write time. The honest caveat — which we return to throughout this part — is that this is <strong>per-partition, never global</strong>: across partitions there is no order. Global total order is achievable only by collapsing to a single partition, which surrenders the entire parallelism the pattern exists to provide.</p>
+
+<h3>5 · Durability — replicated, fsync-decoupled, tunable</h3>
+
+<p>The log persists every acknowledged record to multiple machines (replication, I4-adjacent). Kafka's durability is a <em>tunable</em> contract, not a fixed one, and understanding the dials is essential: <code>acks</code>, <code>replication.factor</code>, and <code>min.insync.replicas</code> together decide how many copies must accept a write before the producer is told "done" (<a href="op06-durability.html">Durability</a>). The canonical safe configuration — <code>RF=3</code>, <code>min.insync.replicas=2</code>, <code>acks=all</code>, <code>unclean.leader.election.enable=false</code> — makes data loss require multiple simultaneous failures (empirical: <em>Conduktor; reference §4</em>).</p>
+
+<div class="callout warning"><span class="callout-title">"acks=all" is not "fsync'd to disk"</span><p>A subtle and frequently misstated point: Kafka acknowledges a write when the required replicas hold it <strong>in page cache</strong>, not when it is fsync'd to physical media. Durability comes from <em>replication plus recovery</em>, not per-message disk flush — by default there is no fsync on the produce path (<a href="op06-durability.html">Durability</a>). This is a deliberate latency-over-disk-flush choice (forcing per-message fsync wrecks tail latency under load), and it is the central, valid critique in several competitor comparisons (empirical: <em>Vanlightly; reference §3</em>). The lesson is general: a "durable" log defines durability as a <em>replication quorum</em>, and you must know whether your system's "committed" means "on N machines' RAM" or "on N machines' disks." For most workloads the former is correct and faster; for a few it is not, and you reach for <code>flush.ms</code>/<code>flush.messages</code> knowing the cost.</p></div>
+
+<h3>6 · The integration backbone — collapsing O(N²) into O(N)</h3>
+
+<p>This is the problem the log was, in the end, <em>invented</em> to solve, and the one Jay Kreps put at the center of "The Log" (2013). An organization with N data systems that must share data point-to-point trends toward <strong>O(N²)</strong> bespoke pipelines: every source wired to every sink, each with its own format, schema drift, and failure modes. The log inverts this into a <strong>hub-and-spoke, O(N)</strong> topology: every source writes once to the log; every sink reads from the log. The log becomes the organization's <em>shared, ordered, replayable system of record</em> — the integration backbone. At LinkedIn this was the original motivation, and it scaled to "over 60 billion unique message writes per day" in 2013 (empirical: <em>Kreps, "The Log"</em>) and to trillions per day a decade later (empirical: <em>reference §7</em>).</p>
+
+<figure class="diagram"><div class="dstack">
+<div class="layer cat-error"><div class="ln">Point-to-point — O(N²)</div><div class="ld">Each of N producers wires a bespoke pipeline to each of M consumers: <code>N × M</code> integrations, each with its own format, schema, and failure modes. Adding one system means wiring it to all the others.</div><div class="row"><span class="chip">coupling: every pair</span><span class="chip">cost ∝ N×M</span><span class="chip">schema sprawl</span></div></div>
+<div class="sep">↓ insert a log as the hub ↓</div>
+<div class="layer cat-storage"><div class="ln">Hub-and-spoke through the log — O(N)</div><div class="ld">Each producer writes <em>once</em> to a topic; each consumer reads from a topic. Adding a system = one new producer or consumer, not N new pipelines. The log is the contract; ordering, durability, and replay are shared infrastructure, not re-implemented per pipe.</div><div class="row"><span class="chip">coupling: each ↔ log only</span><span class="chip">cost ∝ N+M</span><span class="chip">one ordered system of record</span></div></div>
+</div><figcaption>The defining win of the pattern at organizational scale: N producers × M consumers of bespoke pipelines (top, red — quadratic, brittle) collapse into N+M connections through a shared log (bottom — linear, decoupled). This is "The Log" thesis (Kreps, 2013) in one picture.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-error"></span> the quadratic anti-topology (point-to-point sprawl)</span>
+  <span class="lgi"><span class="sw cat-storage"></span> the log as integration hub (linear, shared contract)</span>
+  <span class="lgi"><span class="mono">N, M</span> = counts of producing / consuming systems</span>
+</div></figure>
+
+<div class="callout gotcha"><span class="callout-title">The hub is also a single point of organizational coupling</span><p>Collapsing to a hub is not pure win. The log becomes a <strong>shared dependency</strong> every team relies on — its schemas become contracts (hence Schema Registry and the discipline around it), its outages are everyone's outages, and a poorly-chosen partition key or a hot topic now blasts the whole fleet (Cloudflare's worst recurring incident was exactly this — a client-library change funneling most traffic to one partition: empirical, <em>reference §7</em>). The O(N) topology trades many small, independent failure domains for one large, shared one. That is usually the right trade — but it is a trade, and it demands governance the point-to-point world did not.</p></div>
+
+<h2>Log vs queue vs database — three primitives, three jobs</h2>
+
+<p>The most common and most expensive architectural mistake around the log is using it as something it is not. The log sits between two older primitives — the <em>message queue</em> and the <em>database</em> — and borrows from both without being either. Drawing the lines precisely is the single most clarifying thing in this chapter.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Dimension</th><th>Message queue (e.g. RabbitMQ)</th><th>Distributed log (Kafka)</th><th>Database (e.g. Postgres)</th></tr></thead>
+<tbody>
+<tr><td><strong>Primary record</strong></td><td>A message in flight (transient)</td><td>An immutable event, retained</td><td>A mutable row (current state)</td></tr>
+<tr><td><strong>On read</strong></td><td>Consumed &amp; removed (destructive)</td><td>Read non-destructively at a cursor; re-readable</td><td>Queried; data stays</td></tr>
+<tr><td><strong>Who tracks position</strong></td><td>The broker (per-message ack / redeliver)</td><td>The consumer (owns its offset)</td><td>N/A — random access by key</td></tr>
+<tr><td><strong>Addressing</strong></td><td>None — next available message</td><td>By <em>position</em> (offset)</td><td>By <em>value/key</em> (indexed)</td></tr>
+<tr><td><strong>Ordering</strong></td><td>Best-effort; weakens with redelivery</td><td>Strict per partition (I2)</td><td>Defined by query, not storage</td></tr>
+<tr><td><strong>Fan-out</strong></td><td>Per-subscriber copy or competing consumers</td><td>Cheap — many groups, one copy</td><td>Many readers, but reads current state</td></tr>
+<tr><td><strong>Replay history</strong></td><td>No — gone once acked</td><td>Yes — rewind the cursor (within retention)</td><td>No — only current state (history needs explicit modeling)</td></tr>
+<tr><td><strong>Per-message routing / TTL / priority</strong></td><td>Yes — its core strength</td><td>No — topic-level only</td><td>N/A</td></tr>
+<tr><td><strong>Point lookup by key</strong></td><td>No</td><td>No (only by offset; compaction approximates it)</td><td>Yes — its core strength</td></tr>
+<tr><td><strong>Best at</strong></td><td>Work distribution, RPC-ish tasks, per-message control</td><td>Ordered history, fan-out, replay, integration backbone</td><td>Current-state queries, ad-hoc joins, multi-key transactions</td></tr>
+</tbody>
+</table></div>
+
+<p>Read down the columns and the identities snap into focus. A <strong>queue</strong> is about <em>work</em>: each message is a task, consumed once, with the broker arbitrating delivery — which is exactly why a queue can offer per-message acknowledgement, redelivery, priority, TTL, and content routing. A <strong>database</strong> is about <em>current state</em>: rows are mutable, addressable by value, optimized for "what is true now" and ad-hoc queries. The <strong>log</strong> is about <em>history</em>: an ordered, immutable, replayable record of what happened, addressable by position, optimized for fan-out and reprocessing.</p>
+
+<div class="callout rationale"><span class="callout-title">The "database inside out" — why the log is more fundamental than it looks</span><p>Kleppmann's reframe (2014) is the deepest insight here: a database <em>already contains a log</em> — its write-ahead/redo log — but treats mutable state as primary and the log as a hidden implementation detail. The log pattern <strong>turns the database inside out</strong>: it promotes the log of immutable events to the system of record, and demotes every queryable structure (indexes, caches, materialized views, the "current state" itself) to a <em>derived, replayable projection</em> of that log. Kreps' <strong>State Machine Replication Principle</strong> is the formal backbone: "if two identical, deterministic processes begin in the same state and get the same inputs in the same order, they will produce the same output and end in the same state" — so consistency reduces to <em>building one consistent log</em> and feeding it to deterministic consumers (empirical: <em>Kreps, "The Log"; Kleppmann, "Turning the Database Inside Out"</em>). This is why <strong>stream-table duality</strong> holds: a table is the aggregation of a changelog stream, and a stream is the changelog of a table (empirical: <em>Sax, BIRTE@VLDB 2018</em>) — the basis of <a href="20-kafka-streams.html">KStream/KTable</a> and of CDC. The log is not "a queue with retention"; it is the more primitive thing a database is built <em>on</em>.</p></div>
+
+<div class="callout warning"><span class="callout-title">The three anti-patterns, named</span><p>Most log misuse is forcing it into a neighboring primitive's job. <strong>Log-as-database</strong>: there are no efficient key lookups, no ad-hoc SQL, no multi-key ACID — Kafka replicates <em>into</em> specialized stores, it does not replace them; "I don't think Kafka really benefits from random-access lookups directly against the log" (<em>Kreps</em>). <strong>Log-as-RPC</strong>: the log optimizes throughput over latency and offers no native request-reply — building synchronous request/response over it "returns the coupling we were trying to avoid" (<em>Waehner</em>). <strong>Log-as-task-queue</strong>: per-partition order plus one consumer per partition means throughput "collapses to the speed of the slowest message" — one poison pill head-of-line-blocks every later record, and parallelism is capped at N (empirical: <em>reference §8</em>). The full decision framework — and the mitigations (<a href="15-share-groups.html">share groups</a> for the queue case, the Parallel Consumer, materializing into a DB for the query case) — is <a href="bp01-when-to-use.html">the next chapter</a>.</p></div>
+
+<h2>Why it is a <em>pattern</em> — the same primitive, everywhere</h2>
+
+<p>A solution is a <em>pattern</em> when the same structure recurs across independent problems and independent designers keep reinventing it. The append-only, totally-ordered log is one of the most reinvented structures in all of computing — it predates Kafka by decades and appears far outside messaging. Recognizing it as a pattern is what lets you transfer Kafka's hard-won lessons to systems that look nothing like Kafka, and vice versa.</p>
+
+<figure class="diagram"><div class="dstack">
+<div class="layer cat-storage"><div class="ln">Database write-ahead / redo log (WAL)</div><div class="ld">The original. Every mutation is appended to a durable log <em>before</em> the data pages change (IBM System R onward). On crash, replay the log to recover. The DB's "current state" is a materialized projection of its own log — exactly the inside-out picture, but kept internal.</div></div>
+<div class="sep">— same primitive, different surface —</div>
+<div class="layer cat-control"><div class="ln">State-machine replication — Raft / Paxos</div><div class="ld">A replicated log of commands, agreed by quorum, applied in order to deterministic replicas. The log <em>is</em> the consensus. Kafka's own control plane is this: KRaft replicates the metadata log via a Raft quorum (<a href="10-kraft-consensus.html">KRaft Consensus</a>) — the system that coordinates the logs is itself a log.</div></div>
+<div class="sep">— same primitive, different surface —</div>
+<div class="layer cat-coord"><div class="ln">Event sourcing / CQRS</div><div class="ld">Persist application state as the sequence of immutable domain events; rebuild current state by folding (replaying) the event log. Read models are projections (CQRS). State reconstruction = <code>fold</code> over the log from offset 0 — replay as a first-class feature (empirical: <em>Fowler; Kleppmann</em>).</div></div>
+<div class="sep">— same primitive, different surface —</div>
+<div class="layer cat-error"><div class="ln">Blockchains / distributed ledgers</div><div class="ld">An append-only, totally-ordered, immutable, replicated log of transactions — with the replication mechanism (Byzantine-fault-tolerant consensus + hash-chaining) hardened against adversaries rather than mere crashes. Strip the adversarial trust model and a blockchain is a distributed log with cryptographic tamper-evidence.</div></div>
+</div><figcaption>The same primitive — append-only, totally-ordered, immutable, often replicated — wearing four different costumes. What differs is the <em>surface</em> (who writes, what a "record" means, how strong the replication's adversary model is); the <em>shape</em> is identical. This is why the log is a pattern, not a product.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-storage"></span> storage-recovery log (WAL) &nbsp; <span class="sw cat-control"></span> consensus log (Raft/Paxos)</span>
+  <span class="lgi"><span class="sw cat-coord"></span> application event log (event sourcing) &nbsp; <span class="sw cat-error"></span> adversarial ledger (blockchain)</span>
+  <span class="lgi">vertical stacking = the same abstraction recurring across domains, not a data flow</span>
+</div></figure>
+
+<p>The variation across these is instructive, because it maps directly to the dials you tune in any log system:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Incarnation</th><th>What a "record" is</th><th>Replication / agreement model</th><th>Who consumes, and how</th></tr></thead>
+<tbody>
+<tr><td>DB WAL / redo log</td><td>A physical or logical change (changed bytes, or the SQL command)</td><td>Local durability + (optionally) primary→replica streaming</td><td>The recovery/apply process; replicas — internal to the DB</td></tr>
+<tr><td>Raft / Paxos log</td><td>A state-machine command (e.g. "set leader of partition 7")</td><td>Quorum agreement (majority); crash-fault-tolerant</td><td>Every replica's state machine, applied in committed order</td></tr>
+<tr><td>Kafka partition</td><td>A produced record/event (opaque bytes + key + headers)</td><td>Leader + ISR; tunable quorum via <code>acks</code>/<code>min.insync.replicas</code> (<a href="08-replication.html">Replication</a>)</td><td>External consumers at self-owned offsets; many independent groups</td></tr>
+<tr><td>Event store</td><td>A domain event ("OrderPlaced")</td><td>Whatever the store provides (often a Kafka/DB-backed log)</td><td>Projections/aggregates that fold the log into read models</td></tr>
+<tr><td>Blockchain</td><td>A signed transaction, hash-chained to its predecessor</td><td>BFT consensus + cryptographic linkage; <em>adversary</em>-tolerant</td><td>All nodes; validate-and-apply in agreed order</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout key"><span class="callout-title">The transferable recognition</span><p>When you see <em>append-only + ordered + immutable + (often) replicated + replay-from-a-position</em>, you are looking at the log pattern, whatever the domain calls it. This recognition is worth real money: it means Kafka's solutions to log problems — leader epochs to prevent divergence on leadership change (<a href="08-replication.html">Replication</a>), sparse indexes for cheap positional lookup (<a href="03-storage-log-engine.html">Storage Engine</a>), compaction to derive a table from a stream, tiered storage to unbound retention (<a href="05-tiered-storage.html">Tiered Storage</a>) — are candidate solutions for <em>your</em> log, and the limits of your Raft library or event store illuminate the limits of Kafka. Part III's <a href="bp04-tactics-toolkit.html">tactics toolkit</a> harvests exactly these transferable techniques; <a href="bp03-inherent-limits.html">inherent limits</a> harvests the transferable constraints.</p></div>
+
+<h2>Inherent vs tunable — the distinction that runs through this whole part</h2>
+
+<p>The single most valuable analytical habit for a log architect is to separate, for every limitation, what is <strong>inherent</strong> (structural — a consequence of the pattern itself, true of Pulsar and Kinesis and your hand-rolled event store too) from what is merely <strong>tunable</strong> (a config) or <strong>mitigated</strong> (a feature). Marketing blurs this line in both directions; good architecture depends on holding it sharp. Here is the keystone version of that distinction — each row is expanded in later chapters.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Status</th><th>Why — structural cause or the dial/feature</th></tr></thead>
+<tbody>
+<tr><td>No global order across shards</td><td><strong>Inherent</strong></td><td>Partitioning <em>is</em> the scale mechanism; independent appends cannot share a total order without coordination. Global order ⇒ N=1 ⇒ no parallelism. True of every partitioned log (<a href="bp03-inherent-limits.html">Inherent Limits</a>).</td></tr>
+<tr><td>No per-message lookup by value</td><td><strong>Inherent</strong></td><td>The address is positional (offset), not content-based. Point queries require a derived index/store. Compaction <em>approximates</em> last-value-per-key but is not a lookup.</td></tr>
+<tr><td>No native per-message routing / TTL / priority</td><td><strong>Inherent</strong></td><td>The consumer-owned cursor and shared single copy preclude per-message broker decisions — that is a queue's model, structurally distinct (<a href="bp06-comparative.html">Comparative</a>).</td></tr>
+<tr><td>A real produce latency floor</td><td><strong>Inherent (magnitude tunable)</strong></td><td>Waiting on a replication quorum has an irreducible floor; you tune <em>how high</em> via <code>acks</code>, placement, and fsync policy, but cannot remove it while keeping durability (<a href="op05-performance-tuning.html">Performance Tuning</a>).</td></tr>
+<tr><td>Cross-AZ replication cost</td><td><strong>Inherent (mitigated)</strong></td><td>RF copies must cross failure domains to be durable. Fetch-from-follower and diskless/object-store designs <em>reduce</em> it; the produce+replication floor is structural (<a href="op10-cost.html">Cost</a>).</td></tr>
+<tr><td>Partition-count ceiling</td><td><strong>Mostly tunable now</strong></td><td>The ZooKeeper-era O(partitions) controller failover was structural; <span class="pill kip">KIP-500</span> KRaft moved metadata to an in-memory replicated log, raising the ceiling ~100× — but per-broker FDs, mmap regions, and rebalance time still bound it (<a href="op03-partitioning.html">Partitioning</a>, <a href="op02-limits.html">Limits</a>).</td></tr>
+<tr><td>Durability = "in N page caches," not fsync'd</td><td><strong>Tunable</strong></td><td>A default, not a law. <code>flush.ms</code>/<code>flush.messages</code> force fsync at a latency cost; the default trades disk-flush for speed and relies on replication+recovery (<a href="op06-durability.html">Durability</a>).</td></tr>
+<tr><td>"Stop-the-world" rebalances</td><td><strong>Mitigated → largely fixed</strong></td><td>Historically structural pain; <span class="pill kip">KIP-429</span> (incremental cooperative) and <span class="pill kip">KIP-848</span> (broker-side assignment, GA in 4.0) removed the global sync barrier (<a href="13-group-coordination.html">Group Coordination</a>).</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout key"><span class="callout-title">Carry this distinction into every evaluation</span><p>When a vendor says "Kafka can't do X," ask the second question: is X <em>inherent to the log pattern</em> (then their product can't really do it either, unless they abandoned the pattern) or is it <em>a Kafka default/feature gap</em> (then it is a config, a KIP, or a roadmap item)? Redpanda's "Kafka is unsafe because it doesn't fsync per message" conflates a tunable default with a structural flaw — and is false, because durability comes from replication (empirical: <em>Vanlightly; reference §3, §9</em>). WarpStream's "Kafka cross-AZ cost is huge" is real and partly inherent — but it attacks it by <em>leaving the local-disk part of the pattern</em> for object storage, trading latency for cost (empirical: <em>reference §6, §9</em>). The inherent-vs-tunable lens turns marketing into engineering. It is the through-line of <a href="bp02-design-decisions.html">design decisions</a>, <a href="bp03-inherent-limits.html">inherent limits</a>, and <a href="bp06-comparative.html">comparative architecture</a>.</p></div>
+
+<h2>A first decision: is your problem log-shaped at all?</h2>
+
+<p>We close the foundation chapter with the most basic question, posed as a decision tree. This is deliberately coarse — the full, force-weighted framework (with the anti-patterns and their mitigations) is <a href="bp01-when-to-use.html">the next chapter</a> — but it captures the first cut: does your problem have the <em>shape</em> the log is good at? The shape is: <em>history matters, fan-out or replay is valuable, and per-key ordering is enough.</em> If instead you need current-state queries, per-message control, or synchronous replies, you are looking at a database, a queue, or RPC.</p>
+
+<figure class="diagram"><div class="dflow">
+<div class="node cat-broker"><span class="nt">a stream of facts/events to move or store</span></div>
+<div class="conn" data-label="ask first"></div>
+<div class="node cat-broker decision">do you need the <em>history</em> — replay, audit, late readers, or many independent consumers?</div>
+<div class="conn"></div>
+<div class="row">
+<div class="col"><div class="conn ec-err" data-label="no — only the latest value, queried by key"></div><div class="node cat-error">use a <strong>database / KV store</strong><br/>(log is the wrong primitive — no point lookup)</div></div>
+<div class="col"><div class="conn" data-label="yes — history / fan-out / replay matters"></div><div class="node decision">is <em>per-key</em> order enough, or do you need <em>global</em> total order?</div></div>
+</div>
+<div class="conn"></div>
+<div class="row">
+<div class="col"><div class="conn ec-err" data-label="need strict global order at high volume"></div><div class="node cat-error">the log can't (N=1 kills scale)<br/>rethink the ordering requirement</div></div>
+<div class="col"><div class="conn" data-label="per-key order suffices"></div><div class="node decision">do you need per-<em>message</em> ack / redelivery / routing / priority?</div></div>
+</div>
+<div class="conn"></div>
+<div class="row">
+<div class="col"><div class="conn ec-async" data-label="yes — work distribution semantics"></div><div class="node cat-coord">use a <strong>queue</strong> (or Kafka <a href="15-share-groups.html">share groups</a> for queue-on-a-log)</div></div>
+<div class="col"><div class="conn" data-label="no — stream processing / integration"></div><div class="node cat-storage">the <strong>distributed log</strong> fits<br/>(durable, ordered, replayable, fan-out)</div></div>
+</div>
+</div><figcaption>The coarse first cut. Three questions separate the log from its neighbors: history (vs a database's current-state), ordering granularity (per-key vs an impossible-at-scale global order), and delivery model (stream/fan-out vs per-message queue control). A "no" at any gate routes you to the right primitive instead.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-storage"></span> the log is the fit &nbsp; <span class="sw cat-coord"></span> queue / share-group territory &nbsp; <span class="sw cat-error"></span> log is the <em>wrong</em> choice</span>
+  <span class="lgi"><span class="sw cat-broker"></span> the question under evaluation</span>
+  <span class="lgi"><span class="arr"></span> "fits the log" path &nbsp; <span class="arr dashed"></span> routed to a different primitive</span>
+</div></figure>
+
+<div class="callout note"><span class="callout-title">Where this leaves you, and where Part III goes next</span><p>You now hold the pattern in the abstract: its seven-word essence, its four invariants, the six universal problems it solves (and where each bites back), the queue/log/database trichotomy, the recognition that the same primitive underlies WALs, consensus, event sourcing, and ledgers, and the inherent-vs-tunable lens that keeps the rest of this part honest. From here, <a href="bp01-when-to-use.html">III·01</a> turns the coarse tree above into a full decision framework with the anti-patterns; <a href="bp02-design-decisions.html">III·02</a> dissects each Kafka choice as a tradeoff (pull vs push, ISR vs quorum, page cache vs managed memory); <a href="bp03-inherent-limits.html">III·03</a> presses on where the pattern structurally fails; <a href="bp04-tactics-toolkit.html">III·04</a> extracts the reusable tactics; and <a href="bp06-comparative.html">III·06</a> tests every tradeoff against Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and the diskless designs. Treat Kafka, throughout, as the best-documented instance of a pattern far older and far more general than itself.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

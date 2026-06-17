@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apache Kafka — The Complete Field Guide · Kafka Internals</title>
+<meta name="description" content="A deep, source-derived guide to Apache Kafka: architecture internals, operations, and the log as an architectural blueprint.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+      <div class="hero">
+        <h1>Apache Kafka — The Complete Field Guide</h1>
+        <p>A deep, source-derived guide to Apache Kafka in three parts: how it works inside, how to operate it at scale, and what the distributed log teaches us as an architectural blueprint.</p>
+        <div class="hero-meta">
+          <span class="pill">Apache Kafka 4.4.0-SNAPSHOT · git 04bfe7d · 2026-06-15</span>
+          <span class="pill">Derived from source · not copied from official docs</span>
+          <span class="pill">3 parts · 46 chapters</span>
+        </div>
+      </div>
+      <p class="lead">New here? Start with the <a href="00-overview.html">Architecture Overview</a>. Operating a cluster? Jump to <a href="op00-operator-model.html">Part II — Operations</a>. Designing a system? See <a href="bp00-log-pattern.html">Part III — The Log as a Blueprint</a>.</p>
+      <div class="part-head"><h2>Part I · Architecture Internals</h2><p>How Kafka actually works inside — from the on-disk byte layout of a record batch up to the KRaft controller quorum, the coordinators, and the client runtimes.</p></div>
+      <div class="section-label">Getting Started</div>
+      <div class="card-grid">
+        <a class="card" href="00-overview.html"><div class="card-num">00</div><div class="card-title">Architecture Overview</div><div class="card-desc">The distributed commit log, broker &amp; cluster anatomy, and the end-to-end data path.</div></a>
+      </div>
+      <div class="section-label">Data Format</div>
+      <div class="card-grid">
+        <a class="card" href="01-record-format.html"><div class="card-num">01</div><div class="card-title">Record Format &amp; Batches</div><div class="card-desc">The v2 record batch on disk and on the wire: varints, headers, CRC, control records, compression.</div></a>
+        <a class="card" href="02-wire-protocol.html"><div class="card-num">02</div><div class="card-title">Wire Protocol &amp; RPC</div><div class="card-desc">Request/response framing, ApiKeys, the schema generator, flexible versions, tagged fields.</div></a>
+      </div>
+      <div class="section-label">Storage Engine</div>
+      <div class="card-grid">
+        <a class="card" href="03-storage-log-engine.html"><div class="card-num">03</div><div class="card-title">The Log Storage Engine</div><div class="card-desc">UnifiedLog, LogSegment, the offset/time/transaction indexes, append &amp; read paths, recovery.</div></a>
+        <a class="card" href="04-storage-management.html"><div class="card-num">04</div><div class="card-title">Retention &amp; Compaction</div><div class="card-desc">LogManager, retention by time/size, the log cleaner, compaction, tombstones, JBOD.</div></a>
+        <a class="card" href="05-tiered-storage.html"><div class="card-num">05</div><div class="card-title">Tiered Storage</div><div class="card-desc">KIP-405 remote log: RemoteLogManager, the metadata topic, RemoteIndexCache, copy/read paths.</div></a>
+      </div>
+      <div class="section-label">Networking &amp; API</div>
+      <div class="card-grid">
+        <a class="card" href="06-network-and-threading.html"><div class="card-num">06</div><div class="card-title">Network &amp; Threading Model</div><div class="card-desc">SocketServer, the Acceptor/Processor reactor, the handler pool, Selector, purgatory &amp; timing wheels.</div></a>
+        <a class="card" href="07-request-processing.html"><div class="card-num">07</div><div class="card-title">Request Processing</div><div class="card-desc">KafkaApis dispatch, the request lifecycle, validation, authorization &amp; throttling.</div></a>
+      </div>
+      <div class="section-label">Replication &amp; Cluster</div>
+      <div class="card-grid">
+        <a class="card" href="08-replication.html"><div class="card-num">08</div><div class="card-title">Replication, ISR &amp; High Watermark</div><div class="card-desc">ReplicaManager, Partition, the ISR, the high watermark, leader epochs, acks, unclean election, ELR.</div></a>
+        <a class="card" href="09-fetch-path.html"><div class="card-num">09</div><div class="card-title">Fetch Path &amp; Replica Fetchers</div><div class="card-desc">Follower replication, AbstractFetcherThread, truncation, incremental fetch sessions, DelayedFetch.</div></a>
+      </div>
+      <div class="section-label">KRaft &amp; Metadata</div>
+      <div class="card-grid">
+        <a class="card" href="10-kraft-consensus.html"><div class="card-num">10</div><div class="card-title">KRaft Consensus (Raft)</div><div class="card-desc">KafkaRaftClient, the quorum state machine, elections, pull-based replication, snapshots, voters.</div></a>
+        <a class="card" href="11-kraft-controller.html"><div class="card-num">11</div><div class="card-title">The KRaft Controller</div><div class="card-desc">QuorumController, the control managers, the single-threaded event loop, timeline data structures.</div></a>
+        <a class="card" href="12-metadata-propagation.html"><div class="card-num">12</div><div class="card-title">Metadata &amp; Broker Lifecycle</div><div class="card-desc">MetadataImage/Delta, the loader &amp; publishers, KRaftMetadataCache, registration, heartbeats, fencing.</div></a>
+      </div>
+      <div class="section-label">Coordination</div>
+      <div class="card-grid">
+        <a class="card" href="13-group-coordination.html"><div class="card-num">13</div><div class="card-title">Group Coordination</div><div class="card-desc">The group coordinator, classic &amp; KIP-848 rebalance protocols, assignors, offset management.</div></a>
+        <a class="card" href="14-transactions-eos.html"><div class="card-num">14</div><div class="card-title">Transactions &amp; Exactly-Once</div><div class="card-desc">Idempotent producer, the transaction coordinator, markers, two-phase commit, read_committed &amp; LSO.</div></a>
+        <a class="card" href="15-share-groups.html"><div class="card-num">15</div><div class="card-title">Share Groups (Queues)</div><div class="card-desc">KIP-932 queues: share consumers, the share coordinator, acquisition locks, delivery counts, DLQ.</div></a>
+      </div>
+      <div class="section-label">Clients</div>
+      <div class="card-grid">
+        <a class="card" href="16-producer-client.html"><div class="card-num">16</div><div class="card-title">The Producer Client</div><div class="card-desc">KafkaProducer, the RecordAccumulator, BufferPool, the Sender thread, partitioning, idempotence.</div></a>
+        <a class="card" href="17-consumer-client.html"><div class="card-num">17</div><div class="card-title">The Consumer Client</div><div class="card-desc">Classic vs async consumer, SubscriptionState, the fetch pipeline, request managers, the poll loop.</div></a>
+      </div>
+      <div class="section-label">Cross-Cutting</div>
+      <div class="card-grid">
+        <a class="card" href="18-security.html"><div class="card-num">18</div><div class="card-title">Security</div><div class="card-desc">SASL/SSL/OAuth/SCRAM/Kerberos, delegation tokens, the Authorizer, KRaft ACLs, principal building.</div></a>
+        <a class="card" href="19-quotas.html"><div class="card-num">19</div><div class="card-title">Quotas &amp; Throttling</div><div class="card-desc">ClientQuotaManager, token buckets, quota entities, throttle responses, client metrics (KIP-714).</div></a>
+      </div>
+      <div class="section-label">Streams &amp; Connect</div>
+      <div class="card-grid">
+        <a class="card" href="20-kafka-streams.html"><div class="card-num">20</div><div class="card-title">Kafka Streams</div><div class="card-desc">Topologies, tasks, StreamThread, state stores &amp; changelogs, the partition assignor, EOS.</div></a>
+        <a class="card" href="21-kafka-connect.html"><div class="card-num">21</div><div class="card-title">Kafka Connect</div><div class="card-desc">Workers, connectors &amp; tasks, the distributed herder, backing stores, MirrorMaker 2.</div></a>
+      </div>
+      <div class="section-label">Reference</div>
+      <div class="card-grid">
+        <a class="card" href="glossary.html"><div class="card-num">REF</div><div class="card-title">Glossary &amp; Concepts</div><div class="card-desc">Cross-cutting terminology and a quick reference of Kafka's core abstractions.</div></a>
+      </div>
+      <div class="part-head"><h2>Part II · Operations Manual</h2><p>How to run it: limits, tuning, capacity &amp; partition sizing, failure runbooks, the signals to watch, cost, and what changes at 1M / 10M / 100M events per second.</p></div>
+      <div class="section-label">Foundations</div>
+      <div class="card-grid">
+        <a class="card" href="op00-operator-model.html"><div class="card-num">II·00</div><div class="card-title">The Operator's Mental Model</div><div class="card-desc">What you run in KRaft, what fails independently, the control loops, and the SLIs/SLOs of a healthy cluster.</div></a>
+        <a class="card" href="op01-configuration.html"><div class="card-num">II·01</div><div class="card-title">Configuration: The Tuning Surface</div><div class="card-desc">Static vs dynamic vs per-topic configs, precedence, and the knobs that actually matter — with interactions.</div></a>
+        <a class="card" href="op02-limits.html"><div class="card-num">II·02</div><div class="card-title">Limits &amp; Boundaries</div><div class="card-desc">Hard, soft, and emergent limits: partitions, request/message size, the 1 GiB/s-per-topic question, FDs, 2 GB ceilings.</div></a>
+      </div>
+      <div class="section-label">Sizing &amp; Performance</div>
+      <div class="card-grid">
+        <a class="card" href="op03-partitioning.html"><div class="card-num">II·03</div><div class="card-title">Partitioning Strategy</div><div class="card-desc">How many partitions, per-partition ceilings, the real cost of partitions, when to reshard, the repartitioning trap.</div></a>
+        <a class="card" href="op04-capacity-planning.html"><div class="card-num">II·04</div><div class="card-title">Capacity Planning &amp; Sizing</div><div class="card-desc">The throughput, disk, memory, and network formulas; replication amplification; estimating broker count.</div></a>
+        <a class="card" href="op05-performance-tuning.html"><div class="card-num">II·05</div><div class="card-title">Performance Tuning</div><div class="card-desc">Producer/consumer/broker knobs, the end-to-end latency budget, page cache and zero-copy; throughput ⇄ latency.</div></a>
+        <a class="card" href="op06-durability.html"><div class="card-num">II·06</div><div class="card-title">Durability, Availability &amp; Consistency</div><div class="card-desc">acks, min.insync.replicas, RF, unclean election, the replication-not-fsync philosophy, ELR.</div></a>
+      </div>
+      <div class="section-label">Running in Production</div>
+      <div class="card-grid">
+        <a class="card" href="op07-failure-modes.html"><div class="card-num">II·07</div><div class="card-title">Failure Modes &amp; The Runbook</div><div class="card-desc">URP, offline partitions, disk/quorum failure, ISR thrash, rebalance storms, hanging txns — cause→symptom→fix.</div></a>
+        <a class="card" href="op08-metrics-signals.html"><div class="card-num">II·08</div><div class="card-title">Metrics, Signals &amp; Observability</div><div class="card-desc">The golden signals, where each is emitted in source, alert thresholds, and a dashboard blueprint.</div></a>
+        <a class="card" href="op09-topologies.html"><div class="card-num">II·09</div><div class="card-title">Topologies &amp; Deployment</div><div class="card-desc">Rack/multi-AZ, dedicated vs combined KRaft, multi-region replication, tiered-storage topology, tenancy.</div></a>
+      </div>
+      <div class="section-label">Scale &amp; Economics</div>
+      <div class="card-grid">
+        <a class="card" href="op10-cost.html"><div class="card-num">II·10</div><div class="card-title">Cost Engineering</div><div class="card-desc">Storage/network/cross-AZ cost drivers and the levers: compression, fetch-from-follower, tiered storage, RF.</div></a>
+        <a class="card" href="op11-scaling-scenarios.html"><div class="card-num">II·11</div><div class="card-title">Scaling: 1M → 10M → 100M / sec</div><div class="card-desc">Worked capacity tiers, the bottleneck that emerges at each, what to watch, and where Kafka's limits bind.</div></a>
+        <a class="card" href="op12-lifecycle.html"><div class="card-num">II·12</div><div class="card-title">Lifecycle Operations</div><div class="card-desc">Rolling upgrades &amp; metadata.version, reassignment &amp; throttling, add/remove brokers, disaster recovery.</div></a>
+      </div>
+      <div class="section-label">Advanced Operations</div>
+      <div class="card-grid">
+        <a class="card" href="op13-multitenancy.html"><div class="card-num">II·13</div><div class="card-title">Multitenancy &amp; Isolation</div><div class="card-desc">What is shared vs isolated in a broker, and how different tenants raise each other's latency &amp; error rates — the noisy-neighbour problem.</div></a>
+        <a class="card" href="op14-proactive-monitoring.html"><div class="card-num">II·14</div><div class="card-title">Proactive Monitoring: Leading Indicators</div><div class="card-desc">The leading indicators, trends and capacity-runway metrics that warn you a cluster will suffer — with lead time — before the lagging alerts fire. Includes client-team-side signals.</div></a>
+      </div>
+      <div class="part-head"><h2>Part III · The Log as a Blueprint</h2><p>Kafka as one implementation of the distributed-log pattern — when to choose it, its inherent tradeoffs, the reusable engineering tactics, and the design space.</p></div>
+      <div class="section-label">The Pattern</div>
+      <div class="card-grid">
+        <a class="card" href="bp00-log-pattern.html"><div class="card-num">III·00</div><div class="card-title">The Distributed Log as a Pattern</div><div class="card-desc">The pattern abstracted from Kafka — its invariants and the universal problems a replicated log solves.</div></a>
+        <a class="card" href="bp01-when-to-use.html"><div class="card-num">III·01</div><div class="card-title">When to Use the Log — and When Not To</div><div class="card-desc">A decision framework: the forces for and against, and the anti-patterns (log-as-DB / -as-RPC / -as-queue).</div></a>
+      </div>
+      <div class="section-label">Design &amp; Tradeoffs</div>
+      <div class="card-grid">
+        <a class="card" href="bp02-design-decisions.html"><div class="card-num">III·02</div><div class="card-title">Design Decisions &amp; Alternatives</div><div class="card-desc">Each Kafka choice as a tradeoff: pull vs push, ISR vs quorum (and why both), page cache vs managed memory, segments vs LSM.</div></a>
+        <a class="card" href="bp03-inherent-limits.html"><div class="card-num">III·03</div><div class="card-title">Inherent Limitations</div><div class="card-desc">Where the pattern structurally falls short — ordering, the partition ceiling, no per-message routing/TTL, the latency floor.</div></a>
+      </div>
+      <div class="section-label">For the Architect</div>
+      <div class="card-grid">
+        <a class="card" href="bp04-tactics-toolkit.html"><div class="card-num">III·04</div><div class="card-title">The Tactics Toolkit</div><div class="card-desc">Reusable engineering tactics generalized: mechanical sympathy, epoch fencing, everything-is-a-log, timing wheels, MVCC timelines.</div></a>
+        <a class="card" href="bp05-evolution.html"><div class="card-num">III·05</div><div class="card-title">Evolution as Case Studies</div><div class="card-desc">ZooKeeper→KRaft, the message format, EOS, rebalancing, tiered storage, queues — lessons in evolving a distributed system.</div></a>
+        <a class="card" href="bp06-comparative.html"><div class="card-num">III·06</div><div class="card-title">Comparative Architecture</div><div class="card-desc">Kafka vs Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and diskless designs — what each tradeoff teaches.</div></a>
+        <a class="card" href="bp07-architect-cheatsheet.html"><div class="card-num">III·07</div><div class="card-title">The Architect's Cheat Sheet</div><div class="card-desc">Consolidated design dials, decision trees, and heuristics for choosing and tuning a log-based architecture.</div></a>
+      </div>
+
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

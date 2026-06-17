@@ -1,0 +1,246 @@
+<h1>II · 01 · Configuration: The Tuning Surface</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">Configuration is the operator's control surface — the dials through which you steer durability, throughput, latency, and cost without recompiling a broker. But "configuration" in Kafka is not one flat namespace. It is four overlapping layers — static broker, dynamic cluster-wide, dynamic per-broker, per-topic — plus the client side, each resolved by a precise precedence, and each backed by a <code>ConfigDef</code> that hard-codes a type, a default, a validator, and an importance. This chapter teaches you to <em>read a default straight from the source</em> (so you never trust a stale blog), shows exactly which knobs apply live versus need a restart and <em>why</em> (the dynamic-update path through the metadata log), and walks the ~20 broker and topic knobs that actually move the needle — each with its default, its dynamic-ness, and the concrete mechanism it tunes. The cardinal rule throughout: every recommendation carries its WHY, rooted in a real mechanism in the code — not folklore.</p>
+
+<h2>The anatomy of a config: <code>ConfigDef.define()</code></h2>
+
+<p>Every Kafka configuration — broker, topic, producer, consumer — is declared exactly once through a <code>ConfigDef</code>. A definition binds a <strong>key</strong>, a <strong>type</strong>, a <strong>default</strong>, an optional <strong>validator</strong> (range / enum / custom), an <strong>importance</strong>, and documentation. This is the single source of truth: when this manual cites a default, it is reading the literal argument passed to <code>.define(...)</code>.</p>
+
+<p>Take the replication <code>ConfigDef</code> in <code>server/src/main/java/org/apache/kafka/server/config/ReplicationConfigs.java:154</code>. Every column below comes from one <code>.define()</code> call:</p>
+
+<div class="table-wrap"><table><thead><tr><th>Position in <code>.define()</code></th><th>Example — <code>replica.lag.time.max.ms</code></th><th>Operational meaning</th></tr></thead><tbody>
+<tr><td>key</td><td><code>"replica.lag.time.max.ms"</code></td><td>The property name you set in <code>server.properties</code> or via AdminClient.</td></tr>
+<tr><td>type</td><td><code>LONG</code></td><td>Parsed and coerced at load; a wrong type is a startup error.</td></tr>
+<tr><td>default</td><td><code>30000L</code> (constant <code>REPLICA_LAG_TIME_MAX_MS_DEFAULT</code>)</td><td>Injected when the key is absent.</td></tr>
+<tr><td>validator</td><td>(none here; e.g. <code>atLeast(1)</code> / <code>between(0,1)</code> elsewhere)</td><td>Rejects out-of-range values <em>before</em> they take effect.</td></tr>
+<tr><td>importance</td><td><code>HIGH</code></td><td>Documentation tiering only — no runtime effect.</td></tr>
+</tbody></table></div>
+
+<p>Resolution at runtime is mechanically simple, and there is no hidden fallback chain at this layer. The <code>AbstractConfig</code> constructor calls <code>definition.parse(originals)</code> (<code>clients/src/main/java/org/apache/kafka/common/config/AbstractConfig.java:118</code>); <code>parse()</code> walks every defined key, and if the user supplied no value it injects <code>key.defaultValue</code> (<code>clients/src/main/java/org/apache/kafka/common/config/ConfigDef.java:123</code>). Thereafter <code>AbstractConfig.get(key)</code> simply returns whatever sits in the resolved <code>values</code> map and records the access for unused-config logging (<code>AbstractConfig.java:174</code>). The default you read in source is the default you get.</p>
+
+<figure class="diagram"><div class="dflow">
+<div class="node cat-broker"><span class="nt">raw props (server.properties + CLI + dynamic)</span></div>
+<div class="conn" data-label="constructor"></div>
+<div class="node cat-control">preProcessParsedConfig → resolve <code>${provider:...}</code> vars</div>
+<div class="conn"></div>
+<div class="node cat-control decision">key supplied?</div>
+<div class="row">
+<div class="col"><div class="conn" data-label="yes"></div><div class="node">validate against validator + type</div></div>
+<div class="col"><div class="conn ec-async" data-label="no"></div><div class="node cat-storage">inject <code>defaultValue</code> (ConfigDef.java:123)</div></div>
+</div>
+<div class="conn" data-label="merge"></div>
+<div class="node cat-storage store">resolved <code>values</code> map — read by <code>get(key)</code></div>
+</div><figcaption>How one config value is resolved inside <code>AbstractConfig</code>. Validation runs on user-supplied values; absent keys fall to the compiled-in default. <code>postProcessParsedConfig</code> then fixes up "secondary defaults" before a second parse pass.</figcaption>
+<div class="legend"><span class="sw cat-broker"></span> raw input · <span class="sw cat-control"></span> parse/validate · <span class="sw cat-storage"></span> stored value · <span class="arr dashed"></span> default-injection branch · <span class="mono">get(key)</span> records the read for unused-config warnings</div></figure>
+
+<div class="callout key"><span class="callout-title">How to read a default from source (do this, don't trust the blog)</span><p>Find the <code>*Configs.java</code> class for the subsystem — <code>ServerLogConfigs</code>, <code>ReplicationConfigs</code>, <code>ServerConfigs</code>, <code>SocketServerConfigs</code> — locate the <code>_DEFAULT</code> constant, then confirm it is wired into a <code>CONFIG_DEF</code> via <code>.define(KEY, TYPE, KEY_DEFAULT, ...)</code>. <strong>Topic</strong> defaults live in the static <code>CONFIG</code> block of <code>storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java</code>. <strong>Client</strong> defaults are inline literals in <code>ProducerConfig</code> / <code>ConsumerConfig</code>. Never quote a default you have not seen in a <code>.define()</code> argument — several "well-known" values are now stale (the famous case: <code>linger.ms</code> is <code>5</code>, not <code>0</code>, since the producer ConfigDef sets it that way at <code>ProducerConfig.java:418</code>).</p></div>
+
+<p>Five sentinel conventions recur when reading defaults, and misreading them causes real incidents:</p>
+<ul>
+<li><code>NO_DEFAULT_VALUE</code> (<code>ConfigDef.java:91</code>) — a required config with no default; absence is a hard startup error (e.g. serializer classes).</li>
+<li><code>Long.MAX_VALUE</code> as default = "effectively disabled / unbounded." Examples: <code>log.flush.interval.messages</code> = <code>Long.MAX_VALUE</code> (never flush by count — <code>ServerLogConfigs.java:101</code>) and the byte-rate quotas (no quota until you set one).</li>
+<li><code>-1</code> = "no limit / unbounded by this dimension." <code>log.retention.bytes</code> = <code>-1</code> (no size cap, only time — <code>ServerLogConfigs.java:81</code>).</li>
+<li><code>-2</code> = "derive from the parent config." <code>local.retention.ms</code> = <code>-2</code> derives from <code>retention.ms</code> for tiered topics (<code>LogConfig.java:146</code>).</li>
+<li><code>null</code> default <em>with a secondary key</em> = a fallback synonym exists. <code>log.retention.ms</code> is <code>null</code> and falls back to <code>log.retention.minutes</code> then <code>log.retention.hours</code> (<code>LogConfig.java:168–170</code>); the synonym precedence is resolved in <code>DynamicBrokerConfig.brokerConfigSynonyms</code> (<code>server/.../config/DynamicBrokerConfig.java:97</code>).</li>
+</ul>
+
+<h2>The four layers and their precedence</h2>
+
+<p>A broker's <em>effective</em> configuration is assembled from four sources in a strict order. The authoritative resolution is <code>DynamicBrokerConfig.updateCurrentConfig()</code> (<code>core/src/main/scala/kafka/server/DynamicBrokerConfig.scala:429</code>): it starts from <code>staticBrokerConfigs</code>, overlays cluster-wide dynamic defaults, then overlays per-broker dynamic overrides — later layers win. For log/topic configs a fifth, most-specific layer applies on top: the per-topic override carried in each partition's <code>LogConfig</code>.</p>
+
+<figure class="diagram"><div class="dstack">
+<div class="layer cat-broker"><div class="ln">Static — <code>server.properties</code> + CLI</div><div class="ld">Read once at process start. Changing it requires a <strong>restart</strong>. This is the base layer, <code>staticBrokerConfigs</code>.</div><div class="row"><span class="chip">restart</span><span class="chip">file on disk</span></div></div>
+<div class="sep">↓ overridden by</div>
+<div class="layer cat-control"><div class="ln">Dynamic cluster-wide — <code>ConfigResource(BROKER, "")</code></div><div class="ld">Stored as <code>ConfigRecord</code>s in the metadata log; applied to <em>every</em> broker live. Held in <code>dynamicDefaultConfigs</code>.</div><div class="row"><span class="chip">no restart</span><span class="chip">metadata log</span></div></div>
+<div class="sep">↓ overridden by</div>
+<div class="layer cat-control"><div class="ln">Dynamic per-broker — <code>ConfigResource(BROKER, "&lt;id&gt;")</code></div><div class="ld">Same record store, scoped to one broker id. Wins over the cluster-wide default. Held in <code>dynamicBrokerConfigs</code>.</div><div class="row"><span class="chip">no restart</span><span class="chip">metadata log</span></div></div>
+<div class="sep">↓ for log/topic configs, further overridden by</div>
+<div class="layer cat-storage"><div class="ln">Per-topic — <code>ConfigResource(TOPIC, name)</code></div><div class="ld"><code>LogConfig</code> override per partition; the broker <code>log.*</code> value is merely the inherited default. Highest specificity for a topic's storage behaviour.</div><div class="row"><span class="chip">no restart</span><span class="chip">per partition</span></div></div>
+</div><figcaption>Effective-config resolution order. Per-broker beats cluster-wide beats static; for storage configs a topic override beats the broker's <code>log.*</code> inheritance for that topic only.</figcaption>
+<div class="legend"><span class="sw cat-broker"></span> broker/static · <span class="sw cat-control"></span> controller/metadata-stored dynamic · <span class="sw cat-storage"></span> log/topic · <span class="mono">chip</span> = restart requirement &amp; storage location</div></figure>
+
+<p>Two subtleties that bite operators:</p>
+<ul>
+<li><strong>The layering order flips with the scope you are writing.</strong> When you set a <em>per-broker</em> value, the resolver lays down cluster-defaults first then your per-broker override (per-broker wins). When you set a <em>cluster-wide default</em>, it lays the new defaults <em>under</em> any existing per-broker dynamic values (per-broker still wins) — see <code>validatedKafkaProps</code> at <code>DynamicBrokerConfig.scala:353–360</code>. Net invariant: <strong>a per-broker dynamic override always shadows the cluster-wide default.</strong> If a cluster-wide change "didn't take" on one broker, suspect a leftover per-broker override.</li>
+<li><strong>Topic configs are <em>synonyms</em> of broker <code>log.*</code> configs.</strong> <code>cleanup.policy</code> (topic) ↔ <code>log.cleanup.policy</code> (broker); <code>retention.ms</code> ↔ <code>log.retention.ms</code>; <code>segment.bytes</code> ↔ <code>log.segment.bytes</code>; while <code>min.insync.replicas</code> carries the same name in both layers. The mapping is <code>ServerTopicConfigSynonyms.TOPIC_CONFIG_SYNONYMS</code>, surfaced through the "Server Default Property" header in <code>LogConfig.java:117</code>. The broker value is the cluster default; a topic that does not override inherits it.</li>
+</ul>
+
+<div class="callout note"><span class="callout-title">KRaft changed where dynamic config lives</span><p>In KRaft — the only mode in 4.x; ZooKeeper was removed in 4.0 — dynamic broker, topic, group, and client-quota configs are <code>ConfigRecord</code> entries in the metadata log, applied through the controller and replicated to every node. There is no ZooKeeper znode. On startup a broker even replays dynamic config straight from the latest metadata snapshot (<code>readDynamicBrokerConfigsFromSnapshot</code>, <code>DynamicBrokerConfig.scala:92</code>), then <code>BrokerConfigHandler.processConfigChanges</code> routes each record to <code>updateDefaultConfig</code> or <code>updateBrokerConfig</code> (<code>core/src/main/scala/kafka/server/ConfigHandler.scala:149–153</code>). See Part I <a href="11-kraft-controller.html">11 · KRaft Controller</a> and <a href="12-metadata-propagation.html">12 · Metadata Propagation</a> for the replication path.</p></div>
+
+<h3>HARD vs SOFT vs EMERGENT limits</h3>
+
+<p>This manual distinguishes three kinds of bound, and configuration sits across all three. Knowing which kind you face tells you whether a number is a dial, a wall, or a consequence.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Kind</th><th>What it is</th><th>How you change it</th><th>Config-world example</th></tr></thead><tbody>
+<tr><td><strong>HARD</strong></td><td>A compiled-in constant; no config touches it.</td><td>Only by patching + rebuilding Kafka.</td><td><code>MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE = 5</code> (<code>ProducerConfig.java:277</code>) caps in-flight requests when idempotence is on, regardless of your <code>max.in.flight</code>.</td></tr>
+<tr><td><strong>SOFT</strong></td><td>A config key with a default and a validator.</td><td>Set the key (statically or, if dynamic, live).</td><td><code>min.insync.replicas</code> default <code>1</code>; <code>log.retention.ms</code> default 7 days; <code>num.io.threads</code> default <code>8</code>.</td></tr>
+<tr><td><strong>EMERGENT</strong></td><td>A ceiling that arises from resources/architecture, not a single key.</td><td>Add hardware, change topology, or accept the bound.</td><td>Effective ISR is capped by replica count, so <code>min.insync.replicas=2</code> on an RF=1 topic silently behaves as 1 (see the gotcha below).</td></tr>
+</tbody></table></div>
+
+<h2>Dynamic vs restart-required: the update path</h2>
+
+<p>Whether a config is alterable live is not a matter of opinion — it is membership in a compiled set. <code>DynamicBrokerConfig.ALL_DYNAMIC_CONFIGS</code> (<code>server/.../config/DynamicBrokerConfig.java:70</code>) is the union of every subsystem's reconfigurable list; anything outside it is rejected for dynamic update by <code>validateConfigs</code> with "Cannot update these configs dynamically" (<code>DynamicBrokerConfig.java:130–139</code>). A second set, <code>PER_BROKER_CONFIGS</code> (line 62), records which of those must be scoped to a broker id; <code>dynamicConfigUpdateModes()</code> (line 195) maps each dynamic key to <code>"per-broker"</code> or <code>"cluster-wide"</code> — exactly what <code>kafka-configs.sh</code> reports.</p>
+
+<p>The mechanism that makes live reconfiguration <em>safe</em> is the two-phase apply in <code>processReconfiguration</code> (<code>DynamicBrokerConfig.scala:447</code>). First a validate pass builds a candidate <code>KafkaConfig</code> and calls <code>validateReconfiguration</code> on every affected reconfigurable; <strong>if any throws, the whole update is aborted and nothing changes.</strong> Only then does the apply pass swap in the new config and call <code>reconfigure(oldConfig, newConfig)</code>. This is why a bad dynamic value is refused atomically rather than half-applied.</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:4">
+<div class="lanes"><span class="actor cat-client">kafka-configs.sh</span><span class="actor cat-control">Controller</span><span class="actor cat-storage">Metadata log</span><span class="actor cat-broker">Broker(s)</span></div>
+<div class="body">
+<div class="lifelines"><i></i><i></i><i></i><i></i></div>
+<div class="m r" style="--from:1;--to:2"><span class="ml">IncrementalAlterConfigs</span><span class="ln"></span></div>
+<div class="m r" style="--from:2;--to:3"><span class="ml">append ConfigRecord</span><span class="ln"></span></div>
+<div class="m r dashed" style="--from:3;--to:4"><span class="ml">replicate record</span><span class="ln"></span></div>
+<div class="m l" style="--from:4;--to:2"><span class="ml">validateReconfiguration() — abort on throw</span><span class="ln"></span></div>
+<div class="m r" style="--from:2;--to:4"><span class="ml">apply: reconfigure(old,new)</span><span class="ln"></span></div>
+<div class="m l dashed" style="--from:2;--to:1"><span class="ml">response (OK / ConfigException)</span><span class="ln"></span></div>
+</div></div><figcaption>Dynamic-config update in KRaft. The controller persists a <code>ConfigRecord</code>; brokers validate the candidate config first (atomic abort on failure) and only then apply it. No process restart, no ZooKeeper.</figcaption>
+<div class="legend"><span class="sw cat-client"></span> admin tool · <span class="sw cat-control"></span> controller · <span class="sw cat-storage"></span> metadata log · <span class="sw cat-broker"></span> broker · <span class="arr"></span> request/apply · <span class="arr dashed"></span> async replicate / reply</div></figure>
+
+<p>The reconfigurable subsystems and the configs they own:</p>
+
+<div class="table-wrap"><table><thead><tr><th>Subsystem (source)</th><th>Dynamic configs it owns</th><th>Scope</th></tr></thead><tbody>
+<tr><td><code>DynamicLogConfig</code> (<code>DynamicBrokerConfig.java:203</code>)</td><td><em>Every</em> <code>log.*</code> synonym of a topic config — retention, segment, cleanup policy, flush, compression, <code>min.insync.replicas</code>, timestamp bounds — plus <code>cordoned.log.dirs</code>.</td><td>cluster-wide (cordon is per-broker)</td></tr>
+<tr><td><code>DynamicThreadPool</code> (<code>server/.../DynamicThreadPool.java:29</code>)</td><td><code>num.io.threads</code>, <code>num.replica.fetchers</code>, <code>num.recovery.threads.per.data.dir</code>, <code>background.threads</code>.</td><td>cluster-wide</td></tr>
+<tr><td><code>DynamicListenerConfig</code> + <code>SocketServer</code> (<code>DynamicBrokerConfig.java:216</code>)</td><td>SSL/SASL keystore + truststore + mechanisms, <code>listeners</code>, <code>num.network.threads</code>, <code>max.connections</code>, <code>max.connection.creation.rate</code>.</td><td>per-broker (some listener limits cluster-wide)</td></tr>
+<tr><td><code>DynamicRemoteLogConfig</code> (<code>DynamicBrokerConfig.java:269</code>)</td><td>Tiered-storage thread pools, copy/fetch byte-rate caps, remote index cache size, fetch max-wait.</td><td>cluster-wide</td></tr>
+<tr><td><code>DynamicQuotaConfig</code> / <code>LogCleaner</code> / metrics reporters</td><td>Broker quota knobs (<code>QuotaConfig.BROKER_QUOTA_CONFIGS</code>), log-cleaner threads/IO, <code>metric.reporters</code>.</td><td>cluster-wide</td></tr>
+</tbody></table></div>
+
+<div class="callout rationale"><span class="callout-title">Why these are dynamic and others are not</span><p>A config is dynamic iff the subsystem that consumes it can swap to a new value without reconstructing immutable state. Thread-pool sizes are dynamic because the pools resize in place. All topic/log configs are dynamic because each partition rereads its <code>LogConfig</code>. SSL stores are dynamic because the channel builder can rebuild an SSL context. But <code>broker.id</code>, <code>process.roles</code>, <code>log.dirs</code> (the directory <em>set</em>), <code>controller.quorum.voters</code>, and <code>inter.broker.listener.name</code> are <strong>not</strong> dynamic — they wire identity, the storage layout, and the consensus quorum that must be fixed before the broker can participate at all. Trying to alter one of these dynamically is rejected by <code>nonDynamicConfigs</code> (<code>DynamicBrokerConfig.java:178</code>).</p></div>
+
+<div class="callout gotcha"><span class="callout-title">Static and dynamic of the same key coexist — and dynamic wins</span><p>You can have <code>num.io.threads=8</code> in <code>server.properties</code> <em>and</em> a dynamic per-broker <code>num.io.threads=16</code>. The dynamic value wins (it is layered on top), and it <strong>survives restarts</strong> because it lives in the metadata log, not the file. After an incident where you bumped a thread pool live, reconcile <code>server.properties</code> with the dynamic value or a future operator reading only the file will be misled. Use <code>kafka-configs.sh --describe --all</code> to see the effective value and its source synonyms.</p></div>
+
+<h2>The ~20 knobs that actually matter</h2>
+
+<p>Most of Kafka's hundreds of configs are leave-them-alone. The following are the ones an operator genuinely tunes. Every default below is read from the source cited; every "tunes" column cross-links the Part I chapter that explains the mechanism. <strong>D?</strong> = dynamically alterable.</p>
+
+<h3>Durability &amp; replication</h3>
+
+<div class="table-wrap"><table><thead><tr><th>Config</th><th>Default</th><th>D?</th><th>What it does &amp; the mechanism it tunes</th></tr></thead><tbody>
+<tr><td><code>default.replication.factor</code> (broker) / topic RF</td><td><code>1</code> <code>ReplicationConfigs.java:42</code></td><td>create-time</td><td>Number of copies of each partition. RF is fixed at create time per topic (the broker key only seeds auto-created and internal topics). <strong>Set RF=3 in production</strong> so the cluster survives one broker loss with a quorum remaining. Mechanism: <a href="08-replication.html">08 · Replication</a> (ISR).</td></tr>
+<tr><td><code>min.insync.replicas</code></td><td><code>1</code> <code>ServerLogConfigs.java:155</code></td><td>yes (cluster/topic)</td><td>With <code>acks=all</code>, the minimum ISR members that must persist a write or the producer gets <code>NotEnoughReplicas</code>. <strong>Set to 2 with RF=3</strong>: a write survives one in-sync replica failing <em>after</em> the ack. The producer-visibility rule also lives here — records are invisible to consumers until the ISR meets this. See <a href="08-replication.html">08 · Replication</a>, <a href="06-durability.html">II · 06 · Durability</a>.</td></tr>
+<tr><td><code>unclean.leader.election.enable</code></td><td><code>false</code> <code>LogConfig.java:139</code></td><td>yes (cluster/topic)</td><td>When <code>false</code>, a partition with no in-sync replica stays <em>offline</em> rather than promoting a stale out-of-ISR replica that would truncate committed data. <strong>Keep <code>false</code></strong> — flipping it trades availability for guaranteed data loss. In KRaft, enabling it dynamically waits up to <code>unclean.leader.election.interval.ms</code> (5 min default, <code>ReplicationConfigs.java:123</code>) unless you force it with <code>kafka-leader-election.sh</code>. Mechanism: <a href="08-replication.html">08 · Replication</a>, <a href="11-kraft-controller.html">11 · KRaft Controller</a>.</td></tr>
+<tr><td><code>replica.lag.time.max.ms</code></td><td><code>30000</code> <code>ReplicationConfigs.java:55</code></td><td>no</td><td>A follower that hasn't fetched up to the leader's LEO within this window is dropped from ISR. Lower → ISR shrinks faster (more sensitive to slow followers); higher → tolerates lag but weakens the durability promise. Keep <code>replica.fetch.wait.max.ms</code> (500) well below it. See <a href="08-replication.html">08 · Replication</a>.</td></tr>
+<tr><td><code>num.replica.fetchers</code></td><td><code>1</code> <code>ReplicationConfigs.java:96</code></td><td><strong>yes</strong> (cluster)</td><td>Fetcher threads per source broker pulling replica data. Total fetcher threads = this × #brokers. Raise to 4–8 when followers lag a high-throughput leader; it parallelises follower I/O. Mechanism: <a href="08-replication.html">08 · Replication</a>, <a href="09-fetch-path.html">09 · Fetch Path</a>.</td></tr>
+</tbody></table></div>
+
+<div class="callout invariant"><span class="callout-title">The durability triad — and its mechanism</span><p><code>replication.factor=3</code> + <code>min.insync.replicas=2</code> + producer <code>acks=all</code> + <code>unclean.leader.election.enable=false</code> is the production baseline. <em>Why each term:</em> RF=3 gives three copies; <code>acks=all</code> blocks the ack until every <em>current</em> ISR member has the record (so a single replica is never the sole holder of an acked write); <code>min.insync.replicas=2</code> refuses writes when the ISR has already collapsed to one (no false durability); <code>unclean=false</code> forbids promoting a replica that never had the data. With all four, a single failure is non-data-losing — loss requires ≥2 simultaneous failures. This is the durability triad cited across the operations literature (Conduktor; Datadog's pre-0.11 unclean-election data-loss post-mortem). See <a href="06-durability.html">II · 06 · Durability</a>.</p></div>
+
+<div class="callout gotcha"><span class="callout-title">The silent <code>min.insync.replicas</code> trap</span><p><code>min.insync.replicas</code> is <strong>capped by the actual replica count</strong>. The effective value is <code>minInSyncReplicas.min(remoteReplicasMap.size + 1)</code> in <code>core/src/main/scala/kafka/cluster/Partition.scala:246–247</code>. So on an RF=1 topic, <code>min.insync.replicas=2</code> silently behaves as 1 and writes are accepted with zero redundancy. This is an EMERGENT limit, not a SOFT one — the config does not error, the topology overrides it. <strong>Always verify <code>min.insync.replicas ≤ replication.factor</code> per topic</strong>; the gap is invisible until the day you lose the only replica.</p></div>
+
+<h3>Storage, retention &amp; cleanup</h3>
+
+<div class="table-wrap"><table><thead><tr><th>Config (topic ↔ broker)</th><th>Default</th><th>D?</th><th>What it does &amp; the mechanism it tunes</th></tr></thead><tbody>
+<tr><td><code>retention.ms</code> ↔ <code>log.retention.ms</code></td><td>7 days (<code>604800000</code>) <code>LogConfig.java:134</code></td><td><strong>yes</strong></td><td>Time a record is kept under the <code>delete</code> policy. <code>-1</code> = keep forever. The broker key is <code>null</code> and falls back to <code>log.retention.minutes</code> → <code>log.retention.hours</code> (168). This is your primary disk-sizing dial and an SLA on how long consumers may lag. See <a href="04-storage-management.html">04 · Storage Management</a>, <a href="04-capacity-planning.html">II · 04 · Capacity Planning</a>.</td></tr>
+<tr><td><code>retention.bytes</code> ↔ <code>log.retention.bytes</code></td><td><code>-1</code> (no cap) <code>ServerLogConfigs.java:81</code></td><td><strong>yes</strong></td><td>Per-<em>partition</em> size cap; multiply by partition count for the topic total. Combined with <code>retention.ms</code>, whichever triggers first wins. Use it as a hard ceiling so a traffic spike cannot fill the disk. See <a href="04-storage-management.html">04 · Storage Management</a>.</td></tr>
+<tr><td><code>segment.bytes</code> ↔ <code>log.segment.bytes</code></td><td>1 GiB (<code>1073741824</code>) <code>LogConfig.java:131</code></td><td><strong>yes</strong></td><td>Max size of one log segment file (floor <code>1 MiB</code>, <code>atLeast(1024*1024)</code>). Retention and cleaning operate a <em>whole segment at a time</em>, so smaller segments = finer retention granularity but more files (FDs, mmaps). Lower it on low-volume topics where 1 GiB would never roll within the retention window. See <a href="03-storage-log-engine.html">03 · Storage / Log Engine</a>.</td></tr>
+<tr><td><code>segment.ms</code> ↔ <code>log.roll.ms/hours</code></td><td>7 days <code>LogConfig.java:132</code></td><td><strong>yes</strong></td><td>Forces a roll even if <code>segment.bytes</code> isn't reached, so retention can act on time-bounded data. The active segment is never deleted; if it never rolls, nothing is reclaimed. See <a href="03-storage-log-engine.html">03 · Storage / Log Engine</a>.</td></tr>
+<tr><td><code>cleanup.policy</code> ↔ <code>log.cleanup.policy</code></td><td><code>delete</code> <code>ServerLogConfigs.java:89</code></td><td><strong>yes</strong></td><td><code>delete</code> drops old segments by time/size; <code>compact</code> keeps the latest value per key (log compaction); <code>delete,compact</code> does both; empty list = infinite retention. Compaction is what makes changelog/<code>__consumer_offsets</code>-style topics bounded. See <a href="03-storage-log-engine.html">03 · Storage / Log Engine</a>, <a href="13-group-coordination.html">13 · Group Coordination</a>.</td></tr>
+<tr><td><code>min.cleanable.dirty.ratio</code></td><td><code>0.5</code> <code>LogConfig.java:138</code></td><td><strong>yes</strong></td><td>For compacted topics, the dirty fraction that makes a log eligible for cleaning. Lower → cleans more often (less wasted space, more CPU); higher → fewer, larger cleanings. Bounds worst-case duplicate space. See <a href="03-storage-log-engine.html">03 · Storage / Log Engine</a>.</td></tr>
+<tr><td><code>num.recovery.threads.per.data.dir</code></td><td><code>2</code> <code>ServerLogConfigs.java:147</code></td><td><strong>yes</strong></td><td>Threads per data dir for log recovery at startup / flush at shutdown. Raise it to shorten an unclean-restart recovery on a broker with many partitions — this directly cuts time-to-rejoin after a crash. See <a href="04-storage-management.html">04 · Storage Management</a>, <a href="07-failure-modes.html">II · 07 · Failure Modes</a>.</td></tr>
+</tbody></table></div>
+
+<div class="callout warning"><span class="callout-title">Defaults are not magic numbers — segment vs retention interact</span><p>A common foot-gun: a low-traffic topic with <code>retention.ms=1h</code> but the default <code>segment.bytes=1GiB</code> and <code>segment.ms=7d</code> keeps data for <em>up to 7 days</em>, because retention only deletes <em>closed</em> segments and the active one won't roll for a week. If a topic must honour a tight retention SLA, lower <code>segment.ms</code> to roughly the retention window. The active segment is never eligible for deletion — see <a href="04-storage-management.html">04 · Storage Management</a>.</p></div>
+
+<h3>Message size &amp; timestamps</h3>
+
+<div class="table-wrap"><table><thead><tr><th>Config</th><th>Default</th><th>D?</th><th>What it does &amp; the mechanism it tunes</th></tr></thead><tbody>
+<tr><td><code>max.message.bytes</code> ↔ <code>message.max.bytes</code></td><td><code>1 MiB + 12</code> = <code>1048588</code> <code>ServerLogConfigs.java:177</code></td><td><strong>yes</strong></td><td>Largest <em>record batch</em> (after compression) the broker accepts; the <code>+ LOG_OVERHEAD</code> (12 B) is the batch header. Raising it must be matched on producers (<code>max.request.size</code>) and on the replication path — <code>replica.fetch.max.bytes</code> (1 MiB, <code>ReplicationConfigs.java:68</code>) is "not absolute" and will still return one oversized batch, but undersizing it wastes fetch round-trips. See <a href="01-record-format.html">01 · Record Format</a>, <a href="02-limits.html">II · 02 · Limits</a>.</td></tr>
+<tr><td><code>message.timestamp.type</code></td><td><code>CreateTime</code> <code>ServerLogConfigs.java:127</code></td><td><strong>yes</strong></td><td><code>CreateTime</code> trusts the producer's timestamp; <code>LogAppendTime</code> stamps at the broker. Time-based retention and time-index lookups use this value, so a skewed producer clock under <code>CreateTime</code> can retain data wrongly. See <a href="01-record-format.html">01 · Record Format</a>.</td></tr>
+<tr><td><code>message.timestamp.before.max.ms</code></td><td><code>Long.MAX_VALUE</code> (off) <code>ServerLogConfigs.java:132</code></td><td><strong>yes</strong></td><td>Under <code>CreateTime</code>, rejects a record whose timestamp is more than this far in the <em>past</em>. Default off; set it to stop ancient/backfilled records from poisoning time-based retention.</td></tr>
+<tr><td><code>message.timestamp.after.max.ms</code></td><td><code>3600000</code> (1 h) <code>ServerLogConfigs.java:139</code></td><td><strong>yes</strong></td><td>Under <code>CreateTime</code>, rejects a record timestamped more than 1 hour in the <em>future</em> — a guard against far-future timestamps that would pin retention open forever. Note the asymmetry with the "before" default.</td></tr>
+</tbody></table></div>
+
+<h3>Throughput, threads &amp; sockets</h3>
+
+<div class="table-wrap"><table><thead><tr><th>Config</th><th>Default</th><th>D?</th><th>What it does &amp; the mechanism it tunes</th></tr></thead><tbody>
+<tr><td><code>num.io.threads</code></td><td><code>8</code> <code>ServerConfigs.java:51</code></td><td><strong>yes</strong></td><td>Request-handler threads that do the work (incl. disk I/O) after a network thread parses a request. The classic rule of thumb is ~8 per data disk (Confluent/Strimzi, empirical). Watch <code>RequestHandlerAvgIdlePercent</code>: keep &gt;30%. See <a href="07-request-processing.html">07 · Request Processing</a>, <a href="06-network-and-threading.html">06 · Network &amp; Threading</a>.</td></tr>
+<tr><td><code>num.network.threads</code></td><td><code>3</code> <code>SocketServerConfigs.java:152</code></td><td><strong>yes</strong></td><td>Acceptor-side threads that read requests / write responses per listener. Raise to 8–12 on high-connection or high-fan-out brokers. Watch <code>NetworkProcessorAvgIdlePercent</code> (&lt;0.30 = saturated). See <a href="06-network-and-threading.html">06 · Network &amp; Threading</a>.</td></tr>
+<tr><td><code>queued.max.requests</code></td><td><code>500</code> <code>SocketServerConfigs.java:144</code></td><td>no</td><td>Depth of the queue between network and I/O threads; back-pressure point when I/O threads can't keep up. See <a href="07-request-processing.html">07 · Request Processing</a>.</td></tr>
+<tr><td><code>socket.request.max.bytes</code></td><td>100 MiB (<code>104857600</code>) <code>SocketServerConfigs.java:96</code></td><td>no</td><td>Hard ceiling on a single request's size — a memory-safety bound. Must exceed your largest produce/fetch. See <a href="02-limits.html">II · 02 · Limits</a>.</td></tr>
+<tr><td><code>socket.send.buffer.bytes</code> / <code>.receive.buffer.bytes</code></td><td>100 KiB each <code>SocketServerConfigs.java:88,92</code></td><td>no</td><td>SO_SNDBUF/RCVBUF. On high bandwidth-delay-product links raise toward 1 MiB so a single connection can fill the pipe. See <a href="06-network-and-threading.html">06 · Network &amp; Threading</a>.</td></tr>
+<tr><td><code>compression.type</code> ↔ <code>log.compression.type</code></td><td><code>producer</code> (broker) <code>ServerLogConfigs.java:178</code></td><td><strong>yes</strong></td><td>Broker default <code>producer</code> means "store the codec the producer chose" — no recompression. Set a concrete codec (<code>lz4</code>/<code>zstd</code>) to normalise across producers; <code>uncompressed</code> forces none. <em>Producer</em>-side <code>compression.type</code> defaults to <code>none</code> (<code>ProducerConfig.java:409</code>) — the real choice happens on the producer. See <a href="16-producer-client.html">16 · Producer Client</a>, <a href="05-performance-tuning.html">II · 05 · Performance Tuning</a>.</td></tr>
+<tr><td><code>num.partitions</code></td><td><code>1</code> <code>ServerLogConfigs.java:36</code></td><td>n/a (create-time)</td><td>Default partition count for auto-created and <code>-1</code>-requested topics. Partition count is the unit of parallelism and is <strong>practically immutable</strong> for keyed topics. Set it deliberately per topic; do not lean on this default. See <a href="03-partitioning.html">II · 03 · Partitioning</a>, <a href="13-group-coordination.html">13 · Group Coordination</a>.</td></tr>
+</tbody></table></div>
+
+<h3>The flush configs — and why you almost never set them</h3>
+
+<p>Operators new to Kafka reach for <code>log.flush.interval.messages</code> / <code>log.flush.interval.ms</code> expecting they control durability. They do not, by default — and that is deliberate.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Config</th><th>Default</th><th>D?</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>flush.messages</code> ↔ <code>log.flush.interval.messages</code></td><td><code>Long.MAX_VALUE</code> <code>ServerLogConfigs.java:101</code></td><td><strong>yes</strong></td><td>fsync after N messages. <code>MAX_VALUE</code> = never force fsync by count.</td></tr>
+<tr><td><code>flush.ms</code> ↔ <code>log.flush.interval.ms</code></td><td><code>null</code> → falls back to <code>log.flush.scheduler.interval.ms</code> = <code>Long.MAX_VALUE</code> <code>ServerLogConfigs.java:109</code></td><td><strong>yes</strong></td><td>fsync after a time interval. Effectively disabled by default.</td></tr>
+</tbody></table></div>
+
+<div class="callout rationale"><span class="callout-title">Why Kafka leaves fsync to the OS — and what <code>acks=all</code> really promises</span><p>By default Kafka does <strong>not</strong> fsync on the write path; it writes into the page cache and lets the OS flush lazily, which is why it sustains hundreds of MB/s on commodity disks (the zero-copy / page-cache architecture, Part I <a href="03-storage-log-engine.html">03</a>/<a href="09-fetch-path.html">09</a>). Durability comes from <em>replication</em>, not from disk-forcing each write — the source doc for <code>flush.messages</code> says exactly this (<code>TopicConfig.java:54</code>: "use replication for durability ... it is more efficient"). The crucial corollary: <strong><code>acks=all</code> means "in the page cache of all ISR members," not "fsynced to all disks."</strong> A correlated power-loss across all replicas can still lose acked-but-unflushed data. Forcing per-message fsync (setting <code>flush.messages=1</code>) restores disk-level durability but degrades tail latency under load — the central point in the Redpanda/AutoMQ benchmark critiques. If you need disk-fsync-per-write semantics, set it knowingly and budget the latency; otherwise lean on RF + ISR. See <a href="06-durability.html">II · 06 · Durability</a>.</p></div>
+
+<h3>Quotas — the throttle dials</h3>
+
+<p>Quotas are dynamic, client-entity-scoped configs stored like any other dynamic config. The four override keys (<code>server-common/.../config/QuotaConfig.java:89–92</code>):</p>
+<dl class="kv">
+<dt><code>producer_byte_rate</code></dt><dd>Bytes/sec a (user, client-id) may produce; default unlimited (<code>Long.MAX_VALUE</code>). Over-quota requests are <em>delayed</em>, not failed.</dd>
+<dt><code>consumer_byte_rate</code></dt><dd>Bytes/sec a client may fetch; same delay mechanism.</dd>
+<dt><code>request_percentage</code></dt><dd>Cap on the fraction of broker request-handler + network time a client may consume — protects threads from a single noisy client.</dd>
+<dt><code>controller_mutation_rate</code></dt><dd>Rate of topic create/delete/partition-add mutations a client may issue — guards the controller from metadata storms.</dd>
+</dl>
+<p>The quota window is shaped by <code>quota.window.num</code> (11 samples) × <code>quota.window.size.seconds</code> (1 s) (<code>QuotaConfig.java:42,52</code>). Mechanism and the throttling math: <a href="19-quotas.html">19 · Quotas</a>; operational use: <a href="10-cost.html">II · 10 · Cost</a> and <a href="11-scaling-scenarios.html">II · 11 · Scaling Scenarios</a>.</p>
+
+<h2>Client-side configs that change broker behaviour</h2>
+
+<p>Three producer/consumer defaults are worth pinning because operators misquote them and because they interact with broker-side guarantees. All are read from the client ConfigDefs.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Config (side)</th><th>Default</th><th>Why it matters operationally</th></tr></thead><tbody>
+<tr><td><code>acks</code> (producer)</td><td><code>all</code> <code>ProducerConfig.java:405</code></td><td>Default is now <code>all</code> (not <code>1</code>). Combined with idempotence-on-by-default this gives safe-by-default delivery, at the cost of latency = slowest ISR member. <code>0</code>/<code>1</code> trade durability for latency. See <a href="16-producer-client.html">16 · Producer Client</a>, <a href="06-durability.html">II · 06 · Durability</a>.</td></tr>
+<tr><td><code>enable.idempotence</code> (producer)</td><td><code>true</code> <code>ProducerConfig.java:543</code></td><td>On by default; requires <code>acks=all</code> and <code>max.in.flight ≤ 5</code> (the HARD constant). Prevents duplicates on retry and preserves per-partition order even with 5 in flight. See <a href="16-producer-client.html">16 · Producer Client</a>, <a href="14-transactions-eos.html">14 · Transactions / EOS</a>.</td></tr>
+<tr><td><code>linger.ms</code> / <code>batch.size</code> (producer)</td><td><code>5</code> / <code>16384</code> <code>ProducerConfig.java:418,413</code></td><td>Batching dials. <code>linger.ms</code> is <code>5</code> (a common misquote is <code>0</code>). Larger batches amortise per-request overhead and improve compression ratio; the cost is up to <code>linger.ms</code> of added latency. Only raise linger when produce rate fills <code>batch.size</code> within the window. See <a href="05-performance-tuning.html">II · 05 · Performance Tuning</a>.</td></tr>
+<tr><td><code>fetch.min.bytes</code> (consumer)</td><td><code>1</code> <code>ConsumerConfig.java:187</code></td><td>Tuned for latency, <strong>not</strong> cost — Kafka does not batch reads by default. New Relic cut whole-cluster broker CPU 15% by raising this on consumers of low-throughput topics (empirical, New Relic). See <a href="17-consumer-client.html">17 · Consumer Client</a>, <a href="05-performance-tuning.html">II · 05 · Performance Tuning</a>.</td></tr>
+<tr><td><code>transaction.timeout.ms</code> (producer) vs <code>transaction.max.timeout.ms</code> (broker)</td><td>60 s vs <strong>15 min</strong> <code>TransactionStateManagerConfig.java:33</code></td><td>The producer value is capped by the broker max. A misconfigured transactional producer can pin the LSO and freeze <code>read_committed</code> consumers on a partition for up to 15 minutes. See <a href="14-transactions-eos.html">14 · Transactions / EOS</a>, <a href="07-failure-modes.html">II · 07 · Failure Modes</a>.</td></tr>
+</tbody></table></div>
+
+<h2>Empirical tuning baselines (mark these as benchmarks, not guarantees)</h2>
+
+<p>The source gives you defaults and mechanisms; it cannot give you "good" values for <em>your</em> hardware. These are the most-cited empirical starting points from the reference — directional, version- and workload-dependent, never SLAs:</p>
+<ul>
+<li><strong>JVM heap ~6 GB, rest to page cache.</strong> Kafka does not benefit from a large heap; on a 64 GB box a 6 GB heap leaves ~28–30 GB for the page cache that actually serves reads/writes (Confluent). Larger heaps risk multi-100ms G1 pauses that drop ISRs (Conduktor).</li>
+<li><strong>File descriptors ≥ 100,000 per broker</strong>; production brokers commonly hold &gt;30k open handles. FDs ≈ (partitions × partition-size ÷ <code>segment.bytes</code>) + connections (Jun Rao / Confluent). Lowering <code>segment.bytes</code> raises FD and mmap pressure.</li>
+<li><strong><code>vm.max_map_count</code> ≥ 262144</strong>; the Linux default (~65,530) caps a KRaft broker near ~32k partitions because each partition uses ~2 mmap areas (Instaclustr, empirical, version-dependent).</li>
+<li><strong><code>vm.swappiness=1</code></strong> — <em>not</em> 0; 0 forbids swap and removes the OOM safety net (Cloudera/Confluent).</li>
+<li><strong><code>num.io.threads</code> ≈ 8 × data disks</strong>, bounded by cores and disk bandwidth; <strong><code>num.network.threads</code> 8–12</strong> on busy brokers; <strong><code>num.replica.fetchers</code> 4–8</strong> when followers lag (Strimzi/Confluent).</li>
+<li><strong>Throughput recipe</strong> (Intel/Confluent, illustrative): <code>batch.size</code> 32 KB–1 MB, <code>linger.ms</code> 5–100, <code>acks=all</code>, <code>min.insync.replicas=2</code>, <code>compression.type=lz4</code> (or <code>zstd</code> for storage density). Reference baseline: ~605 MB/s peak; p99 5 ms at 200 MB/s on i3en, fsync off (Confluent OpenMessaging) — a <em>specific test</em>, not a promise.</li>
+</ul>
+
+<div class="callout warning"><span class="callout-title">Version- and vendor-dependent numbers — handle with care</span><p>Treat every benchmark above as directional. The 605 MB/s / "p99 5 ms at 200 MB/s" figures are one i3en test with fsync off and reads served from cache. "2 million writes/sec" (Kreps/LinkedIn, 2014) was <em>three</em> producers with async replication; a single producer with <code>acks=-1</code> dropped to ~422K rec/s — sync replication roughly halved throughput. Redpanda's "10×" claims used a crippled Kafka (per-batch fsync, Java 11); on equal hardware Kafka matched or beat it (Vanlightly). And the per-broker partition ceiling is an EMERGENT bound of memory + FDs + <code>vm.max_map_count</code> + fetcher overhead, not a config — see <a href="02-limits.html">II · 02 · Limits</a> and <a href="03-partitioning.html">II · 03 · Partitioning</a>.</p></div>
+
+<h2>Operating the configuration surface</h2>
+
+<p>A short decision tree for "I need to change a config in production":</p>
+
+<figure class="diagram"><div class="dflow">
+<div class="node cat-client"><span class="nt">need to change a config</span></div>
+<div class="conn" data-label="classify"></div>
+<div class="node cat-control decision">in <code>ALL_DYNAMIC_CONFIGS</code>?</div>
+<div class="row">
+<div class="col">
+<div class="conn" data-label="yes"></div>
+<div class="node cat-control decision">per-broker or cluster?</div>
+<div class="row">
+<div class="col"><div class="conn" data-label="cluster"></div><div class="node cat-storage"><code>kafka-configs.sh --entity-type brokers --entity-default --alter</code></div></div>
+<div class="col"><div class="conn" data-label="one broker"></div><div class="node cat-storage"><code>--entity-name &lt;id&gt;</code> (survives restart, shadows default)</div></div>
+</div>
+<div class="conn" data-label="applied live, validated atomically"></div>
+<div class="node cat-coord">verify: <code>--describe --all</code> shows new effective value</div>
+</div>
+<div class="col">
+<div class="conn ec-err" data-label="no (non-dynamic)"></div>
+<div class="node cat-error">edit <code>server.properties</code> → <strong>rolling restart</strong></div>
+<div class="conn" data-label="one broker at a time"></div>
+<div class="node cat-coord">wait URP→0 between brokers (<a href="08-replication.html">08</a>)</div>
+</div>
+</div>
+</div><figcaption>Change-a-config runbook. Dynamic path = no downtime, atomic validate-then-apply, persisted in the metadata log. Non-dynamic path = rolling restart, gated on under-replicated partitions returning to zero between brokers.</figcaption>
+<div class="legend"><span class="sw cat-client"></span> operator intent · <span class="sw cat-control"></span> classify/route · <span class="sw cat-storage"></span> apply via metadata · <span class="sw cat-coord"></span> verify/wait · <span class="sw cat-error"></span> restart-required path · <span class="arr"></span> step · <span class="arr dashed"></span> async</div></figure>
+
+<div class="callout key"><span class="callout-title">Operator rules of thumb for configuration</span><p>(1) <strong>Read the default in source before you override it</strong> — the <code>.define()</code> argument is truth. (2) <strong>Prefer topic-level overrides to broker-wide changes</strong>; they are surgical and dynamic. (3) <strong>After any live change, reconcile <code>server.properties</code></strong> so the file and the metadata log agree. (4) <strong>Treat RF and partition count as create-time, near-immutable</strong> for keyed topics — get them right up front, lean on <code>kafka-reassign-partitions</code> only for placement, not count. (5) <strong>A dynamic update either fully applies or fully aborts</strong> (<code>processReconfiguration</code>), so a rejected value never leaves you half-configured — but it <em>will</em> surface as a <code>ConfigException</code> you must read. (6) <strong>When a cluster-wide change doesn't land on one broker, look for a stale per-broker override</strong> shadowing it.</p></div>
+
+<p>From here, <a href="02-limits.html">II · 02 · Limits</a> takes the HARD/SOFT/EMERGENT framing into the concrete ceilings (partition counts, request sizes, connection limits); <a href="03-partitioning.html">II · 03 · Partitioning</a> handles the one config you can't easily undo; and <a href="06-durability.html">II · 06 · Durability</a> turns the durability triad above into a full guarantee model. Everything in this manual ultimately routes back through this tuning surface.</p>

@@ -1,0 +1,411 @@
+<h1>10 · KRaft Consensus (Raft)</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">KRaft is Kafka's hand-rolled implementation of the Raft consensus algorithm, used to replicate the cluster's metadata log across a quorum of controllers. Its centerpiece, <code>KafkaRaftClient</code>, is a single-threaded, non-blocking event loop that drives a precise state machine through the roles <em>Unattached</em>, <em>Voted</em>, <em>Prospective</em>, <em>Candidate</em>, <em>Follower</em>, <em>Leader</em> and <em>Resigned</em>. Unlike textbook Raft, replication is <strong>pull-based</strong>: followers and observers issue <code>Fetch</code> requests to the leader, which never pushes data. This chapter dissects the poll loop, leader election (with KIP-996 pre-vote), the persisted quorum-state file, the high-watermark commit rule, snapshots (KIP-630), and dynamic quorum reconfiguration (KIP-853), all grounded in the <code>raft/</code> module source.</p>
+
+<h2>Role &amp; responsibilities</h2>
+
+<p>KRaft replaces ZooKeeper (removed entirely since 4.0) as the system of record for cluster metadata. A small set of <strong>controllers</strong> form a <em>voter</em> quorum that runs Raft over a single topic partition, <code>__cluster_metadata-0</code>. The Raft library here is generic over a record type <code>T</code> (<code>KafkaRaftClient&lt;T&gt;</code> implements <code>RaftClient&lt;T&gt;</code>); the controller plugs in its own <code>RecordSerde</code> and a <code>RaftClient.Listener</code> to receive committed batches. See <a href="11-kraft-controller.html">The KRaft Controller</a> for the state machine that consumes this log and <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a> for how brokers (as <em>observers</em>) replicate it.</p>
+
+<p>The class header itself frames the design (<code>raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java:129</code>): <em>"Leader election is more or less pure Raft, but replication is driven by replica fetching and we use Kafka's log reconciliation protocol to truncate the log to a common point following each leader election."</em> KRaft reuses Kafka's existing log/segment storage, record-batch format, and Fetch RPC, layering Raft semantics on top.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Voters take part in elections and are the only nodes eligible to handle Vote/BeginQuorumEpoch/EndQuorumEpoch requests. Observers (brokers, and controllers being added) never vote; they only fetch. Whether a node is a voter is not a static flag but is derived continuously from the latest <code>VoterSet</code> in the replicated log (<code>QuorumState.isVoter()</code>, <code>QuorumState.java:332</code>).</p></div>
+
+<h2>Where it lives in the code</h2>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Concern</th><th>Class</th><th>File</th></tr></thead>
+<tbody>
+<tr><td>Event-loop Raft state machine</td><td><code>KafkaRaftClient&lt;T&gt;</code></td><td><code>raft/.../raft/KafkaRaftClient.java</code></td></tr>
+<tr><td>Single-threaded driver (the IO thread)</td><td><code>KafkaRaftClientDriver&lt;T&gt;</code></td><td><code>raft/.../raft/KafkaRaftClientDriver.java</code></td></tr>
+<tr><td>Role/epoch state &amp; transition rules</td><td><code>QuorumState</code></td><td><code>raft/.../raft/QuorumState.java</code></td></tr>
+<tr><td>Per-role state objects</td><td><code>EpochState</code> impls: <code>UnattachedState</code>, <code>ProspectiveState</code>, <code>CandidateState</code>, <code>FollowerState</code>, <code>LeaderState&lt;T&gt;</code>, <code>ResignedState</code></td><td><code>raft/.../raft/*State.java</code></td></tr>
+<tr><td>Election vote tally</td><td><code>EpochElection</code> (+ <code>NomineeState</code>)</td><td><code>raft/.../raft/internals/EpochElection.java</code></td></tr>
+<tr><td>Voter membership</td><td><code>VoterSet</code>, <code>ReplicaKey</code>, <code>Endpoints</code></td><td><code>raft/.../raft/VoterSet.java</code></td></tr>
+<tr><td>Persisted election state</td><td><code>FileQuorumStateStore</code>, <code>ElectionState</code></td><td><code>raft/.../raft/FileQuorumStateStore.java</code></td></tr>
+<tr><td>Leader batch building</td><td><code>BatchAccumulator&lt;T&gt;</code>, <code>BatchBuilder&lt;T&gt;</code></td><td><code>raft/.../raft/internals/BatchAccumulator.java</code></td></tr>
+<tr><td>Control-record tracking (voters, kraft.version)</td><td><code>KRaftControlRecordStateMachine</code>, <code>VoterSetHistory</code></td><td><code>raft/.../raft/internals/KRaftControlRecordStateMachine.java</code></td></tr>
+<tr><td>Connection backoff &amp; in-flight tracking</td><td><code>RequestManager</code></td><td><code>raft/.../raft/RequestManager.java</code></td></tr>
+<tr><td>Snapshots (file naming, read/write)</td><td><code>Snapshots</code>, <code>RecordsSnapshotWriter</code>, <code>FileRawSnapshotReader</code></td><td><code>raft/.../snapshot/*.java</code></td></tr>
+<tr><td>Log over segment storage</td><td><code>KafkaRaftLog</code> (implements <code>RaftLog</code>)</td><td><code>raft/.../raft/internals/KafkaRaftLog.java</code></td></tr>
+<tr><td>Reconfiguration handlers</td><td><code>AddVoterHandler</code>, <code>RemoveVoterHandler</code>, <code>UpdateVoterHandler</code></td><td><code>raft/.../raft/internals/*VoterHandler.java</code></td></tr>
+<tr><td>Configuration</td><td><code>QuorumConfig</code></td><td><code>raft/.../raft/QuorumConfig.java</code></td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+
+<dl class="kv">
+<dt>Voter vs Observer</dt><dd>A voter participates in elections and quorum commit; an observer only fetches. Membership comes from the latest <code>VoterSet</code>. Brokers are always observers; controllers are normally voters.</dd>
+<dt>Epoch</dt><dd>The Raft term — a monotonically increasing integer. Each election bumps the epoch by exactly one (<code>QuorumState.transitionToCandidate()</code>, <code>QuorumState.java:641</code>: <code>int newEpoch = epoch() + 1</code>). Records are uniquely identified by (offset, epoch).</dd>
+<dt>ReplicaKey</dt><dd>A pair of <code>id</code> (int) and an optional directory <code>Uuid</code> (the node's log directory). KIP-853 added directory ids so that a re-formatted node with the same broker id is treated as a distinct voter.</dd>
+<dt>High watermark (HWM)</dt><dd>The largest offset replicated to a majority of voters; the commit point. Exposed via <code>RaftClient.highWatermark()</code>.</dd>
+<dt>Leader endpoints</dt><dd>The advertised listener addresses of the current leader, carried in RPC responses so observers and unattached voters can discover where to fetch.</dd>
+<dt>kraft.version</dt><dd>A feature level: <code>KRAFT_VERSION_0</code> (static voters, no reconfiguration) or <code>KRAFT_VERSION_1</code> (dynamic quorums). <code>isReconfigSupported()</code> returns true for v1+ (<code>server-common/.../KRaftVersion.java:59</code>).</dd>
+<dt>Bootstrap snapshot</dt><dd>The synthetic snapshot id <code>(offset=0, epoch=0)</code> (<code>BOOTSTRAP_SNAPSHOT_ID</code>, <code>Snapshots.java:49</code>) used to seed initial cluster state; it is never replicated over the wire.</dd>
+</dl>
+
+<h2>Data structures</h2>
+
+<h3>In-memory: the role objects</h3>
+
+<p>All six role classes implement <code>EpochState</code>; the current one is held in a single <code>volatile EpochState state</code> field inside <code>QuorumState</code> (<code>QuorumState.java:99</code>). Each role carries the data relevant to it:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Role</th><th>Key fields</th><th>Timer</th></tr></thead>
+<tbody>
+<tr><td><code>UnattachedState</code></td><td><code>epoch</code>, <code>OptionalInt leaderId</code>, <code>Optional&lt;ReplicaKey&gt; votedKey</code>, voter id set, HWM</td><td>election timer</td></tr>
+<tr><td><code>ProspectiveState</code></td><td>as Unattached + <code>VoterSet voters</code>, <code>EpochElection epochElection</code> (pre-vote tally)</td><td>election timer</td></tr>
+<tr><td><code>CandidateState</code></td><td><code>localId</code>, <code>localDirectoryId</code>, <code>epoch</code>, <code>EpochElection epochElection</code></td><td>election timer</td></tr>
+<tr><td><code>FollowerState</code></td><td><code>epoch</code>, <code>leaderId</code>, <code>Endpoints leaderEndpoints</code>, <code>votedKey</code>, HWM, <code>hasFetchedFromLeader</code>, <code>fetchingSnapshot</code></td><td>fetch timer, update-voter-set timer</td></tr>
+<tr><td><code>LeaderState&lt;T&gt;</code></td><td><code>epoch</code>, <code>epochStartOffset</code>, <code>grantingVoters</code>, per-replica <code>ReplicaState</code> map, <code>BatchAccumulator</code>, HWM</td><td>check-quorum timer, begin-quorum-epoch timer</td></tr>
+<tr><td><code>ResignedState</code></td><td><code>localId</code>, <code>epoch</code>, <code>unackedVoters</code>, <code>preferredSuccessors</code></td><td>election timer</td></tr>
+</tbody>
+</table></div>
+
+<p>Notably there is no separate <code>VotedState</code> class. A binding vote is represented as an <code>UnattachedState</code> (or <code>ProspectiveState</code>) carrying a non-empty <code>votedKey</code> (see <code>QuorumState.unattachedAddVotedState()</code>, <code>QuorumState.java:428</code> and <code>isUnattachedAndVoted()</code>, <code>QuorumState.java:850</code>). The "Voted" role in the protocol is thus Unattached-with-a-vote.</p>
+
+<p>The leader's per-replica view is <code>LeaderState.ReplicaState</code> (<code>LeaderState.java:978</code>): <code>replicaKey</code>, <code>Endpoints listeners</code>, <code>Optional&lt;LogOffsetMetadata&gt; endOffset</code>, <code>lastFetchTimestamp</code>, <code>lastFetchLeaderLogEndOffset</code>, <code>lastCaughtUpTimestamp</code>, and <code>hasAcknowledgedLeader</code>. <code>ReplicaState</code> is <code>Comparable</code>, sorted by descending end offset — this is how the leader finds the majority offset for the HWM.</p>
+
+<h3>Persistent: the quorum-state file</h3>
+
+<p>Election state survives restarts in a small JSON file named <code>quorum-state</code> (<code>FileQuorumStateStore.DEFAULT_FILE_NAME</code>, <code>FileQuorumStateStore.java:80</code>) inside the metadata log directory. Its schema is <code>QuorumStateData</code> (<code>raft/src/main/resources/common/message/QuorumStateData.json</code>), with a <code>data_version</code> field appended for forward-compat. The version is tied to <code>kraft.version</code> via <code>KRaftVersion.quorumStateVersion()</code>.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Versions</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>ClusterId</code></td><td>string</td><td>0 only</td><td>Cluster id (dropped in v1)</td></tr>
+<tr><td><code>LeaderId</code></td><td>int32</td><td>0+</td><td>Elected leader id, default -1</td></tr>
+<tr><td><code>LeaderEpoch</code></td><td>int32</td><td>0+</td><td>Current epoch, default -1</td></tr>
+<tr><td><code>VotedId</code></td><td>int32</td><td>0+</td><td>Id this replica voted for, -1 if none</td></tr>
+<tr><td><code>VotedDirectoryId</code></td><td>uuid</td><td>1+</td><td>Directory id of the candidate voted for (KIP-853)</td></tr>
+<tr><td><code>AppliedOffset</code></td><td>int64</td><td>0 only</td><td>Legacy; unused in v1</td></tr>
+<tr><td><code>CurrentVoters</code></td><td>[]Voter</td><td>0 only</td><td>Legacy static voter list; v1 stores voters in the log instead</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>The quorum-state file is written <strong>before</strong> the in-memory transition takes effect (<code>QuorumState.durableTransitionTo()</code>, <code>QuorumState.java:729</code>): it calls <code>store.writeElectionState(...)</code> then <code>memoryTransitionTo(...)</code>. The write is durable — <code>FileQuorumStateStore</code> writes to a <code>.tmp</code> file, calls <code>fileOutputStream.getFD().sync()</code>, then atomically renames (<code>FileQuorumStateStore.java:181-183</code>). This guarantees that once a replica has voted (or become a candidate at epoch N), that fact cannot be lost across a crash, preserving "at most one vote per epoch".</p></div>
+
+<p>Note the Resigned and Prospective states do <em>not</em> trigger a durable write: <code>transitionToResigned</code> and <code>transitionToProspective</code> use <code>memoryTransitionTo</code> directly (<code>QuorumState.java:358</code>, <code>:622</code>), because Resigned does not change the persisted <code>ElectionState</code> and Prospective is a pre-vote phase that has not yet bumped the epoch.</p>
+
+<h3>On-wire: voter membership records</h3>
+
+<p>Under kraft.version 1, the voter set lives <em>in the log</em> as control records, not in the quorum file. The <code>VotersRecord</code> (<code>clients/.../message/VotersRecord.json</code>) carries, per voter: <code>VoterId</code>, <code>VoterDirectoryId</code> (uuid), a list of <code>Endpoints</code> (name/host/port), and a <code>KRaftVersionFeature</code> range (min/max supported version). A companion <code>KRaftVersionRecord</code> records the finalized feature level. These are read back by <code>KRaftControlRecordStateMachine.handleBatch()</code> (<code>KRaftControlRecordStateMachine.java:301</code>).</p>
+
+<h2>Architecture &amp; control/data flow</h2>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">Inbound RPCs</span><span class="nd">network threads</span></div>
+  <div class="conn dashed ec-async" data-label="enqueue + own responses"></div>
+  <div class="node cat-coord store"><span class="nt">BlockingMessageQueue</span><span class="nd">LinkedBlockingQueue · inbound concurrency boundary</span></div>
+  <div class="conn" data-label="poll(timeoutMs)"></div>
+  <div class="node cat-broker"><span class="nt">KafkaRaftClientDriver</span><span class="nd">kafka-raft-io-thread · loop: client.poll()</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">1 · maybeCompleteShutdown</span><span class="nd">KafkaRaftClient.poll()</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">2 · pollCurrentState</span><span class="nd">pollLeader / pollFollower / pollCandidate …</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">3 · snapshotCleaner.maybeClean</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">4 · messageQueue.poll(timeout)</span><span class="nd">→ handleInboundMessage</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">5 · pollListeners</span><span class="nd">handleCommit / handleLeaderChange / snapshot</span></div>
+  <div class="row">
+    <div class="col"><div class="conn ec-data" data-label="outbound via NetworkChannel"></div><div class="node cat-control"><span class="nt">Remote voters / leader</span></div></div>
+    <div class="col"><div class="conn ec-data" data-label="committed records"></div><div class="node cat-storage"><span class="nt">RaftClient.Listener</span><span class="nd">controller / broker state machine</span></div></div>
+  </div>
+</div><figcaption>The single-threaded poll loop. All Raft state is mutated only on the <code>kafka-raft-io-thread</code>; the message queue is the sole inbound concurrency boundary. Step 2 emits outbound RPCs; step 5 delivers committed records to the listener.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker / IO-thread component</span>
+  <span class="lgi"><span class="sw cat-coord"></span>queue · waiting boundary</span>
+  <span class="lgi"><span class="sw cat-control"></span>remote quorum peer</span>
+  <span class="lgi"><span class="sw cat-storage"></span>state-machine listener</span>
+  <span class="lgi"><span class="sw cat-coord round"></span>cylinder = queue / store</span>
+  <span class="lgi"><span class="arr"></span>poll step / data flow</span>
+  <span class="lgi"><span class="arr dashed"></span>async hand-off across threads</span>
+  <span class="lgi"><span class="mono">label</span> = action on the edge</span>
+</div></figure>
+
+<p>The driver is a <code>ShutdownableThread</code> whose name is <code>threadNamePrefix + "-io-thread"</code> (<code>KafkaRaftClientDriver.java:55</code>); the default prefix is <code>kafka-raft</code> (<code>core/.../KafkaRaftManager.scala:104</code>), giving the thread name <code>kafka-raft-io-thread</code>. Its <code>doWork()</code> simply calls <code>client.poll()</code> in a loop; any uncaught exception is routed to a fatal <code>FaultHandler</code> (<code>KafkaRaftClientDriver.java:62-67</code>), which typically halts the process.</p>
+
+<h3>The pull-based replication contrast</h3>
+
+<figure class="diagram"><div class="dseq" style="--cols:2">
+  <div class="lanes"><span class="actor cat-control">Leader</span><span class="actor cat-control">Follower</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">AppendEntries(records)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">ack</span><span class="ln"></span></div>
+    <div class="m r dashed ec-async" style="--from:1;--to:2"><span class="ml">heartbeats — assert leadership</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>Classic Raft (push). The leader drives replication: it sends <code>AppendEntries</code> to followers and uses empty AppendEntries as periodic heartbeats to assert leadership.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>Raft voter (leader / follower)</span>
+  <span class="lgi"><span class="arr"></span>request / records</span>
+  <span class="lgi"><span class="arr dashed"></span>ack · periodic heartbeat</span>
+  <span class="lgi">arrow points <span class="mono">from → to</span> over time (top → bottom)</span>
+</div></figure>
+
+<figure class="diagram"><div class="dseq" style="--cols:2">
+  <div class="lanes"><span class="actor cat-control">Follower</span><span class="actor cat-control">Leader</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">Fetch(offset, epoch)</span><span class="ln"></span></div>
+    <div class="m l" style="--from:2;--to:1"><span class="ml">records + HWM + leaderEpoch</span><span class="ln"></span></div>
+    <div class="m l dashed ec-async" style="--from:2;--to:1"><span class="ml">BeginQuorumEpoch — once per epoch, announces leader</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>KRaft (pull) inverts the data direction: the leader pushes nothing and only answers <code>Fetch</code>. <code>BeginQuorumEpoch</code> substitutes for the empty-AppendEntries heartbeat, announcing a new leader once per epoch.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw cat-control"></span>Raft voter (leader / follower)</span>
+  <span class="lgi"><span class="arr"></span>Fetch request / fetch response</span>
+  <span class="lgi"><span class="arr dashed"></span>leader announcement (BeginQuorumEpoch)</span>
+  <span class="lgi">arrow points <span class="mono">from → to</span> over time (top → bottom)</span>
+</div></figure>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Reusing Kafka's <code>Fetch</code> path lets the metadata quorum share the broker's mature replication machinery (log segments, batch format, zero-copy sends, fetch purgatory). Because the leader never pushes, it needs a separate way to announce itself after an election — hence <code>BeginQuorumEpoch</code> (<code>KafkaRaftClient.java:144</code>). The overall protocol is KIP-595 ("A Raft Protocol for the Metadata Quorum"); pull-based fetch and log reconciliation are its defining deviations from Diego Ongaro's Raft.</p></div>
+
+<h2>The state machine in detail</h2>
+
+<figure class="diagram"><div class="dstate v">
+  <span class="term"></span>
+  <span class="tr"><span class="tl">initialize</span><span class="ta"></span></span>
+  <span class="st">Unattached</span>
+  <span class="tr"><span class="tl">election timeout</span><span class="ta"></span></span>
+  <span class="st">Prospective</span>
+  <span class="tr"><span class="tl">majority PreVotes granted (epoch++)</span><span class="ta"></span></span>
+  <span class="st">Candidate</span>
+  <span class="tr"><span class="tl">majority votes granted</span><span class="ta"></span></span>
+  <span class="st accent">Leader</span>
+  <span class="tr"><span class="tl">graceful shutdown</span><span class="ta"></span></span>
+  <span class="st warn">Resigned</span>
+  <span class="tr"><span class="tl">election timeout (epoch++) → Unattached</span><span class="ta"></span></span>
+  <div class="note"><strong>Branch transitions</strong> (off the main spine):
+    <br>· <span class="mono">Unattached → Follower</span> — a leader with ≥ epoch and a known endpoint is learned
+    <br>· <span class="mono">Prospective → Follower</span> — PreVote lost but a last-known leader exists
+    <br>· <span class="mono">Prospective → Unattached</span> — PreVote lost and no leader is known
+    <br>· <span class="mono">Candidate → Prospective</span> — election loss or timeout
+    <br>· <span class="mono">Follower → Prospective</span> — fetch timeout
+  </div>
+  <div class="note"><strong>Cross-cutting rules.</strong> Any role steps back to <span class="mono">Unattached</span> (or <span class="mono">Follower</span>) on learning a higher epoch. A <span class="mono">Resigned</span> leader sends <code>EndQuorumEpoch</code> to voters. Observers use only <span class="mono">Unattached ⇄ Follower</span>.</div>
+</div><figcaption>Voter state machine (simplified). The vertical spine is a voter's election happy-path; branch transitions and the higher-epoch fallback are noted below it. Full rules: <code>QuorumState.java:35-83</code>.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw round"></span>pill = Raft role / state</span>
+  <span class="lgi"><span class="sw cat-storage round"></span>accent = Leader</span>
+  <span class="lgi"><span class="sw cat-error round"></span>warn = Resigned (stepping down)</span>
+  <span class="lgi">◉ = initial state (after <code>initialize()</code>)</span>
+  <span class="lgi"><span class="arr"></span>transition (label = trigger)</span>
+  <span class="lgi"><span class="mono">A → B</span> = off-spine transition (see notes)</span>
+</div></figure>
+
+<h3>Initialization</h3>
+
+<p><code>QuorumState.initialize()</code> (<code>QuorumState.java:141</code>) reads the persisted <code>ElectionState</code> and reconstructs a starting role:</p>
+<ul>
+<li>If the stored epoch is <em>below</em> the log's last epoch, the file is stale → start <code>Unattached</code> at the log's epoch.</li>
+<li>If we were the leader → start <code>Resigned</code> in the same epoch. This is deliberate (<code>QuorumState.java:173-189</code>): it prevents voting for someone else in that epoch and protects the (offset, epoch) uniqueness invariant if unflushed data was lost.</li>
+<li>If we were a voted candidate for ourselves → start <code>Candidate</code>.</li>
+<li>If a leader is known and its endpoints are in the voter set → start <code>Follower</code>; otherwise start <code>Unattached</code> (we cannot fetch without an endpoint) and discover the leader via Fetch-to-bootstrap or an inbound BeginQuorumEpoch.</li>
+</ul>
+<p><code>KafkaRaftClient.initialize()</code> then short-circuits: a single-voter quorum becomes leader immediately by going Prospective→Candidate→Leader (<code>KafkaRaftClient.java:567-571</code>).</p>
+
+<h3>Pre-Vote and the Prospective role (KIP-996)</h3>
+
+<p>When a voter's fetch timeout expires, it does <strong>not</strong> immediately bump the epoch and become a candidate. Instead it transitions to <code>Prospective</code> (<code>pollFollowerAsVoter</code> → <code>transitionToProspective</code>, <code>KafkaRaftClient.java:3326-3328</code>) and sends <code>Vote</code> requests with <code>PreVote=true</code> at the <em>current</em> epoch. The vote request schema added this field at version 2 (<code>VoteRequest.json:51</code>; comment at <code>VoteRequest.json:22</code>: "Version 2 adds PreVote field and renames candidate to replica").</p>
+
+<p>A pre-vote is granted only if the prospective's log is up-to-date (<code>ProspectiveState.canGrantVote</code> → <code>unattachedOrProspectiveCanGrantVote</code>, <code>QuorumState.java:886</code>), and crucially a follower will grant a pre-vote <em>even though it has a leader</em> as long as it has not yet successfully fetched from that leader (<code>FollowerState.canGrantVote</code>, <code>FollowerState.java:228-231</code>: <code>isPreVote &amp;&amp; !hasFetchedFromLeader &amp;&amp; isLogUpToDate</code>). Only when a majority grant the pre-vote does the prospective call <code>transitionToCandidate</code>, bumping the epoch (<code>maybeTransitionToCandidate</code>, <code>KafkaRaftClient.java:688</code>). On pre-vote loss/timeout it falls back to Follower (if a leader is known with endpoints) or Unattached (<code>prospectiveTransitionAfterElectionLoss</code>, <code>KafkaRaftClient.java:3277</code>).</p>
+
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Pre-vote (KIP-996) prevents a partitioned or bouncing voter from repeatedly incrementing the epoch and disrupting a healthy leader. The candidate canvasses for support at the current epoch before committing to a disruptive epoch bump. KIP-853 reuses the same PreVote flag to fence a removed voter from forcing elections. If any voter responds <code>UNSUPPORTED_VERSION</code> to a pre-vote (i.e. doesn't understand PreVote), the prospective falls back to a real candidacy immediately (<code>handleVoteResponse</code>, <code>KafkaRaftClient.java:954-961</code>).</p></div>
+
+<h3>Vote tallying</h3>
+
+<p><code>EpochElection</code> (<code>EpochElection.java</code>) tracks each voter as <code>UNRECORDED</code>/<code>GRANTED</code>/<code>REJECTED</code>. The local node records a grant for itself on construction (e.g. <code>CandidateState.java:77</code>). <code>isVoteGranted()</code> is <code>numGranted &gt;= majoritySize</code> where <code>majoritySize = voterStates.size()/2 + 1</code>; <code>isVoteRejected()</code> short-circuits the election when <code>numGranted + numUnrecorded &lt; majoritySize</code> — i.e. winning is already impossible (<code>EpochElection.java:85-97</code>). On each response, <code>handleVoteResponse</code> records the grant/reject and calls <code>maybeTransitionForward</code> (Prospective→Candidate or Candidate→Leader) or <code>maybeHandleElectionLoss</code> (<code>KafkaRaftClient.java:1006-1014</code>).</p>
+
+<h3>Vote granting rules (handleVoteRequest)</h3>
+
+<p>For an incoming <code>Vote</code> (<code>handleVoteRequest</code>, <code>KafkaRaftClient.java:829</code>):</p>
+<ol>
+<li>Validate cluster id, topic-partition, and epoch sanity. For a standard vote, the request's epoch must exceed the log's last epoch (<code>lastEpoch &gt;= replicaEpoch</code> is illegal); for pre-vote, <code>lastEpoch &gt; replicaEpoch</code> is illegal (<code>KafkaRaftClient.java:861</code>).</li>
+<li>If <code>replicaEpoch &gt; quorum.epoch()</code> and it is a standard vote, transition to Unattached at the new epoch first (<code>KafkaRaftClient.java:890</code>).</li>
+<li>Verify the request's voter key matches the local replica key (id + directory id) → else <code>INVALID_VOTER_KEY</code>.</li>
+<li>Grant only if the candidate's log is at least as up-to-date: <code>lastEpochEndOffsetAndEpoch.compareTo(endOffset()) &gt;= 0</code> (<code>KafkaRaftClient.java:919-923</code>).</li>
+<li>For a granted <em>standard</em> vote, persist the vote by transitioning to Unattached/Prospective with the candidate's key (<code>unattachedAddVotedState</code> / <code>prospectiveAddVotedState</code>).</li>
+</ol>
+
+<h3>The pull-based commit: how the leader advances the HWM</h3>
+
+<p>The leader holds a <code>ReplicaState</code> per voter. On each Fetch from a follower, <code>updateReplicaState</code> records the follower's fetch offset and timestamp (<code>LeaderState.java:846</code>), then <code>maybeUpdateHighWatermark</code> (<code>LeaderState.java:727</code>):</p>
+<ol>
+<li>Sort all voter <code>ReplicaState</code> by descending end offset.</li>
+<li>Take the element at index <code>voterStates.size()/2</code> — the offset that a majority (including the leader, which counts itself) has reached.</li>
+<li>Apply the <strong>leader-epoch commit restriction</strong>: only advance the HWM past <code>epochStartOffset</code>, i.e. the leader must have committed at least one record from <em>its own</em> epoch before exposing any earlier-epoch records (<code>LeaderState.java:747</code>).</li>
+<li>The HWM is monotonic; a computed value below the current HWM is logged and ignored (it can only legitimately drop on a voter-set change), guarding against committed-data loss (<code>LeaderState.java:762-768</code>).</li>
+</ol>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A freshly-elected leader does <em>not</em> inherit the previous HWM (<code>QuorumState.transitionToLeader</code> comment, <code>QuorumState.java:699-708</code>). To advance the global HWM it must replicate a record from its new epoch to a majority. To force this without waiting for client writes, <code>onBecomeLeader</code> immediately appends a <code>LeaderChange</code> control record via <code>appendStartOfEpochControlRecords</code> (<code>KafkaRaftClient.java:667</code>, <code>LeaderState.java:392</code>).</p></div>
+
+<h3>The leader batch pipeline</h3>
+
+<p>Client appends (from the controller) enter via <code>RaftClient.prepareAppend</code> → <code>append</code> (<code>KafkaRaftClient.java:3697</code>), which writes into the <code>LeaderState</code>'s <code>BatchAccumulator</code>. The accumulator coalesces records into batches under an <code>appendLock</code> (<code>ReentrantLock</code>), bounded by <code>MAX_BATCH_SIZE_BYTES = 8 MiB</code> and <code>MAX_NUMBER_OF_BATCHES = 10</code> (<code>KafkaRaftClient.java:170-173</code>). A linger timer (default <code>controller.quorum.append.linger.ms = 25</code>) is tracked with an <code>AtomicLong</code> so the IO thread can read the deadline without locking (<code>BatchAccumulator.SimpleTimer</code>, <code>BatchAccumulator.java:629</code>).</p>
+
+<p>On the next poll, <code>pollLeader</code> → <code>maybeAppendBatches</code> drains ready batches, appends them to the log as leader, parks each in the <code>appendPurgatory</code> awaiting commit, then <code>flushLeaderLog</code> updates the end offset and fsyncs (<code>KafkaRaftClient.java:3082-3107</code>). When the HWM later crosses a batch's last offset, the purgatory completes and the listener is notified (<code>onUpdateLeaderHighWatermark</code> → <code>appendPurgatory.maybeComplete</code>, <code>KafkaRaftClient.java:383</code>). The leader optimizes by routing the in-memory record objects straight to its own listener rather than re-reading from disk (<code>ListenerContext.fireHandleCommit(...)</code> overload, <code>KafkaRaftClient.java:4073</code>).</p>
+
+<h3>The follower fetch loop &amp; log reconciliation</h3>
+
+<p>A follower builds a <code>Fetch</code> request carrying its log end offset, last fetched epoch, the current leader epoch, its directory id, and its current HWM (<code>buildFetchRequest</code>, <code>KafkaRaftClient.java:2985</code>). The leader validates the (fetchOffset, lastFetchedEpoch) against its log (<code>validateOffsetAndEpoch</code>). Three outcomes drive reconciliation in <code>handleFetchResponse</code> (<code>KafkaRaftClient.java:1689</code>):</p>
+<ul>
+<li><strong>Diverging epoch</strong>: the leader returns a <code>divergingEpoch</code> (epoch, endOffset). The follower truncates to that point — <code>log.truncateToEndOffset</code> — but never below its own HWM (a violation throws <code>KafkaException</code>), then re-fetches (<code>KafkaRaftClient.java:1742-1764</code>).</li>
+<li><strong>Snapshot id</strong>: the follower's offset is below the leader's log start; the leader returns a <code>snapshotId</code> and the follower switches to FetchSnapshot (<code>KafkaRaftClient.java:1765-1807</code>).</li>
+<li><strong>Records</strong>: appended via <code>appendAsFollower</code>, which writes to the log, fsyncs if the node is (or can become) a voter, updates the control-record state machine, and advances the follower HWM to <code>min(LEO, leaderHWM)</code> (<code>KafkaRaftClient.java:1808-1814</code>, <code>updateFollowerHighWatermark</code>, <code>KafkaRaftClient.java:341</code>).</li>
+</ul>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>There is at most one in-flight Fetch per follower for its LEO. <code>RequestManager</code> tracks a single in-flight correlation id per connection and <code>maybeSendFetchToBestNode</code> only sends when <code>!hasAnyInflightRequest</code> (<code>KafkaRaftClient.java:3410</code>). Two concurrent Fetches could cause the follower to append the same offset twice — the comment at <code>RequestManager.java:66-68</code> spells this out.</p></div>
+
+<h3>BeginQuorumEpoch &amp; EndQuorumEpoch</h3>
+
+<p>After winning, the leader periodically sends <code>BeginQuorumEpoch</code> to voters that haven't fetched recently (<code>maybeSendBeginQuorumEpochRequests</code>, interval <code>fetchTimeoutMs/2</code>, <code>LeaderState.java:156</code>). It retries until each voter acknowledges (<code>addAcknowledgementFrom</code>) or a new election occurs. This is how a voter that was Unattached (because it didn't know the leader's endpoint) discovers and follows the new leader (<code>maybeTransition</code>, <code>KafkaRaftClient.java:2691</code>).</p>
+
+<p>On graceful shutdown or forced resignation, the leader transitions to <code>Resigned</code> and sends <code>EndQuorumEpoch</code> to all voters (<code>pollResigned</code>, <code>KafkaRaftClient.java:3141</code>). The request includes a <em>preferred successors</em> list ordered by descending fetch offset (<code>nonLeaderVotersByDescendingFetchOffset</code>). A receiving follower shortens its fetch timeout using a strict-exponential backoff keyed on its position in that list, so the most caught-up voter is most likely to win the next election quickly (<code>endEpochElectionBackoff</code> / <code>strictExponentialElectionBackoffMs</code>, <code>KafkaRaftClient.java:1320</code>, <code>:1058</code>).</p>
+
+<h2>Snapshots (KIP-630)</h2>
+
+<p>Because the metadata log would grow unbounded, KRaft periodically snapshots state and truncates the log prefix. Snapshot files are named <code>&lt;20-digit-offset&gt;-&lt;10-digit-epoch&gt;.checkpoint</code> (<code>Snapshots.filenameFromSnapshotId</code>, <code>Snapshots.java:63</code>), e.g. <code>00000000000000001234-0000000007.checkpoint</code>, living alongside the log segments. Partial downloads use <code>.checkpoint.part</code>; pending deletions use <code>.checkpoint.deleted</code> (<code>Snapshots.java:40-41</code>).</p>
+
+<figure class="diagram"><div class="bytemap">
+  <div class="bf" style="--w:5"><span class="bf-name">SnapshotHeaderRecord</span><span class="bf-meta">control batch · lastContainedLogTime</span></div>
+  <div class="bf" style="--w:5"><span class="bf-name">KRaftVersionRecord</span><span class="bf-meta">control batch · finalized kraft.version (v1+)</span></div>
+  <div class="bf" style="--w:5"><span class="bf-name">VotersRecord</span><span class="bf-meta">control batch · voter set at snapshot (v1+)</span></div>
+  <div class="bf" style="--w:10"><span class="bf-name">state-machine records</span><span class="bf-meta">data batches · serialized state</span></div>
+  <div class="bf" style="--w:5"><span class="bf-name">SnapshotFooterRecord</span><span class="bf-meta">control batch</span></div>
+</div>
+<figcaption>Snapshot file <code>&lt;offset&gt;-&lt;epoch&gt;.checkpoint</code>, in batch order. Identified by snapshotId = (endOffset, epoch); covers offsets [0, endOffset). The KRaftVersion and Voters batches are written only when kraft.version 1 (reconfiguration) is supported. Built by <code>RecordsSnapshotWriter</code>; voters/version are sourced from <code>KRaftControlRecordStateMachine</code> at the snapshot's last contained offset.</figcaption><div class="legend">
+  <span class="lgi"><span class="sw"></span>each cell = one record batch (left → right = on-disk order)</span>
+  <span class="lgi"><span class="mono">bold</span> = record / batch name</span>
+  <span class="lgi">small text = batch kind &amp; what it carries</span>
+  <span class="lgi">cell width ∝ relative footprint (data batches dominate)</span>
+  <span class="lgi">colour distinguishes adjacent batches only — not a semantic category</span>
+</div></figure>
+
+<p><strong>Generating</strong>: a state-machine client calls <code>RaftClient.createSnapshot(snapshotId, lastContainedLogTimestamp)</code> (<code>KafkaRaftClient.java:3798</code>). The writer is wrapped in a <code>NotifyingRawSnapshotWriter</code> whose freeze callback trims the in-memory control-record history (<code>partitionState.truncateOldEntries</code>). The voter set and kraft.version embedded come from <code>voterSetAtOffset</code>/<code>kraftVersionAtOffset</code> at <code>snapshotId.offset() - 1</code> (<code>KafkaRaftClient.java:3821-3822</code>).</p>
+
+<p><strong>Fetching</strong>: when a lagging follower is told to fetch a snapshot, it issues <code>FetchSnapshot</code> requests carrying the <code>SnapshotId</code> and a byte <code>Position</code> (<code>FetchSnapshotRequest.json:41-50</code>); the leader replies with a slice of the file as <code>UnalignedRecords</code> (records are not offset-aligned). The follower appends slices until <code>sizeInBytes == size</code>, freezes the snapshot, then fully truncates its log to the snapshot via <code>log.truncateToLatestSnapshot()</code> and reloads control-record state (<code>handleFetchSnapshotResponse</code>, <code>KafkaRaftClient.java:2181-2210</code>).</p>
+
+<p><strong>Loading on startup</strong>: <code>KRaftControlRecordStateMachine.updateState()</code> reads the latest snapshot first, then replays log batches up to the LEO (<code>KRaftControlRecordStateMachine.java:116</code>, <code>:259</code>), maintaining the invariant that this listener has always read to the LEO (described at <code>KafkaRaftClient.java:202-213</code>).</p>
+
+<p><strong>Retention &amp; cleaning</strong>: a timer-driven <code>RaftMetadataLogCleanerManager</code> calls <code>log.maybeClean()</code> every 60 s (<code>KafkaRaftClient.java:314</code>). <code>KafkaRaftLog.maybeClean</code> deletes old snapshots/segments by retention size then retention time, but always keeps at least one snapshot and respects segment invariants (<code>KafkaRaftLog.java:538-583</code>). Snapshot generation cadence is governed by <code>metadata.log.max.snapshot.interval.ms</code> (default 1 hour) and <code>metadata.log.max.record.bytes.between.snapshots</code> (default 20 MiB), defined in <code>MetadataLogConfig.java:38-41</code> (the controller decides when to call <code>createSnapshot</code>; see <a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a>).</p>
+
+<h2>Dynamic quorum reconfiguration (KIP-853)</h2>
+
+<p>Under kraft.version 1, the voter set can change at runtime without restarting controllers. Three RPCs are handled by dedicated handlers: <code>AddRaftVoter</code>, <code>RemoveRaftVoter</code>, <code>UpdateRaftVoter</code>. Each appends a new <code>VotersRecord</code> to the log; the change takes effect when the <code>KRaftControlRecordStateMachine</code> reads the (even uncommitted) record, and is finalized when it commits.</p>
+
+<p>The add-voter algorithm (<code>AddVoterHandler.java:45-64</code>) is exacting:</p>
+<ol>
+<li>Reject if a voter change is already pending, or if the leader has no HWM yet (epoch not committed) → <code>REQUEST_TIMED_OUT</code>.</li>
+<li>Reject if the cluster doesn't support kraft.version 1 → <code>UNSUPPORTED_VERSION</code>; if the latest <code>VotersRecord</code> isn't committed yet → <code>REQUEST_TIMED_OUT</code>; if the voter id already exists → <code>DUPLICATE_VOTER</code>.</li>
+<li>Send <code>ApiVersions</code> to the new voter to learn its supported kraft.version range; abort if it doesn't support the finalized version, or if it isn't caught up to the leader's LEO (<code>isReplicaCaughtUp</code>, fetched within the last hour, <code>LeaderState.java:487</code>).</li>
+<li>Append the updated <code>VotersRecord</code>, then wait for it to commit using the <em>new</em> majority before acking (<code>highWatermarkUpdated</code>, <code>AddVoterHandler.java:334</code>).</li>
+</ol>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>KRaft adds/removes <strong>one</strong> voter at a time. A newly-added voter must be caught up before it joins, and the change must commit under the new majority. Removing a voter when the quorum is already at minimum availability can lose the quorum — the leader requires its current epoch to be committed (HWM established) before processing any membership change, which is the mechanism that prevents split-brain reconfiguration.</p></div>
+
+<p>Observers configured with <code>controller.quorum.auto.join.enable=true</code> automatically send <code>AddRaftVoter</code> (or <code>RemoveRaftVoter</code> to evict a stale entry sharing their id) once reconfiguration is supported (<code>pollFollowerAsObserver</code>, <code>KafkaRaftClient.java:3365</code>). Voters also periodically send <code>UpdateRaftVoter</code> when their endpoints or supported-version range drift from what's recorded (<code>shouldSendUpdateVoteRequest</code>, <code>KafkaRaftClient.java:3300</code>). Upgrading kraft.version 0→1 is coordinated through <code>LeaderState.maybeAppendUpgradedKRaftVersion</code> using optimistic locking on an <code>AtomicReference&lt;KRaftVersionUpgrade&gt;</code> (<code>LeaderState.java:107</code>, <code>:528</code>) — it requires every voter to support v1 and to have a known directory id.</p>
+
+<h2>Concurrency &amp; threading</h2>
+
+<p>KRaft is overwhelmingly single-threaded by design. Almost all mutable state — <code>QuorumState</code>, every role object, <code>RequestManager</code>, <code>LeaderState</code>'s replica map, the listener contexts — is touched only on the <code>kafka-raft-io-thread</code>. The crossing points are:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Shared state</th><th>Guard</th><th>Other thread(s)</th></tr></thead>
+<tbody>
+<tr><td>Inbound messages &amp; responses</td><td><code>BlockingMessageQueue</code> (<code>LinkedBlockingQueue</code>) + <code>wakeup()</code></td><td>network threads enqueue; IO thread dequeues</td></tr>
+<tr><td>Listener registration</td><td><code>ConcurrentLinkedQueue&lt;Registration&gt;</code> drained in <code>pollListeners</code></td><td>any thread calling <code>register/unregister</code></td></tr>
+<tr><td>Leader append buffer</td><td><code>BatchAccumulator.appendLock</code> (<code>ReentrantLock</code>); linger via <code>AtomicLong</code>; <code>completed</code> is a <code>ConcurrentLinkedQueue</code></td><td>controller threads calling <code>prepareAppend</code></td></tr>
+<tr><td>Resignation request</td><td><code>volatile boolean resignRequested</code> (set via <code>requestResign()</code>)</td><td>external thread calling <code>RaftClient.resign</code></td></tr>
+<tr><td>Graceful shutdown flag</td><td><code>AtomicReference&lt;GracefulShutdown&gt;</code></td><td>thread calling <code>shutdown()</code></td></tr>
+<tr><td>kraft.version upgrade</td><td><code>AtomicReference&lt;KRaftVersionUpgrade&gt;</code> with CAS</td><td>client calling <code>upgradeKRaftVersion</code></td></tr>
+<tr><td>Control-record history</td><td><code>synchronized(voterSetHistory)</code> / <code>synchronized(kraftVersionHistory)</code> + <code>volatile nextOffset</code></td><td>snapshot-freezing threads reading <code>voterSetAtOffset</code></td></tr>
+<tr><td>Listener offsets</td><td><code>synchronized(ListenerContext)</code> for <code>nextOffset</code>/<code>lastSent</code></td><td>the listener thread via <code>BatchReader.onClose</code></td></tr>
+</tbody>
+</table></div>
+
+<p>Fetch and append purgatories (<code>ThresholdPurgatory&lt;Long&gt;</code> backed by a <code>TimingWheelExpirationService</code>) complete futures from an expiration thread, but the success-path completion of a parked Fetch is always re-evaluated on the IO thread (<code>handleFetchRequest</code>'s comment, <code>KafkaRaftClient.java:1586-1589</code>). The IO thread sleeps in <code>messageQueue.poll(timeoutMs)</code> where the timeout is the minimum of every role timer and the snapshot cleaner deadline; any state change that should shorten the sleep calls <code>wakeup()</code> (<code>KafkaRaftClient.java:3645</code>).</p>
+
+<h2>Configuration reference</h2>
+
+<p>All knobs are defined in <code>QuorumConfig.java</code> under the <code>controller.quorum.</code> prefix (snapshot knobs are in <code>MetadataLogConfig</code>).</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>controller.quorum.voters</code></td><td>empty</td><td>Static <code>{id}@{host}:{port}</code> voter map (legacy / kraft.version 0). Should NOT be set with dynamic quorums.</td></tr>
+<tr><td><code>controller.quorum.bootstrap.servers</code></td><td>empty</td><td><code>{host}:{port}</code> endpoints for discovering the metadata quorum (dynamic quorums). Bootstrap nodes get decreasing negative ids (<code>KafkaRaftClient.java:318</code>).</td></tr>
+<tr><td><code>controller.quorum.election.timeout.ms</code></td><td>1000</td><td>Max time without fetching from the leader before starting an election. Actual timeout is randomized: <code>t + random.nextInt(t)</code> (<code>QuorumState.java:745</code>).</td></tr>
+<tr><td><code>controller.quorum.fetch.timeout.ms</code></td><td>2000</td><td>Follower: max time without a successful fetch before becoming Prospective. Leader: max time without a fetch from a majority before resigning (check-quorum = 1.5×, <code>LeaderState.java:65</code>).</td></tr>
+<tr><td><code>controller.quorum.election.backoff.max.ms</code></td><td>1000</td><td>Cap for the strict-exponential election backoff that prevents gridlocked elections.</td></tr>
+<tr><td><code>controller.quorum.append.linger.ms</code></td><td>25</td><td>How long the leader lets writes accumulate in the <code>BatchAccumulator</code> before flushing to disk.</td></tr>
+<tr><td><code>controller.quorum.request.timeout.ms</code></td><td>2000</td><td>RPC timeout used by <code>RequestManager</code>; a timed-out connection is reset.</td></tr>
+<tr><td><code>controller.quorum.retry.backoff.ms</code></td><td>20</td><td>Backoff after a failed RPC before the connection is retried.</td></tr>
+<tr><td><code>controller.quorum.auto.join.enable</code></td><td>false</td><td>If true, a controller observer auto-issues AddRaftVoter to join its cluster's quorum (KIP-853).</td></tr>
+<tr><td><code>controller.quorum.fetch.max.bytes</code></td><td>1048576</td><td>Max bytes per Fetch (always returns ≥1 batch).</td></tr>
+<tr><td><code>controller.quorum.fetch.snapshot.max.bytes</code></td><td>1048576</td><td>Max bytes per FetchSnapshot.</td></tr>
+<tr><td><code>metadata.log.max.snapshot.interval.ms</code></td><td>3600000</td><td>Max wall-clock between snapshot generations (<code>MetadataLogConfig.java:38</code>).</td></tr>
+<tr><td><code>metadata.log.max.record.bytes.between.snapshots</code></td><td>20971520</td><td>Max log bytes accumulated before a snapshot is generated.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout note"><span class="callout-title">Note</span><p>The defaults are deliberately aggressive (election ~1 s, fetch ~2 s). The <code>QuorumConfig</code> header explains the philosophy (<code>QuorumConfig.java:42-50</code>): leader changes should be quick because the KIP-631 controller standby is "hot" — it has the metadata in memory and can take over without a cold reload.</p></div>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+
+<ul>
+<li><strong>Leader isolation (check-quorum)</strong>: if a leader stops receiving fetches from a majority of voters within <code>1.5 × fetch.timeout.ms</code>, <code>timeUntilCheckQuorumExpires</code> hits zero and the leader resigns (<code>pollLeader</code>, <code>KafkaRaftClient.java:3176-3179</code>). A single-voter quorum never expires this timer (<code>LeaderState.java:225</code>).</li>
+<li><strong>Stale leader endpoint</strong>: if a restarted voter knows a leader id but not its endpoint (e.g. leader not in the local static voter set), it starts <code>Unattached</code> and learns the endpoint from a BeginQuorumEpoch or a bootstrap Fetch rather than getting stuck (<code>QuorumState.java:204-231</code>).</li>
+<li><strong>Log divergence after election</strong>: handled inline on the Fetch path via diverging-epoch truncation; a follower will never truncate below its HWM (throws if asked to, <code>KafkaRaftClient.java:1749-1753</code>).</li>
+<li><strong>Snapshot deleted mid-download</strong>: if the leader GC'd the snapshot, FetchSnapshot returns <code>SNAPSHOT_NOT_FOUND</code>; the follower resets its fetching-snapshot state and retries from a plain Fetch (<code>KafkaRaftClient.java:2122-2138</code>).</li>
+<li><strong>Crash before flush</strong>: starting a former leader as <code>Resigned</code> in the same epoch protects against re-using an (offset, epoch) if unflushed records were lost (<code>QuorumState.java:173-189</code>).</li>
+<li><strong>Graceful-shutdown timeout</strong>: <code>GracefulShutdown</code> uses a timer; if a resigning leader can't hand off within the window the future completes exceptionally with <code>TimeoutException</code> (<code>KafkaRaftClient.java:3931</code>). A follower/observer or sole voter can shut down immediately (<code>maybeCompleteShutdown</code>, <code>KafkaRaftClient.java:3604-3610</code>).</li>
+<li><strong>Disruptive rejoining voter</strong>: pre-vote (above) prevents it from bumping the epoch; a partitioned voter spins in Prospective without disturbing the leader.</li>
+<li><strong>Cluster-id mismatch</strong>: every RPC validates the cluster id and returns <code>INCONSISTENT_CLUSTER_ID</code> on mismatch (e.g. <code>handleVoteRequest</code>, <code>KafkaRaftClient.java:834</code>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<ul>
+<li><strong>At most one leader per epoch.</strong> Epochs increase by exactly one per election; the durable quorum-state write before transition means a vote is never forgotten across a crash. Voted/leader state is retained when transitioning within the same epoch (<code>QuorumState.transitionToFollower</code> preserves <code>votedKey</code>, <code>QuorumState.java:583</code>).</li>
+<li><strong>Election safety via log up-to-dateness.</strong> A vote is granted only if the candidate's (lastEpoch, lastOffset) is ≥ the voter's, so any new leader has all committed records (<code>KafkaRaftClient.java:919</code>).</li>
+<li><strong>Leader completeness via the epoch-start commit rule.</strong> The HWM cannot advance past prior-epoch records until the leader commits a record from its own epoch (<code>LeaderState.java:747</code>).</li>
+<li><strong>Monotonic HWM.</strong> Both leader and follower reject non-monotonic HWM updates (<code>FollowerState.updateHighWatermark</code> throws, <code>FollowerState.java:190</code>).</li>
+<li><strong>Records uniquely identified by (offset, epoch).</strong> Underpins truncation/reconciliation correctness.</li>
+<li><strong>One in-flight Fetch per follower for its LEO</strong> (prevents double-append).</li>
+<li><strong>Control-record listener is always read to the LEO</strong>, so the latest voter set and kraft.version are always current (<code>KafkaRaftClient.java:202</code>).</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+<li><a href="11-kraft-controller.html">The KRaft Controller</a> registers a <code>RaftClient.Listener</code>; it receives <code>handleCommit</code> for committed metadata batches, <code>handleSnapshot</code>/<code>handleLoadBootstrap</code>, and <code>handleLeaderChange</code> (fired only once the listener has caught up to the new epoch's start offset, <code>KafkaRaftClient.java:4121-4137</code>). The controller, in turn, decides when to call <code>createSnapshot</code> and <code>upgradeKRaftVersion</code>.</li>
+<li><a href="12-metadata-propagation.html">Metadata Propagation</a>: brokers run a <code>KafkaRaftClient</code> as an <em>observer</em>, fetching the same log to build their <code>MetadataImage</code>.</li>
+<li><a href="03-storage-log-engine.html">The Log Storage Engine</a> and <a href="04-storage-management.html">Log Management</a>: <code>KafkaRaftLog</code> is a thin <code>RaftLog</code> over the same segment storage, batch format, and indexes used by ordinary partitions.</li>
+<li><a href="09-fetch-path.html">The Fetch Path</a> and <a href="08-replication.html">Replication, ISR &amp; HWM</a>: KRaft reuses the Fetch RPC and a HWM/commit concept analogous to ISR replication, but the quorum here is a strict majority of voters, not an ISR.</li>
+<li><a href="02-wire-protocol.html">Wire Protocol &amp; RPC Framework</a>: the Vote/BeginQuorumEpoch/EndQuorumEpoch/FetchSnapshot/Add|Remove|UpdateRaftVoter RPCs are all defined as message JSON and listed on the <code>controller</code> listener.</li>
+<li><a href="06-network-and-threading.html">Network Layer &amp; Threading</a>: inbound requests arrive via <code>KafkaRaftClientDriver.handleRequest</code> and are placed on the message queue; outbound requests go through a <code>KafkaNetworkChannel</code>.</li>
+</ul>
+
+<h3>RPC summary</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>API</th><th>ApiKey</th><th>Direction</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>Vote</code></td><td>52</td><td>nominee → voters</td><td>Request a (pre-)vote; carries last (offset, epoch) and PreVote flag (v2).</td></tr>
+<tr><td><code>BeginQuorumEpoch</code></td><td>53</td><td>leader → voters</td><td>Announce leadership of a new epoch; carries leader endpoints (v1).</td></tr>
+<tr><td><code>EndQuorumEpoch</code></td><td>54</td><td>leader → voters</td><td>Graceful resignation + preferred-successor ordering.</td></tr>
+<tr><td><code>Fetch</code></td><td>1</td><td>follower/observer → leader</td><td>Pull records; piggybacks leader/epoch, HWM, divergence &amp; snapshot id.</td></tr>
+<tr><td><code>FetchSnapshot</code></td><td>59</td><td>follower → leader</td><td>Download a snapshot by (snapshotId, byte position).</td></tr>
+<tr><td><code>DescribeQuorum</code></td><td>—</td><td>admin → leader</td><td>Report voter/observer replication state.</td></tr>
+<tr><td><code>AddRaftVoter</code> / <code>RemoveRaftVoter</code> / <code>UpdateRaftVoter</code></td><td>—</td><td>client/observer → leader</td><td>Dynamic reconfiguration (KIP-853).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Design rationale &amp; evolution</h2>
+<p>KRaft has accreted across several KIPs, all visible in the code and message schemas:</p>
+<ul>
+<li><span class="pill kip">KIP-595</span> The core Raft protocol for the metadata quorum — pull-based fetch, log reconciliation, BeginQuorumEpoch.</li>
+<li><span class="pill kip">KIP-630</span> Snapshots: the <code>FetchSnapshot</code> RPC, <code>.checkpoint</code> files, and the SnapshotHeader/Footer control records.</li>
+<li><span class="pill kip">KIP-853</span> Dynamic KRaft quorums: directory ids in <code>ReplicaKey</code>/<code>VotersRecord</code>, leader endpoints in responses, AddVoter/RemoveVoter/UpdateVoter, and kraft.version 1 (the JSON comments cite KIP-853 explicitly, e.g. <code>VoteRequest.json:21</code>).</li>
+<li><span class="pill kip">KIP-996</span> Pre-Vote: the <code>Prospective</code> role and the <code>PreVote</code> field, preventing disruptive epoch bumps.</li>
+<li><span class="pill kip">KIP-631</span> The quorum-controller design that motivates the low default timeouts (hot standby).</li>
+</ul>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>"Voter" is not a config you flip per node at runtime; it is whether your <code>ReplicaKey</code> appears in the latest committed (or even uncommitted) <code>VotersRecord</code>. A node whose broker id is in the voter set but with a <em>different directory id</em> is treated as an observer (the directory ids don't match in <code>VoterSet.isVoter</code>), which is exactly why auto-join may issue a <code>RemoveRaftVoter</code> for the stale entry before adding itself (<code>KafkaRaftClient.java:3375-3385</code>). Mixing the legacy <code>controller.quorum.voters</code> with dynamic quorums is unsupported and the config doc warns against it.</p></div>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The <code>quorum-state</code> file only stores leader/epoch/vote — under kraft.version 1 it no longer stores the voter set (the <code>CurrentVoters</code> field is version-0 only). The authoritative voter set lives in the metadata log/snapshot. Hand-editing <code>quorum-state</code> to "fix" membership will not work and risks violating the at-most-one-leader-per-epoch invariant.</p></div>

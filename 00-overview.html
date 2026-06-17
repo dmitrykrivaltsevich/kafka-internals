@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture Overview · Kafka Internals</title>
+<meta name="description" content="The distributed commit log, broker &amp; cluster anatomy, and the end-to-end data path.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="00-overview">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>00 · Architecture Overview</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">Apache Kafka is, at its core, a single idea executed with unusual discipline: a <strong>distributed, partitioned, replicated commit log</strong>. Producers append records to the end of a log; consumers read forward from a position they themselves track; the broker is a comparatively "dumb" custodian of bytes that it stores as sequential append-only segment files and ships to readers with near-zero overhead. Everything else in this guide — replication and the high watermark, the KRaft metadata quorum that replaced ZooKeeper, consumer groups and rebalancing, exactly-once transactions, share groups, tiered storage, Streams and Connect — is an elaboration built <em>on top of that log</em>. This chapter is the front door. It builds an accurate end-to-end mental model: what the abstractions are, how a cluster is laid out in KRaft, how a record physically travels from <code>producer.send()</code> to <code>consumer.poll()</code>, how bytes are stored, how coordination and delivery semantics work, how a broker is threaded, and where every detail lives in the codebase and in the twenty-one chapters that follow. Read it once to orient yourself; return to it as the map.</p>
+
+<h2>What Kafka is: a distributed commit log</h2>
+
+<p>Strip away the features and Kafka is a log. A <strong>log</strong> here is the precise computer-science object: an append-only, totally-ordered sequence of records, ordered by the time they were appended, addressed by a monotonically increasing integer position. Jay Kreps called it "perhaps the simplest possible storage abstraction" — and it is the same primitive that sits underneath database replication and state-machine replication. Kafka's bet, made at LinkedIn in 2010–2011 and proven out since, is that this one abstraction, made distributed and durable, is the right backbone for both real-time stream processing and offline data integration, replacing an O(N²) tangle of point-to-point pipelines with an O(N) hub-and-spoke.</p>
+
+<h3>The core abstractions</h3>
+<dl class="kv">
+<dt>Record</dt><dd>The unit of data: an optional <strong>key</strong>, a <strong>value</strong> (the payload, or <code>null</code> for a compaction tombstone), a <strong>timestamp</strong>, and an ordered list of <strong>headers</strong> (string key + bytes). Records are never stored individually on disk — they live inside batches. See <a href="01-record-format.html">Record Format &amp; Batches</a>.</dd>
+<dt>Record batch</dt><dd>The real on-disk and on-wire unit. The v2 <code>DefaultRecordBatch</code> has a fixed 61-byte header (base offset, CRC-32C, producer id/epoch/sequence, leader epoch, attributes) followed by varint delta-encoded records. Writing shared fields once per batch cut per-record overhead from ~34 bytes for a standalone legacy v1 message (a 12-byte offset/size log prefix plus the 22-byte <code>RECORD_OVERHEAD_V1</code>) to ~7 bytes. The batch — not the record — is the fundamental unit of write, replication, compression, and fetch.</dd>
+<dt>Partition</dt><dd>One physical log. A partition is the <em>unit of parallelism and of ordering</em>: records within a partition are strictly ordered by offset; there is no ordering guarantee across partitions. A partition is replicated; exactly one replica is the <strong>leader</strong> and serves reads/writes.</dd>
+<dt>Topic</dt><dd>A named, logical stream — simply a set of partitions. A topic has no storage of its own; it is the partitions that store data.</dd>
+<dt>Offset</dt><dd>The position of a record within its partition: a 64-bit integer assigned by the leader at append time, dense and gap-free within a batch's range. The offset is the <em>only</em> per-consumer state Kafka needs — one number per partition tells a consumer exactly where it is.</dd>
+<dt>Broker</dt><dd>A server process that hosts partitions, accepts produce/fetch requests, and replicates. A Kafka cluster is a set of brokers plus a controller quorum (below).</dd>
+<dt>Segment</dt><dd>A partition log is split into ~1 GiB <strong>segments</strong>: a <code>.log</code> file of record batches plus sparse <code>.index</code> / <code>.timeindex</code> / <code>.txnindex</code> sidecars. Only the last (active) segment is written; old segments are immutable and can be deleted, compacted, or tiered wholesale. See <a href="03-storage-log-engine.html">The Log Storage Engine</a>.</dd>
+</dl>
+
+<figure class="diagram">
+  <div class="logstrip">
+    <div class="ls-head">
+      <span class="ttl">partition&nbsp;0 &nbsp;·&nbsp; topic <span class="q">"orders"</span></span>
+      <span class="append">producer appends to the tail&nbsp;→</span>
+    </div>
+    <div class="cells">
+      <div class="cell committed">0</div>
+      <div class="cell committed">1</div>
+      <div class="cell committed">2</div>
+      <div class="cell committed">3</div>
+      <div class="cell committed">4</div>
+      <div class="cell committed">5<span class="tag hw">high watermark</span></div>
+      <div class="cell pending">6</div>
+      <div class="cell next">7<span class="tag leo">LEO</span></div>
+    </div>
+    <div class="marks">
+      <div class="mslot"></div>
+      <div class="mslot"><span class="mk">group&nbsp;A<br>reads&nbsp;@1</span></div>
+      <div class="mslot"></div><div class="mslot"></div><div class="mslot"></div><div class="mslot"></div>
+      <div class="mslot"><span class="mk b">group&nbsp;B<br>reads&nbsp;@6</span></div>
+      <div class="mslot"></div>
+    </div>
+  </div>
+  <figcaption>One partition is an append-only, offset-addressed log (a topic is a set of these). Records up to the <strong>high watermark</strong> (offset&nbsp;5) are committed — replicated to the ISR and visible to consumers; offset&nbsp;6 is appended but not yet committed; the <strong>log end offset</strong> (LEO&nbsp;=&nbsp;7) is the next slot the leader will write. Independent consumer groups read at their own positions, so a rewind is just a seek.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-storage"></span><b>committed</b> &mdash; offset ≤ high watermark</span>
+    <span class="lgi"><span class="sw cat-control dash"></span><b>uncommitted</b> &mdash; replicating to followers</span>
+    <span class="lgi"><span class="sw dash"></span><b>LEO</b> &mdash; next offset to be written</span>
+    <span class="lgi"><span class="sw round cat-client"></span>▲ consumer-group read position</span>
+    <span class="lgi"><span class="mono">n</span> = monotonic offset (int64)</span>
+  </div>
+</figure>
+
+<h3>The "dumb broker, smart client" model</h3>
+<p>The defining architectural choice is that <strong>the consumer tracks its own offset</strong>, and the broker keeps essentially no per-consumer state on the hot path. A traditional message queue deletes a message when it is consumed and must track, per consumer, what has been acknowledged. Kafka instead addresses every record by a stable logical offset, retains data by a time/size SLA regardless of who has read it, and lets each consumer (or consumer group) say "give me from offset N." This has profound consequences:</p>
+<ul>
+<li><strong>Replay and fan-out are free.</strong> Rewinding is a seek; a new consumer group reading history costs the broker nothing extra. Many independent subscribers read the same log.</li>
+<li><strong>The broker stays simple and fast.</strong> No per-message acknowledgement bookkeeping, no random-access index of "who has what" — just sequential append and sequential scan, which is what disks and the OS page cache are best at.</li>
+<li><strong>Back-pressure is natural.</strong> Consumers <em>pull</em> (long-poll fetch) at their own pace; a slow consumer cannot be overwhelmed by a push.</li>
+</ul>
+
+<div class="callout key"><span class="callout-title">The one-sentence mental model</span><p>Kafka is a set of <strong>append-only, offset-addressed, replicated partition logs</strong>. Producers append batches to the leader of a partition; the leader replicates to followers; data below the <strong>high watermark</strong> is committed and visible; consumers pull forward from a position they own and commit back to the cluster. Hold that picture and every other chapter slots into it.</p></div>
+
+<h2>Cluster anatomy in KRaft (no ZooKeeper)</h2>
+
+<p>As of Kafka 4.0, ZooKeeper is gone entirely; 4.4.0-SNAPSHOT runs <strong>KRaft-only</strong>. A cluster is split cleanly into two planes:</p>
+<ul>
+<li>The <strong>data plane</strong>: <em>broker</em> nodes that host topic-partition replicas and serve produce/fetch. This is where your records live.</li>
+<li>The <strong>metadata plane</strong>: a small <em>controller quorum</em> that owns all cluster metadata — topics, partitions, replica assignments, leadership, ISR, ACLs, quotas, feature levels, producer-ID blocks — as an ordered, replayable, fsync'd <strong>event log</strong>.</li>
+</ul>
+
+<p>Every node runs with a configured set of <code>process.roles</code>. The <code>ProcessRole</code> enum has two members, <code>BrokerRole</code> and <code>ControllerRole</code> (<code>server/.../ProcessRole.java</code>), and <code>KafkaRaftServer</code> instantiates a <code>BrokerServer</code> if the roles contain <code>BrokerRole</code> and a <code>ControllerServer</code> if they contain <code>ControllerRole</code> (<code>KafkaRaftServer.scala:76-82</code>). So a node can be:</p>
+<div class="table-wrap"><table>
+<thead><tr><th><code>process.roles</code></th><th>Runs</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>broker</code></td><td><code>BrokerServer</code> only — hosts partitions, serves clients</td><td>Production data nodes in a larger cluster</td></tr>
+<tr><td><code>controller</code></td><td><code>ControllerServer</code> only — a voter in the metadata quorum</td><td>Dedicated controllers (3 or 5 of them) in a larger cluster</td></tr>
+<tr><td><code>broker,controller</code></td><td>Both, in one JVM</td><td>"Combined" mode — small clusters and development</td></tr>
+</tbody>
+</table></div>
+
+<h3>Bootstrapping a KRaft cluster</h3>
+<p>Because there is no ZooKeeper to seed the cluster, KRaft makes <strong>formatting storage a mandatory first step</strong> — unlike the ZooKeeper era, a node will not start until its log directories carry a cluster identity. The sequence is:</p>
+<ol>
+<li><strong>Generate a cluster ID.</strong> <code>kafka-storage random-uuid</code> prints a fresh base64 <code>Uuid</code> (<code>StorageTool.scala</code>, the <code>random-uuid</code> command → <code>Uuid.randomUuid</code>). The same ID is used to format every node.</li>
+<li><strong>Format each node's log dirs.</strong> <code>kafka-storage format --cluster-id &lt;ID&gt; --release-version &lt;MV&gt;</code> writes a <code>meta.properties</code> into each <code>log.dirs</code> directory (cluster.id, node.id, and a per-directory <code>directory.id</code> UUID), and lays down a <code>bootstrap.checkpoint</code> file. That checkpoint is the <code>BootstrapMetadata</code>: a tiny record set whose first record is a <code>FeatureLevelRecord</code> pinning the initial <code>metadata.version</code> (the <code>--release-version</code> you chose), so the cluster comes up at a known feature level rather than the code's default.</li>
+<li><strong>Declare the initial voters (KIP-853).</strong> For a dynamic controller quorum, the format step takes <code>--standalone</code> (a single-node quorum), <code>--initial-controllers &lt;list&gt;</code> (an explicit voter set, each <code>id@host:port:directory-id</code>), or <code>--no-initial-controllers</code>; the older static model instead lists voters in <code>controller.quorum.voters</code>.</li>
+</ol>
+<p>Only after a node's directories are formatted does <code>KafkaRaftServer</code> start the Raft stack against them. The deep mechanics of registration and the bootstrap metadata live in <a href="11-kraft-controller.html">The KRaft Controller</a> and <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>.</p>
+
+<h3>The metadata quorum and __cluster_metadata</h3>
+<p>The controllers form a <strong>Raft quorum</strong> using Kafka's own Raft dialect (KRaft). The quorum's state is a single topic partition, <code>__cluster_metadata-0</code>, replicated across the controller voters. One controller is the Raft <strong>leader</strong> (the "active controller"); the others are hot standbys. This partition is the <strong>single source of truth</strong> for the whole cluster: nothing about a topic, a partition's leader, or an ACL is "true" until it is a committed record in this log.</p>
+
+<figure class="diagram"><div class="dstack">
+  <div class="layer cat-client"><div class="ln">Clients</div><div class="ld">producers write to partition leaders; consumers read from leaders (or rack-local followers)</div><div class="row"><span class="chip">Producers</span><span class="chip">Consumers</span><span class="chip">Admin</span></div></div>
+  <div class="sep">↓ produce&nbsp;·&nbsp;fetch &nbsp;|&nbsp; metadata responses ↑</div>
+  <div class="layer cat-control"><div class="ln">Metadata plane — controller quorum (KRaft)</div><div class="ld">a Raft quorum owns cluster metadata as an event log, <span class="mono">__cluster_metadata-0</span>; standbys <em>fetch</em> from the active leader (the single source of truth)</div><div class="row"><span class="chip">controller · active leader</span><span class="chip">controller · standby</span><span class="chip">controller · standby</span></div></div>
+  <div class="sep">↓ committed records replayed: <span class="mono">TopicRecord</span> · <span class="mono">PartitionChangeRecord</span> · <span class="mono">RegisterBrokerRecord</span> · <span class="mono">AccessControlEntryRecord</span> …</div>
+  <div class="layer cat-broker"><div class="ln">Data plane — brokers</div><div class="ld">each broker replays committed metadata into a <span class="mono">MetadataImage</span>, hosts topic-partition replicas, and replicates partition data among themselves</div><div class="row"><span class="chip">broker 0</span><span class="chip">broker 1</span><span class="chip">broker 2</span></div></div>
+</div><figcaption>KRaft cluster anatomy: a Raft controller quorum owns metadata as an event log (the single source of truth, <code>__cluster_metadata-0</code>); brokers replay committed metadata and replicate partition data among themselves, while clients produce to and fetch from the brokers.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-client"></span><b>clients</b> &mdash; producers / consumers / admin</span>
+    <span class="lgi"><span class="sw cat-control"></span><b>metadata plane</b> &mdash; controller quorum</span>
+    <span class="lgi"><span class="sw cat-broker"></span><b>data plane</b> &mdash; brokers</span>
+    <span class="lgi">stacked bands = planes; <span class="mono">↓↑</span> separators = the flow between them</span>
+    <span class="lgi"><span class="mono">Record</span> = committed metadata record type</span>
+  </div>
+</figure>
+
+<p>Brokers are <strong>clients</strong> of this metadata log. Each broker registers with the active controller (<code>BrokerRegistrationRequest</code>), is fenced until it has caught up, then continually <em>pulls</em> committed metadata records via the Raft Fetch path and sends periodic heartbeats (which double as liveness). Crucially, the controller does <strong>not push</strong> <code>LeaderAndIsr</code>/<code>UpdateMetadata</code>/<code>StopReplica</code> RPCs the way the ZooKeeper-era controller did; making metadata a log the brokers replay turns topic create/delete into an O(1) append for the controller and eliminates the controller-vs-ZooKeeper state divergence that plagued the old design. The deep mechanics are in <a href="10-kraft-consensus.html">KRaft Consensus</a>, <a href="11-kraft-controller.html">The KRaft Controller</a>, and <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>.</p>
+
+<div class="callout note"><span class="callout-title">Two Rafts, do not conflate them</span><p>KRaft (the metadata quorum over <code>__cluster_metadata</code>) and ordinary <strong>partition replication</strong> (leader/follower ISR replication of your topic data) are <em>different mechanisms</em>. KRaft uses a majority-vote high watermark over the controller voters; topic-partition replication uses the ISR / min-LEO high watermark over the partition's replicas. They share a code lineage (followers fetch in both) but are governed by separate rules. KRaft replaced only ZooKeeper's metadata role — not data replication.</p></div>
+
+<h2>Control plane vs data plane, and the metadata backbone</h2>
+
+<p>The split above is enforced in the request layer too. Brokers do <strong>not</strong> mutate cluster metadata directly. Around eighteen administrative APIs — <code>CreateTopics</code>, <code>DeleteTopics</code>, the <code>CreateAcls</code>/<code>DeleteAcls</code> family, <code>AlterClientQuotas</code>, <code>ElectLeaders</code>, reassignments, <code>UpdateFeatures</code>, the Raft-voter APIs — when received by a broker are wrapped in an <code>Envelope</code> and <strong>forwarded to the active controller</strong>, which re-dispatches them through <code>ControllerApis</code> (<code>KafkaApis.scala</code> → <code>forwardToController</code> → <code>ControllerApis.scala</code>). The <code>AlterConfigs</code>/<code>IncrementalAlterConfigs</code> family is a partial exception: its handler preprocesses some resources locally and forwards only the remainder. The controller is the only writer of metadata; brokers are readers.</p>
+
+<p>The propagation backbone is a clean pipeline. The active controller is a deterministic replicated state machine: a single-threaded event loop (<code>QuorumController</code>, thread <code>quorum-controller-{id}-event-handler</code>) turns each request into a list of metadata <em>records</em>, appends them to the Raft log, and applies them to in-memory state under a strict <strong>write → commit → apply</strong> discipline so the active controller and every standby reach byte-identical state by replaying the same records in offset order.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">admin request</span><span class="nd">CreateTopics, AlterConfigs, ElectLeaders …</span></div>
+  <div class="conn"></div>
+  <div class="node cat-control"><span class="nt">ControllerApis</span><span class="nd">on the active controller</span></div>
+  <div class="conn"></div>
+  <div class="node cat-control"><span class="nt">QuorumController</span><span class="nd">single-threaded event loop: 1. generate records · 2. prepareAppend → Raft log · 3. replay() optimistically</span></div>
+  <div class="conn"></div>
+  <div class="node cat-control store"><span class="nt">__cluster_metadata</span><span class="nd">Raft commit (majority over voters)</span></div>
+  <div class="conn ec-async" data-label="RaftClient commit callback · on every broker"></div>
+  <div class="node cat-broker"><span class="nt">MetadataLoader</span><span class="nd">single thread — folds committed batches into a MetadataDelta</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker store"><span class="nt">new immutable MetadataImage</span><span class="nd">provenance + 9 sub-images: topics, configs, cluster, ACLs, quotas, features …</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">MetadataPublishers</span><span class="nd">ordered chain — fan out to each subsystem</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col"><div class="conn"></div><div class="node cat-broker"><span class="nt">KRaftMetadataCache</span><span class="nd">setImage() — serves Metadata responses</span></div></div>
+    <div class="col"><div class="conn"></div><div class="node cat-broker"><span class="nt">ReplicaManager</span><span class="nd">applyDelta() — make leaders / followers</span></div></div>
+    <div class="col"><div class="conn"></div><div class="node cat-coord"><span class="nt">Group / Txn coordinators</span><span class="nd">elect / resign shards</span></div></div>
+    <div class="col"><div class="conn"></div><div class="node cat-broker"><span class="nt">Acl / Scram · quotas</span><span class="nd">client-metrics publishers</span></div></div>
+  </div>
+</div><figcaption>The metadata backbone: the controller writes records, Raft commits them, and every broker replays them into an immutable MetadataImage that publishers fan out to each subsystem.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-client"></span>admin request (client)</span>
+    <span class="lgi"><span class="sw cat-control"></span>controller / metadata plane</span>
+    <span class="lgi"><span class="sw cat-broker"></span>broker-side component</span>
+    <span class="lgi"><span class="sw cat-coord"></span>coordinator shard</span>
+    <span class="lgi"><span class="sw cat-control cyl"></span>cylinder = the metadata log</span>
+    <span class="lgi"><span class="arr"></span>generate / apply</span>
+    <span class="lgi"><span class="arr dashed"></span>async Raft commit callback</span>
+  </div>
+</figure>
+
+<p>On the broker side, the <code>MetadataLoader</code> consumes Raft commits on one thread, folds them into immutable <code>MetadataImage</code> snapshots (a <code>MetadataProvenance</code> plus nine sub-images, rebuilt incrementally via <code>MetadataDelta</code>), and publishes each new image to an ordered chain of <code>MetadataPublisher</code>s. The <code>BrokerMetadataPublisher</code> is what actually turns metadata into behaviour: it swaps the cache image, then calls <code>replicaManager.applyDelta(topicsDelta, newImage)</code> to drive partitions into leader/follower roles, and elects or resigns coordinator shards. This is the join between the metadata plane and the data plane.</p>
+
+<h2>The end-to-end data path for a record</h2>
+
+<p>Here is the journey of a single record, from a producer's <code>send()</code> to a consumer's <code>poll()</code>, with each hop linked to its chapter. This is the most important diagram in the guide.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node pill cat-client"><span class="nt">PRODUCER · app thread · §16</span></div>
+  <div class="conn"></div>
+  <div class="node cat-client"><span class="nt">send(record)</span><span class="nd">serialize · pick partition (explicit / murmur2(key) / sticky)</span></div>
+  <div class="conn"></div>
+  <div class="node cat-client store"><span class="nt">RecordAccumulator</span><span class="nd">per-partition deque of ProducerBatch (fill to batch.size or linger.ms; compress) · §01</span></div>
+  <div class="conn" data-label="drain"></div>
+  <div class="node cat-client"><span class="nt">Sender I/O thread</span><span class="nd">stamp (PID, epoch, seq) if idempotent · build ProduceRequest · §02</span></div>
+  <div class="conn ec-data" data-label="ProduceRequest → partition leader"></div>
+
+  <div class="node pill cat-broker"><span class="nt">BROKER · leader of the partition · §06 · §07</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">Acceptor ▶ Processor (NIO) ▶ RequestChannel ▶ KafkaRequestHandler ▶ KafkaApis.handle</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">ReplicaManager.appendRecords</span><span class="nd">authorize; for acks=all reject if ISR &lsaquo; min.insync.replicas · §08</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage store"><span class="nt">UnifiedLog.append</span><span class="nd">validate · assign offsets from LEO · stamp leader epoch · write to active segment · advance LEO · §03</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">acks?</div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col"><div class="conn" data-label="0"></div><div class="node"><span class="nt">fire-and-forget</span><span class="nd">no broker reply; client surfaces offset &minus;1</span></div></div>
+    <div class="col"><div class="conn" data-label="1"></div><div class="node"><span class="nt">ack now</span><span class="nd">reply once written to leader</span></div></div>
+    <div class="col"><div class="conn dashed ec-async" data-label="all"></div><div class="node cat-coord"><span class="nt">DelayedProduce in PRODUCE purgatory</span><span class="nd">park; wait for HW · §08</span></div></div>
+  </div>
+  <div class="conn ec-async" data-label="followers' ReplicaFetcherThreads FETCH, report LEO; leader sets HW = min LEO over ISR · §09 → when HW ≥ produced offset"></div>
+  <div class="node cat-storage store"><span class="nt">RECORD COMMITTED</span><span class="nd">offset &lsaquo; high watermark</span></div>
+  <div class="conn ec-data" data-label="consumer Fetch"></div>
+
+  <div class="node pill cat-client"><span class="nt">CONSUMER · poll loop · §17</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">Fetch from leader</span><span class="nd">(or rack-local follower, KIP-392); page-cache read bounded by isolation: read_uncommitted→HW, read_committed→last stable offset, skip aborted · §09 · §14</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage store"><span class="nt">FileRecords via sendfile (zero-copy)</span><span class="nd">if &lsaquo; fetch.min.bytes, park in FETCH purgatory until data / max.wait.ms · §03</span></div>
+  <div class="conn ec-data" data-label="deliver"></div>
+  <div class="node cat-client"><span class="nt">poll()</span><span class="nd">deliver ≤ max.poll.records to the app; process</span></div>
+  <div class="conn"></div>
+  <div class="node cat-coord"><span class="nt">OffsetCommit</span><span class="nd">group coordinator writes offset to __consumer_offsets (replicated) · §13</span></div>
+</div><figcaption>The full data path: producer batching → ProduceRequest to the leader → log append → ISR replication → high-watermark commit (acks) → consumer fetch bounded by HW/LSO → group offset commit.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-client"></span>client (producer / consumer)</span>
+    <span class="lgi"><span class="sw cat-broker"></span>broker server component</span>
+    <span class="lgi"><span class="sw cat-storage"></span>the log / segments</span>
+    <span class="lgi"><span class="sw cat-coord"></span>coordinator / purgatory (waiting)</span>
+    <span class="lgi"><span class="sw cat-storage cyl"></span>cylinder = a log / store</span>
+    <span class="lgi"><span class="mono">acks?</span> rounded = decision</span>
+    <span class="lgi"><span class="arr"></span>data flow</span>
+    <span class="lgi"><span class="arr dashed"></span>async (await HW / replicate)</span>
+    <span class="lgi"><span class="sw cat-client" style="border-radius:999px"></span>pill = phase</span>
+  </div>
+</figure>
+
+<p>Narrating the hops:</p>
+<ol>
+<li><strong>Batching (producer).</strong> <code>send()</code> never does network I/O on the caller's thread. It serializes, selects a partition (explicit, murmur2 key-hash, or the adaptive sticky <code>BuiltInPartitioner</code>), and appends bytes into a per-partition deque in the <code>RecordAccumulator</code>. A single <strong>Sender</strong> thread drains full or lingering batches. Batching is what makes Kafka fast — it amortizes round-trips and turns writes into large sequential chunks. See <a href="16-producer-client.html">The Producer Client</a>.</li>
+<li><strong>ProduceRequest to the leader.</strong> The batch travels as a length-prefixed, versioned RPC (<a href="02-wire-protocol.html">Wire Protocol &amp; RPC</a>) to the broker that currently <em>leads</em> that partition. The client learned the leader from a cached Metadata response.</li>
+<li><strong>Append to the log.</strong> The broker's network/handler threads hand the request to <code>KafkaApis</code> (<a href="07-request-processing.html">Request Processing</a>), which authorizes and calls <code>ReplicaManager</code>. For <code>acks=all</code> the leader first rejects if the ISR is below <code>min.insync.replicas</code>. Then <code>UnifiedLog.append</code> validates the batches, assigns offsets from the current log-end offset, stamps the leader epoch into each batch header, and writes to the active segment, advancing the LEO (<a href="03-storage-log-engine.html">The Log Storage Engine</a>).</li>
+<li><strong>Replication to followers (ISR).</strong> Followers are themselves <em>fetch clients</em> of the leader: their <code>ReplicaFetcherThread</code>s pull new records and report their own LEO back. The leader tracks each follower and maintains the <strong>in-sync replica set</strong>. See <a href="08-replication.html">Replication, ISR &amp; High Watermark</a> and <a href="09-fetch-path.html">The Fetch Path</a>.</li>
+<li><strong>High-watermark commit (acks).</strong> The <strong>high watermark</strong> is the minimum LEO over the ISR — the boundary below which data is committed and can never be lost to a clean leader change. For <code>acks=all</code>, the produce request waits in the <strong>produce purgatory</strong> until the HW reaches its offset, then the ack is sent. <code>acks=1</code> replies once the leader has written; <code>acks=0</code> is fire-and-forget — the broker sends <strong>no response at all</strong> (a <code>NoOpResponse</code>), and the client's send callback completes locally with a fabricated <code>RecordMetadata</code> offset of −1.</li>
+<li><strong>Consumer fetch.</strong> A consumer fetches from the leader (or, with KIP-392, a rack-local follower). The leader serves the read from the OS page cache, bounded by an <strong>isolation level</strong>: <code>read_uncommitted</code> sees up to the HW, <code>read_committed</code> sees only up to the <strong>last stable offset</strong> and skips aborted-transaction batches. Bytes are sent with <code>sendfile</code> (zero-copy). See <a href="17-consumer-client.html">The Consumer Client</a>.</li>
+<li><strong>Group offset commit.</strong> After processing, the consumer commits its position to the <strong>group coordinator</strong>, which durably writes it to the internal <code>__consumer_offsets</code> topic. On restart or rebalance, consumers resume from the committed offset. See <a href="13-group-coordination.html">Group Coordination</a>.</li>
+</ol>
+
+<h2>The storage model in one screen</h2>
+
+<p>A partition replica on disk is a directory named <code>topic-partition</code> containing a sequence of segments. Each segment is a <code>.log</code> file of record batches plus three sparse, memory-mapped sidecar indexes. The layered abstraction is <code>UnifiedLog</code> → <code>LocalLog</code> → <code>LogSegments</code> → <code>LogSegment</code>.</p>
+
+<figure class="diagram">
+<div class="table-wrap"><table>
+<thead><tr><th>File in <code>/var/lib/kafka/orders-0/</code></th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>00000000000000000000.log</code></td><td>record batches (the data); the 20-digit prefix is the segment base offset = first offset in the file</td></tr>
+<tr><td><code>00000000000000000000.index</code></td><td>sparse offset → file-position (8 B/entry)</td></tr>
+<tr><td><code>00000000000000000000.timeindex</code></td><td>sparse timestamp → relative offset (12 B/entry)</td></tr>
+<tr><td><code>00000000000000000000.txnindex</code></td><td>aborted-txn ranges (lazy; <code>read_committed</code>)</td></tr>
+<tr><td><code>00000000000000004096.log</code></td><td>next segment; rolls at <code>segment.bytes</code> (1 GiB), <code>segment.ms</code> (7 d), or when an index fills</td></tr>
+<tr><td><code>00000000000000004096.index</code></td><td>index for the next segment</td></tr>
+<tr><td><code>00000000000000004096.snapshot</code></td><td>producer-state snapshot (idempotence/txn)</td></tr>
+<tr><td><code>leader-epoch-checkpoint</code></td><td>epoch → start offset (truncation authority)</td></tr>
+<tr><td><code>partition.metadata</code></td><td>topic id</td></tr>
+</tbody>
+</table></div>
+<p><strong>Read-by-offset:</strong> offset → <code>OffsetIndex.lookup</code> (greatest ≤ target) → short forward scan → <code>FileRecords.slice</code> → <code>sendfile</code> to socket (no JVM heap copy).</p>
+<figcaption>On-disk layout of one partition replica: append-only segments with sparse indexes; reads translate an offset to a file position and stream bytes zero-copy.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="mono">00000000000000000000</span> = 20-digit segment base offset (the file's first offset)</span>
+  <span class="lgi"><span class="mono">.log / .index / .timeindex / .txnindex</span> = data + sparse sidecar indexes</span>
+  <span class="lgi"><span class="mono">→</span> in the read path = "translates to / then"</span>
+</div></figure>
+
+<p>The storage design is a deliberate set of bets, every one of which trades generality for throughput:</p>
+<ul>
+<li><strong>Sequential everything.</strong> Appends go to the tail; reads scan forward. Sequential disk I/O is orders of magnitude faster than random, so performance is decoupled from total retained volume.</li>
+<li><strong>Sparse indexes, relative offsets.</strong> An index entry is added only every <code>index.interval.bytes</code> (4 KiB) of log. Offsets are stored <em>relative</em> to the segment base so a 64-bit offset fits in 4 bytes. Indexes carry no checksum and are rebuilt from the log if corrupt.</li>
+<li><strong>Lean on the OS page cache.</strong> Kafka keeps <em>no</em> in-JVM record cache. The kernel page cache survives broker restarts, avoids double-buffering, and avoids GC pressure on huge heaps. A caught-up cluster does essentially no disk <em>reads</em>.</li>
+<li><strong>Zero-copy.</strong> Reads return <code>FileRecords</code>, a window over the segment's <code>FileChannel</code>; <code>FileRecords.writeTo</code> bottoms out in <code>sendfile(2)</code>, so committed bytes flow page-cache → NIC without entering user space. (Zero-copy is defeated by TLS or by down-converting v2 to an old format.)</li>
+<li><strong>Durability via replication, not fsync.</strong> By default <code>flush.messages</code> and <code>flush.ms</code> are effectively infinite — Kafka does <em>not</em> fsync every write. Durability comes from replication across the ISR plus the page cache, not per-write disk sync.</li>
+</ul>
+
+<p>Two retention modes govern a log's lifecycle, and a third tier extends it:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th><code>cleanup.policy</code></th><th>What it keeps</th><th>For</th></tr></thead>
+<tbody>
+<tr><td><strong>Retention (delete)</strong></td><td><code>delete</code></td><td>Whole oldest segments deleted by size (<code>retention.bytes</code>) or age (<code>retention.ms</code>, default 7 d)</td><td>Event streams, logs — most topics</td></tr>
+<tr><td><strong>Compaction</strong></td><td><code>compact</code></td><td>At least the latest value per key; <code>null</code> value = tombstone (retained <code>delete.retention.ms</code>)</td><td>Changelogs, CDC, state — <code>__consumer_offsets</code>, <code>__transaction_state</code></td></tr>
+<tr><td><strong>Tiered storage</strong></td><td>(orthogonal)</td><td>Closed segments offloaded to object store; local tier keeps the hot tail</td><td>Near-infinite retention, small clusters</td></tr>
+</tbody>
+</table></div>
+<p>Retention and compaction mechanics are in <a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a>; the remote tier (RSM/RLMM SPIs, <code>__remote_log_metadata</code>, copy/fetch quotas) is in <a href="05-tiered-storage.html">Tiered Storage</a>.</p>
+
+<h2>Coordination &amp; delivery semantics</h2>
+
+<h3>Consumer groups &amp; rebalancing</h3>
+<p>A <strong>consumer group</strong> scales out consumption: the group's members divide the subscribed partitions among themselves, with <em>each partition assigned to exactly one member</em> (preserving per-partition order). A broker-side <strong>group coordinator</strong> — the leader of the relevant <code>__consumer_offsets</code> partition — owns the group's membership and offsets, persisting them as records in that partition's log (its durable state <em>is</em> the log; failover is just a replay). The rebalance protocol has evolved decisively from client-driven to server-driven:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Protocol</th><th><code>group.protocol</code></th><th>How assignment happens</th></tr></thead>
+<tbody>
+<tr><td><strong>Classic</strong></td><td><code>classic</code></td><td>A <em>consumer</em> (the elected "leader," not the broker) computes the assignment via <code>JoinGroup</code>/<code>SyncGroup</code>; eager (stop-the-world) or incremental cooperative (KIP-429)</td></tr>
+<tr><td><strong>Consumer</strong> <span class="pill kip">KIP-848</span></td><td><code>consumer</code></td><td>A single long-lived <code>ConsumerGroupHeartbeat</code> RPC; assignment is <em>fully server-side</em>; incremental reconciliation via three epochs (group / assignment / member). GA in 4.0; server-side assignors only</td></tr>
+<tr><td><strong>Streams</strong> <span class="pill kip">KIP-1071</span></td><td><code>streams</code></td><td>The KIP-848 model extended to Kafka Streams task assignment; Early Access in 4.1, Generally Available (core feature set) since 4.2</td></tr>
+</tbody>
+</table></div>
+<p>The new Java group coordinator (default on KRaft in 4.0) runs each <code>__consumer_offsets</code> partition as a single-threaded replicated state machine and also backs share groups and Streams groups. Full detail in <a href="13-group-coordination.html">Group Coordination &amp; Rebalance Protocols</a>.</p>
+
+<h3>Exactly-once &amp; transactions</h3>
+<p>Exactly-once semantics is two layers (KIP-98), both carried in the v2 batch header and reconstructable on log reload:</p>
+<ul>
+<li>The <strong>idempotent producer</strong> deduplicates retries <em>within one producer session, per partition</em>, using a producer id (PID) + epoch + monotonic per-partition sequence number that the leader's <code>ProducerStateManager</code> validates. On by default since 3.0 (with <code>acks=all</code>, in-flight ≤ 5).</li>
+<li><strong>Transactions</strong> give atomic, all-or-nothing writes across many partitions and across sessions. A <code>TransactionCoordinator</code> maps a user <code>transactional.id</code> to a PID with epoch fencing, runs a two-phase commit over the internal <code>__transaction_state</code> log, and writes <strong>COMMIT/ABORT marker</strong> control records into every involved partition. <code>read_committed</code> consumers stop at the last stable offset and filter aborted batches via the transaction index.</li>
+</ul>
+<p>Folding consumer-offset commits into the transaction (<code>sendOffsetsToTransaction</code>) makes the read-process-write loop a single atomic unit — the basis for Kafka Streams' end-to-end exactly-once. See <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once</a>.</p>
+
+<h3>Share groups (queues)</h3>
+<p>Share groups <span class="pill kip">KIP-932</span> add a queue-like model: <em>many</em> consumers cooperatively read the <em>same</em> partition (N:M), and records are leased individually under a time-bounded acquisition lock with a per-record delivery state (Available → Acquired → Acknowledged/Archived) and delivery count, rather than committed by offset. This gives at-least-once with bounded redelivery and an optional dead-letter queue, decoupling parallelism from partition count. Durable state lives in <code>__share_group_state</code> via a share coordinator. See <a href="15-share-groups.html">Share Groups</a>.</p>
+
+<h3>Delivery &amp; ordering guarantees</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Guarantee</th><th>What holds</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><td><strong>Per-partition ordering</strong></td><td>Records in a partition are read in offset order, always</td><td>Single leader assigns dense offsets at append; followers copy a prefix</td></tr>
+<tr><td><strong>No cross-partition ordering</strong></td><td>Order across partitions is undefined</td><td>Partition is the unit of ordering by design</td></tr>
+<tr><td><strong>At-least-once</strong></td><td>The default with <code>acks=all</code> + retries; a record may be delivered more than once</td><td>Producer retries; consumer commits after processing</td></tr>
+<tr><td><strong>Exactly-once</strong></td><td>Opt-in: idempotent producer + transactions + <code>read_committed</code></td><td>PID/epoch/sequence dedup; 2PC markers; LSO read boundary</td></tr>
+<tr><td><strong>Read boundary (HW)</strong></td><td><code>read_uncommitted</code> consumers never see uncommitted data</td><td>High watermark = min LEO over ISR; reads clamp to HW</td></tr>
+<tr><td><strong>Read boundary (LSO)</strong></td><td><code>read_committed</code> consumers never see undecided/aborted txn data</td><td>Last stable offset = below it every transaction is decided</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout gotcha"><span class="callout-title">acks=all alone is not "no data loss"</span><p><code>acks=all</code> waits for all members of the <em>current</em> ISR — which can shrink to just the leader. Durability requires <code>acks=all</code> <strong>and</strong> <code>min.insync.replicas &gt;= 2</code> so the leader rejects writes when the ISR is too small. The classic loss case is <code>replication.factor=3, min.insync.replicas=1, acks=all</code>. Eligible Leader Replicas (KIP-966) close the remaining "last replica standing" gap by freezing HW advancement when the ISR drops below min ISR.</p></div>
+
+<h2>The threading model of a broker at a glance</h2>
+
+<p>A broker is a carefully partitioned set of thread pools, each with a single job, communicating through bounded hand-off queues. Nothing on the request hot path blocks on disk or network from a handler thread — slow work is <em>parked</em> in a purgatory and completed by an event later.</p>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-client"><span class="nt">socket</span><span class="nd">inbound TCP connection</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">ACCEPTOR</span><span class="nd">1 per listener — round-robins connections to processors</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker"><span class="nt">PROCESSOR threads (NIO)</span><span class="nd">num.network.threads / listener (default 3); one Selector each · frame: 4-byte size + payload</span></div>
+  <div class="conn" data-label="enqueue"></div>
+  <div class="node cat-broker store"><span class="nt">RequestChannel</span><span class="nd">bounded ArrayBlockingQueue (queued.max.requests = 500) — the back-pressure point</span></div>
+  <div class="conn" data-label="dequeue"></div>
+  <div class="node cat-broker"><span class="nt">KafkaRequestHandler pool</span><span class="nd">num.io.threads (default 8): KafkaApis.handle (match on apiKey, ~80 handlers) ▶ authorize ▶ act ▶ build response ▶ throttle ▶ route to originating processor</span></div>
+  <div class="conn"></div>
+  <div class="row">
+    <div class="col"><div class="conn ec-data" data-label="act via"></div><div class="node cat-broker"><span class="nt">ReplicaManager → UnifiedLog</span><span class="nd">append / read · Group / Txn / Share coordinators · MetadataCache</span></div></div>
+    <div class="col"><div class="conn dashed ec-async" data-label="can't complete now?"></div><div class="node cat-coord"><span class="nt">DelayedOperationPurgatory</span><span class="nd">Produce, Fetch, DeleteRecords, RemoteFetch … hierarchical TIMING WHEEL for timeouts; completes when its condition fires</span></div></div>
+  </div>
+  <div class="conn dashed"></div>
+  <div class="node pill"><span class="nt">running alongside — background threads</span></div>
+  <div class="conn dashed"></div>
+  <div class="node cat-broker"><span class="nt">background thread pools</span><span class="nd">ReplicaFetcherThreads (pull from leaders) · log cleaner / retention schedulers · ExpirationReapers (advance the wheel) · ThrottledChannelReapers (quotas) · if combined: quorum-controller event loop + kafka-raft-io-thread</span></div>
+</div><figcaption>Broker threading: acceptor → processor (NIO reactor) → bounded RequestChannel → handler pool → KafkaApis, with non-completable work parked in purgatories driven by a hierarchical timing wheel.</figcaption>
+  <div class="legend">
+    <span class="lgi"><span class="sw cat-client"></span>external socket / connection</span>
+    <span class="lgi"><span class="sw cat-broker"></span>broker thread pool / component</span>
+    <span class="lgi"><span class="sw cat-coord"></span>purgatory (parked, waiting)</span>
+    <span class="lgi"><span class="sw cat-broker cyl"></span>cylinder = the bounded hand-off queue</span>
+    <span class="lgi"><span class="arr"></span>request hand-off</span>
+    <span class="lgi"><span class="arr dashed"></span>parked / runs alongside</span>
+  </div>
+</figure>
+
+<dl class="kv">
+<dt>Acceptor</dt><dd>One non-daemon thread per listener; accepts TCP connections and round-robins them to processors. Connection quotas (count + creation rate) are enforced here.</dd>
+<dt>Processor (network thread)</dt><dd><code>num.network.threads</code> per listener (default 3), each owning one <code>java.nio.Selector</code>. Reads size-delimited requests, hands them to the <code>RequestChannel</code>, and writes responses back. Per-connection ordering is guaranteed by muting a channel while its request is in flight.</dd>
+<dt>Request handler (I/O thread)</dt><dd><code>num.io.threads</code> daemon threads (default 8) running <code>KafkaApis.handle</code> — a giant dispatch on <code>apiKey</code> to ~80 handlers. The <code>RequestChannel</code> (bounded at <code>queued.max.requests</code> = 500) is the back-pressure point: when handlers fall behind, network threads block on the queue and stop reading sockets, turning handler slowness into TCP back-pressure.</dd>
+<dt>Replica fetcher</dt><dd>Background threads on a <em>follower</em> broker that pull from leaders (<code>num.replica.fetchers</code> per source, keyed by leader+fetcherId). Followers are fetch clients of leaders.</dd>
+<dt>Purgatory &amp; reapers</dt><dd>A <code>DelayedOperationPurgatory</code> parks operations (acks=all produce, under-min-bytes fetch, remote fetch, …) that cannot complete immediately, indexed by watch key and by a hierarchical <strong>timing wheel</strong> (O(1) insert/cancel). An <code>ExpirationReaper</code> advances the clock; operations complete when their condition fires or they time out.</dd>
+<dt>Coordinator / controller threads</dt><dd>Group/transaction/share coordinators run per-partition single-threaded event loops. A combined node also runs the controller's <code>quorum-controller</code> event loop and the <code>kafka-raft-io-thread</code>.</dd>
+</dl>
+
+<p>The <strong>request lifecycle</strong> is instrumented end to end: each request carries timestamps decomposing latency into request-queue time, local processing, remote (purgatory) time, response-queue time, and send time, each written by a different actor. The reactor (<code>Selector</code> + <code>KafkaChannel</code>) is the same code used by producers, consumers, and replica fetchers. Deep dives: <a href="06-network-and-threading.html">Network Layer &amp; Threading</a> and <a href="07-request-processing.html">Request Processing (KafkaApis)</a>.</p>
+
+<h2>Map of the codebase</h2>
+
+<p>The repository is a multi-module Gradle build. Knowing which module owns what is half the battle when reading source. The principal modules:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Module</th><th>Language</th><th>What lives there</th><th>Chapters</th></tr></thead>
+<tbody>
+<tr><td><code>clients</code></td><td>Java</td><td>The producer, consumer, admin, and share clients (the <code>AdminClient</code> has no chapter of its own — its controller-forwarding pipeline surfaces in <a href="07-request-processing.html">07</a>); the shared NIO reactor (<code>Selector</code>, <code>KafkaChannel</code>); the wire-protocol message types and generated schemas; record-format classes; security channel stack</td><td><a href="01-record-format.html">01</a>, <a href="02-wire-protocol.html">02</a>, <a href="16-producer-client.html">16</a>, <a href="17-consumer-client.html">17</a>, <a href="18-security.html">18</a></td></tr>
+<tr><td><code>core</code></td><td>Scala</td><td>The broker itself: <code>SocketServer</code>, <code>KafkaApis</code>, <code>ReplicaManager</code>, <code>Partition</code>, <code>BrokerServer</code>/<code>ControllerServer</code>/<code>KafkaRaftServer</code>, replica fetchers, the transaction coordinator runtime, broker-side metadata publishing</td><td><a href="06-network-and-threading.html">06</a>, <a href="07-request-processing.html">07</a>, <a href="08-replication.html">08</a>, <a href="09-fetch-path.html">09</a>, <a href="14-transactions-eos.html">14</a></td></tr>
+<tr><td><code>storage</code></td><td>Java</td><td>The log engine: <code>UnifiedLog</code>, <code>LocalLog</code>, <code>LogSegment</code>, the indexes, <code>LogManager</code>, the <code>LogCleaner</code> (compaction), <code>ProducerStateManager</code>, tiered-storage <code>RemoteLogManager</code></td><td><a href="03-storage-log-engine.html">03</a>, <a href="04-storage-management.html">04</a>, <a href="05-tiered-storage.html">05</a></td></tr>
+<tr><td><code>metadata</code></td><td>Java</td><td>The KRaft controller (<code>QuorumController</code> and the per-domain control managers), the <code>MetadataImage</code>/<code>MetadataDelta</code>/<code>MetadataLoader</code> pipeline, <code>PartitionRegistration</code>, the <code>StandardAuthorizer</code></td><td><a href="11-kraft-controller.html">11</a>, <a href="12-metadata-propagation.html">12</a>, <a href="18-security.html">18</a></td></tr>
+<tr><td><code>raft</code></td><td>Java</td><td>Kafka's own Raft implementation: <code>KafkaRaftClient</code>, the <code>QuorumState</code> role machine, snapshots, dynamic quorum reconfiguration</td><td><a href="10-kraft-consensus.html">10</a></td></tr>
+<tr><td><code>group-coordinator</code></td><td>Java</td><td>The modern Java group coordinator: <code>CoordinatorRuntime</code>, <code>GroupMetadataManager</code>, <code>OffsetMetadataManager</code>, classic + KIP-848 protocols, server-side assignors; share-group config</td><td><a href="13-group-coordination.html">13</a>, <a href="15-share-groups.html">15</a></td></tr>
+<tr><td><code>transaction-coordinator</code></td><td>Java/Scala</td><td>Producer-ID management (<code>RPCProducerIdManager</code>), transaction state schemas, marker plumbing</td><td><a href="14-transactions-eos.html">14</a></td></tr>
+<tr><td><code>share-coordinator</code></td><td>Java</td><td>The share-group state coordinator and its <code>__share_group_state</code> persistence</td><td><a href="15-share-groups.html">15</a></td></tr>
+<tr><td><code>server</code> / <code>server-common</code></td><td>Java</td><td>Shared server infrastructure: config classes, <code>ProcessRole</code>, the purgatory + timing wheel, quotas, broker lifecycle, <code>AssignmentsManager</code>, feature/metadata-version definitions</td><td><a href="06-network-and-threading.html">06</a>, <a href="12-metadata-propagation.html">12</a>, <a href="19-quotas.html">19</a></td></tr>
+<tr><td><code>streams</code></td><td>Java</td><td>Kafka Streams: topology builder, <code>StreamThread</code>, the task model, state stores, the changelog restorer, EOS-v2</td><td><a href="20-kafka-streams.html">20</a></td></tr>
+<tr><td><code>connect</code></td><td>Java</td><td>Kafka Connect: the plugin SPI, <code>Worker</code> and task loops, the <code>DistributedHerder</code>, the three internal topics, MirrorMaker 2</td><td><a href="21-kafka-connect.html">21</a></td></tr>
+</tbody>
+</table></div>
+
+<h2>How to read this guide</h2>
+
+<p>The twenty-one detailed chapters are written to stand alone, but they build on each other. Here is a recommended path and a logical grouping. If you read top to bottom you will rarely hit a forward reference you do not already understand.</p>
+
+<h3>Recommended reading order</h3>
+<ol>
+<li><strong>Start here</strong> (this chapter) for the whole-system model.</li>
+<li><strong>Bytes &amp; protocol</strong> — the vocabulary everything else speaks: <a href="01-record-format.html">01 · Record Format &amp; Batches</a>, then <a href="02-wire-protocol.html">02 · Wire Protocol &amp; RPC</a>.</li>
+<li><strong>Storage</strong> — where records live: <a href="03-storage-log-engine.html">03 · The Log Storage Engine</a>, <a href="04-storage-management.html">04 · Log Management, Retention &amp; Compaction</a>, <a href="05-tiered-storage.html">05 · Tiered Storage</a>.</li>
+<li><strong>The broker's spine</strong> — how requests flow: <a href="06-network-and-threading.html">06 · Network Layer &amp; Threading</a>, <a href="07-request-processing.html">07 · Request Processing (KafkaApis)</a>.</li>
+<li><strong>Durability</strong> — making data safe and readable: <a href="08-replication.html">08 · Replication, ISR &amp; High Watermark</a>, <a href="09-fetch-path.html">09 · Fetch Path &amp; Replica Fetchers</a>.</li>
+<li><strong>The metadata plane</strong> — the KRaft brain: <a href="10-kraft-consensus.html">10 · KRaft Consensus (Raft)</a>, <a href="11-kraft-controller.html">11 · The KRaft Controller</a>, <a href="12-metadata-propagation.html">12 · Metadata Propagation &amp; Broker Lifecycle</a>.</li>
+<li><strong>Coordination &amp; semantics</strong> — groups, EOS, queues: <a href="13-group-coordination.html">13 · Group Coordination</a>, <a href="14-transactions-eos.html">14 · Transactions &amp; Exactly-Once</a>, <a href="15-share-groups.html">15 · Share Groups</a>.</li>
+<li><strong>The clients</strong> — the smart edge: <a href="16-producer-client.html">16 · The Producer Client</a>, <a href="17-consumer-client.html">17 · The Consumer Client</a>.</li>
+<li><strong>Cross-cutting concerns</strong>: <a href="18-security.html">18 · Security</a>, <a href="19-quotas.html">19 · Quotas &amp; Throttling</a>.</li>
+<li><strong>Built on top</strong> — the higher-level frameworks: <a href="20-kafka-streams.html">20 · Kafka Streams</a>, <a href="21-kafka-connect.html">21 · Kafka Connect</a>.</li>
+<li>Keep the <a href="glossary.html">Glossary &amp; Cross-Cutting Concepts</a> open in a tab.</li>
+</ol>
+
+<h3>Alternative entry points</h3>
+<dl class="kv">
+<dt>"I operate clusters"</dt><dd>Read 08 (replication/durability), 12 (broker lifecycle), 04 (retention), 05 (tiered storage), 19 (quotas), 18 (security). The durability gotcha above is the single most important operational fact.</dd>
+<dt>"I write producers/consumers"</dt><dd>Read 16, 17, then 13 (groups) and 14 (EOS) for semantics, with 01/02 for what goes over the wire.</dd>
+<dt>"I'm here for KRaft"</dt><dd>Read 10 (the Raft dialect), 11 (the controller state machine), 12 (how brokers consume metadata). Note that KRaft is a <em>pull-based</em> Raft dialect with no leader heartbeats — not textbook Raft.</dd>
+<dt>"I want exactly-once"</dt><dd>Read 14 first, then 13 (offset commits fold into transactions) and 03 (producer state on disk). Streams EOS-v2 is in 20.</dd>
+</dl>
+
+<div class="callout rationale"><span class="callout-title">Why this structure</span><p>The guide is layered like Kafka itself: bytes, then storage, then the broker, then durability, then the metadata plane, then coordination, then clients, then the frameworks built on all of it. Each chapter is derived directly from the 4.4.0-SNAPSHOT source (git <code>04bfe7d</code>) with file-and-line citations, KRaft-only, and fact-checked — not paraphrased from official docs. Where a date or attribution is commonly mis-stated (e.g. "acks=all guarantees no loss," "KRaft is standard Raft," "tiered storage was GA in 3.6"), the chapters call out the correct fact explicitly.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fetch Path &amp; Replica Fetchers · Kafka Internals</title>
+<meta name="description" content="Follower replication, AbstractFetcherThread, truncation, incremental fetch sessions, DelayedFetch.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="09-fetch-path">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>09 · The Fetch Path &amp; Replica Fetchers</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
+
+<p class="lead">There is exactly one read path in Kafka, served by a single piece of machinery, and two kinds of clients walk it: <em>follower brokers</em> replicating from a partition leader, and <em>consumers</em> draining committed data. Both speak the <a href="02-wire-protocol.html">Fetch API</a>; both land in <code>ReplicaManager.fetchMessages</code>, which reads from the <a href="03-storage-log-engine.html">log engine</a>, optionally parks the request in a <em>purgatory</em> until <code>min.bytes</code>/<code>max.wait.ms</code> are satisfied, and streams record batches back with zero-copy <code>sendfile</code>. This chapter dissects the follower side (the <code>AbstractFetcherThread</code> pull loop, work partitioning, the leader-epoch truncation handshake, and intra-broker JBOD moves) and the leader-serving side (log reads, <code>DelayedFetch</code>, the high-watermark/last-stable-offset bounds, incremental fetch sessions per KIP-227, and rack-aware fetch-from-follower per KIP-392).</p>
+
+<h2>Role &amp; responsibilities</h2>
+<p>The fetch subsystem has two distinct halves that meet at the wire:</p>
+<ul>
+  <li><strong>Follower replication (the fetcher side).</strong> Each broker that is a <em>follower</em> for some partitions runs a small pool of long-lived threads that continuously pull records from the partition's leader, append them to the local log, and advance their own high watermark from the leader's reported value. This is how the ISR stays caught up (see <a href="08-replication.html">Replication, ISR &amp; High Watermark</a>).</li>
+  <li><strong>Serving fetches (the leader/broker side).</strong> When a follower's fetch request or a consumer's fetch request arrives, the broker reads from its local log and returns data — either immediately or after a bounded wait in purgatory. Consumers and followers differ only in a handful of parameters (isolation bound, who may be throttled, whether a preferred read replica is computed).</li>
+</ul>
+<p>A third, closely-related actor reuses the same fetcher framework for an entirely local purpose: <strong><code>ReplicaAlterLogDirsThread</code></strong> copies a partition from one local log directory to another (JBOD intra-broker reassignment), fetching from a <em>local</em> leader endpoint instead of a remote socket.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>Follower replication is just a fetch loop. A follower is a client of its leader's Fetch API; the very same <code>ReplicaManager.fetchMessages</code> path that serves consumers serves followers, distinguished by <code>FetchParams.replicaId</code> being a valid broker id rather than the consumer sentinel.</p></div>
+
+<h2>Where it lives in the code</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Class / file</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>core/src/main/scala/kafka/server/AbstractFetcherThread.scala</code></td><td>The pull loop: truncate, build fetch, send, process responses, advance state. Shared by replica and alter-dir fetchers.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/AbstractFetcherManager.scala</code></td><td>Partitions topic-partitions across N fetcher threads keyed by (leader, fetcherId); thread-pool resize; failed-partition tracking.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/ReplicaFetcherThread.scala</code></td><td>Follower-specific append, HW advance, and post-fetch delayed-fetch completion.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/ReplicaFetcherManager.scala</code></td><td>Creates <code>ReplicaFetcherThread</code>s with a <code>RemoteLeaderEndPoint</code> + <code>FetchSessionHandler</code>.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/RemoteLeaderEndPoint.scala</code></td><td>Talks to a remote leader broker over a blocking socket; builds incremental fetch requests; issues <code>ListOffsets</code> / <code>OffsetsForLeaderEpoch</code>.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/LocalLeaderEndPoint.scala</code></td><td>"Fetches" from a local replica for the alter-log-dirs path by calling <code>ReplicaManager.fetchMessages</code> in-process.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/ReplicaAlterLogDirsThread.scala</code></td><td>Copies a partition between local log directories; promotes the future replica.</td></tr>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/LeaderEndPoint.java</code></td><td>Interface abstracting "the leader I fetch from" (remote vs local).</td></tr>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/PartitionFetchState.java</code></td><td>Per-partition fetcher state record: offset, epoch, lag, FETCHING/TRUNCATING, delay.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/ReplicaManager.scala</code></td><td><code>fetchMessages</code>, <code>readFromLog</code>, <code>findPreferredReadReplica</code>, throttling, purgatory wiring.</td></tr>
+<tr><td><code>core/src/main/scala/kafka/server/DelayedFetch.scala</code></td><td>The delayed operation that waits for <code>min.bytes</code> or expiry in the fetch purgatory.</td></tr>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/FetchSession.java</code></td><td>Leader-side incremental fetch session + <code>CachedPartition</code> + <code>FetchSessionCache</code>.</td></tr>
+<tr><td><code>server/src/main/java/org/apache/kafka/server/FetchManager.java</code> / <code>FetchContext.java</code> / <code>FetchSessionCacheShard.java</code></td><td>Server-side session creation, epoch validation, eviction.</td></tr>
+<tr><td><code>clients/src/main/java/org/apache/kafka/clients/FetchSessionHandler.java</code></td><td>Client/follower-side session bookkeeping (which partitions to send vs forget).</td></tr>
+<tr><td><code>clients/src/main/java/org/apache/kafka/common/replica/RackAwareReplicaSelector.java</code></td><td>Default pluggable rack-locality selector (KIP-392).</td></tr>
+</tbody>
+</table></div>
+
+<h2>Core concepts &amp; terminology</h2>
+<dl class="kv">
+  <dt>Fetcher thread</dt><dd>A <code>ShutdownableThread</code> that loops <code>doWork()</code> = truncate-if-needed, then fetch, for a set of partitions sharing one leader. Named <code>ReplicaFetcherThread-{fetcherId}-{leaderId}</code> (<code>ReplicaFetcherManager.scala:42</code>).</dd>
+  <dt>Leader endpoint</dt><dd>The <code>LeaderEndPoint</code> a fetcher reads from. <code>RemoteLeaderEndPoint</code> wraps a TCP <code>BlockingSend</code>; <code>LocalLeaderEndPoint</code> reads in-process for JBOD moves.</dd>
+  <dt>High watermark (HW)</dt><dd>The largest offset known to be replicated to all in-sync replicas; the consumer-visible end of the log. Followers learn it from the leader's fetch response and copy it locally (<code>ReplicaFetcherThread.scala:143</code>).</dd>
+  <dt>Last stable offset (LSO)</dt><dd>The bound for <code>read_committed</code> consumers: the offset below which there are no open transactions. See <a href="14-transactions-eos.html">Transactions &amp; EOS</a>.</dd>
+  <dt>Fetch offset / fetched epoch</dt><dd>The follower's next-to-read offset and the leader epoch of its last appended batch, sent so the leader can detect log divergence.</dd>
+  <dt>Diverging epoch</dt><dd>A signal in the fetch response telling the follower its log has diverged from the leader and must truncate (KIP-595 truncation-on-fetch).</dd>
+  <dt>Incremental fetch session</dt><dd>A stateful "subscription" (KIP-227): after a full fetch establishes a <code>sessionId</code>, subsequent requests omit unchanged partitions and the response omits partitions with no news.</dd>
+  <dt>Preferred read replica</dt><dd>A follower the leader nominates for a consumer to read from, for rack locality (KIP-392).</dd>
+</dl>
+
+<h2>Data structures</h2>
+
+<h3>PartitionFetchState (in-memory, per partition per fetcher)</h3>
+<p>The follower's complete per-partition fetch state is the record <code>PartitionFetchState</code> (<code>server/.../PartitionFetchState.java:32</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>topicId</code></td><td><code>Optional&lt;Uuid&gt;</code></td><td>Topic ID for topic-ID-aware fetch (FetchRequest v13+).</td></tr>
+<tr><td><code>fetchOffset</code></td><td><code>long</code></td><td>Next offset to fetch; equals the follower's log-end offset once caught up.</td></tr>
+<tr><td><code>lag</code></td><td><code>Optional&lt;Long&gt;</code></td><td>leaderHW − nextOffset; <code>isReplicaInSync</code> ⇔ lag ≤ 0 (<code>:71</code>).</td></tr>
+<tr><td><code>currentLeaderEpoch</code></td><td><code>int</code></td><td>The leader epoch this follower believes is current; sent in every fetch/epoch request for fencing.</td></tr>
+<tr><td><code>delay</code> / <code>dueMs</code></td><td><code>Optional&lt;Long&gt;</code></td><td>Backoff: if set and <code>dueMs &gt; now</code>, the partition is skipped (<code>isDelayed</code>, <code>:78</code>).</td></tr>
+<tr><td><code>state</code></td><td><code>ReplicaState</code></td><td><code>FETCHING</code> or <code>TRUNCATING</code>. <code>isReadyForFetch</code> ⇔ FETCHING &amp;&amp; !delayed (<code>:66</code>).</td></tr>
+<tr><td><code>lastFetchedEpoch</code></td><td><code>Optional&lt;Integer&gt;</code></td><td>Leader epoch of the last batch appended; lets the leader detect divergence.</td></tr>
+</tbody>
+</table></div>
+<p>All states live in a <code>PartitionStates&lt;PartitionFetchState&gt;</code> inside the fetcher (<code>AbstractFetcherThread.scala:70</code>), an insertion-ordered map; <code>updateAndMoveToEnd</code> rotates a just-served partition to the back for round-robin fairness.</p>
+
+<h3>CachedPartition (leader-side, per fetch session)</h3>
+<p>For every partition in an incremental fetch session, the broker keeps a memory-frugal <code>CachedPartition</code> (<code>FetchSession.java:220</code>). It deliberately stores <code>topic</code>/<code>topicId</code>/<code>partition</code> as primitives rather than a <code>TopicPartition</code> object, because a broker may hold millions of them. Key fields: <code>maxBytes</code>, <code>fetchOffset</code>, <code>highWatermark</code>, <code>leaderEpoch</code>, <code>fetcherLogStartOffset</code> (the <em>follower's</em> LSO), <code>localLogStartOffset</code> (this broker's LSO for the partition), and <code>lastFetchedEpoch</code>. Its <code>maybeUpdateResponseData</code> decides whether a partition must appear in the response (see below). Equality/hash switch on whether topic IDs are in use (<code>:380</code>, <code>:397</code>).</p>
+
+<h3>FetchSession &amp; the sharded cache</h3>
+<p>A <code>FetchSession</code> (<code>FetchSession.java:42</code>) carries an <code>id</code>, a <code>privileged</code> flag (true for follower sessions, false for consumers), the <code>partitionMap</code> of <code>CachedPartition</code>s, a monotonically increasing <code>epoch</code>, and <code>creationMs</code>/<code>lastUsedMs</code>. Each session is guarded by its own monitor lock. Sessions are kept in a <code>FetchSessionCache</code> split into <code>NumFetchSessionCacheShards = 8</code> shards (<code>KafkaBroker.scala:79</code>), each owning a contiguous <code>sessionIdRange = Int.MaxValue / 8</code> band of IDs so the shard for an ID is <code>sessionId / sessionIdRange</code> (<code>FetchSession.java:471</code>). Total capacity is <code>max.incremental.fetch.session.cache.slots</code> (default 1000) divided across shards (<code>BrokerServer.scala:465</code>).</p>
+
+<h2>Architecture &amp; control/data flow</h2>
+
+<figure class="diagram"><div class="dflow">
+  <div class="node cat-broker"><span class="nt">ReplicaFetcherThread.doWork() loop</span><span class="nd">follower side &middot; truncate &rarr; fetch &rarr; append</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker decision">maybeTruncate(): in TRUNCATING?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn ec-async" data-label="OffsetsForLeaderEpoch"></div>
+      <div class="node cat-broker"><span class="nt">Leader: handleOffsetForLeaderEpochRequest</span><span class="nd">replies epoch end offsets</span></div>
+      <div class="conn dashed ec-async" data-label="epoch end offsets &rarr; truncate local log"></div>
+    </div>
+    <div class="col">
+      <div class="conn" data-label="FETCHING"></div>
+      <div class="node cat-broker"><span class="nt">maybeFetch &rarr; buildFetch</span><span class="nd">FetchSessionHandler: only changed partitions</span></div>
+    </div>
+  </div>
+  <div class="conn ec-data" data-label="FetchRequest (sessionId, epoch)"></div>
+  <div class="node cat-broker"><span class="nt">Leader: handleFetchRequest</span><span class="nd">fetchManager.newContext &rarr; ReplicaManager.fetchMessages</span></div>
+  <div class="conn"></div>
+  <div class="node cat-broker store"><span class="nt">readFromLog</span><span class="nd">bound = HW / LSO / LOG_END</span></div>
+  <div class="conn"></div>
+  <div class="node cat-storage decision">bytesReadable &ge; minBytes?</div>
+  <div class="row">
+    <div class="col">
+      <div class="conn dashed ec-async" data-label="no"></div>
+      <div class="node cat-coord pill"><span class="nt">DelayedFetch &rarr; fetch purgatory</span><span class="nd">park until min.bytes / max.wait.ms</span></div>
+      <div class="conn dashed ec-async" data-label="on satisfy / expiry"></div>
+    </div>
+    <div class="col">
+      <div class="conn ec-data" data-label="yes: respond now"></div>
+      <div class="node cat-broker"><span class="nt">build FetchResponse</span><span class="nd">records (zero-copy), HW, logStartOffset</span></div>
+      <div class="conn dashed ec-data" data-label="response"></div>
+    </div>
+  </div>
+  <div class="node cat-broker"><span class="nt">processPartitionData (follower)</span><span class="nd">append &middot; maybeUpdateHighWatermark &middot; advance fetchOffset</span></div>
+  <div class="conn" data-label="HW advanced locally"></div>
+  <div class="node cat-coord"><span class="nt">completeDelayedFetchRequests()</span><span class="nd">wake consumer fetches parked on this broker</span></div>
+</div><figcaption>One follower fetch round-trip threaded through the leader's serving path: the follower truncates if diverged, builds an incremental fetch, the leader reads from its log and either responds immediately or parks the request in purgatory, and on return the follower appends and wakes any consumer fetches waiting on the freshly-advanced high watermark. The same leader path serves consumer fetches.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-broker"></span>broker component (fetcher thread / KafkaApis / ReplicaManager)</span>
+  <span class="lgi"><span class="sw cat-storage"></span>log read / on-disk bound</span>
+  <span class="lgi"><span class="sw cat-coord round"></span>purgatory &amp; delayed-fetch wakeups (waiting)</span>
+  <span class="lgi"><span class="sw cat-broker dash"></span>cylinder = log read</span>
+  <span class="lgi"><span class="mono">rounded</span> = decision &middot; <span class="mono">pill</span> = purgatory</span>
+  <span class="lgi"><span class="arr cat-broker ec-data"></span>request / response data</span>
+  <span class="lgi"><span class="arr dashed cat-coord ec-async"></span>async: epoch handshake / purgatory / wakeup</span>
+</div></figure>
+
+<h3>The fetcher manager: partitioning work across threads</h3>
+<p><code>AbstractFetcherManager</code> owns a <code>fetcherThreadMap: HashMap[BrokerIdAndFetcherId, T]</code> (<code>AbstractFetcherManager.scala:40</code>). When partitions are assigned (<code>addFetcherForPartitions</code>, <code>:131</code>) each is bucketed by <code>BrokerAndFetcherId(leader, getFetcherId(tp))</code>. The fetcher id is a stable hash:</p>
+<pre><code>fetcherId = Utils.abs(31 * topic.hashCode + partition) % numFetchersPerBroker   // :113</code></pre>
+<p>So a partition's fetcher is a function of (its leader broker, hash of its name). With <code>num.replica.fetchers = 1</code> (default) a follower runs one fetcher thread <em>per source leader broker</em>; raising it fans partitions from the same leader across more threads. A thread is reused if it already targets that broker; otherwise the stale one is shut down and a fresh one started (<code>:147</code>–<code>:156</code>). <code>resizeThreadPool</code> drains every thread's partitions and re-adds them under the new modulus so the hash mapping stays consistent across add/delete (<code>:69</code>–<code>:99</code>). <code>shutdownIdleFetcherThreads</code> reaps threads with zero partitions (<code>:207</code>).</p>
+
+<div class="callout note"><span class="callout-title">Note</span><p>The total number of replica-fetcher threads on a broker is bounded by <code>num.replica.fetchers × (number of distinct leader brokers it follows)</code>, not by partition count. Many partitions multiplex onto each thread via one incremental fetch session per (follower, leader) pair.</p></div>
+
+<h3>The pull loop in detail</h3>
+<p>Every iteration of <code>AbstractFetcherThread.doWork()</code> is <code>maybeTruncate(); maybeFetch()</code> (<code>:112</code>). <code>ReplicaFetcherThread</code> appends a third step, <code>completeDelayedFetchRequests()</code> (<code>:107</code>).</p>
+<ol>
+  <li><strong>maybeFetch</strong> (<code>:117</code>) takes <code>partitionMapLock</code>, calls <code>leader.buildFetch(partitionStates)</code>, and — if no partition is ready — waits on <code>partitionMapCond</code> for up to <code>fetchBackOffMs</code> (= <code>replica.fetch.backoff.ms</code>, default 1000) before looping. If a request was built, it is sent <em>outside</em> the lock by <code>processFetchRequest</code>.</li>
+  <li><strong>processFetchRequest</strong> (<code>:318</code>) calls <code>leader.fetch(request)</code> (a blocking round-trip), then re-takes <code>partitionMapLock</code> and, per partition, validates the response is still relevant — the partition must still be present, its <code>fetchOffset</code> and <code>currentLeaderEpoch</code> must match what was requested, and it must be <code>isReadyForFetch</code> (<code>:348</code>). This guards against the partition being moved/truncated/re-added while the request was in flight.</li>
+  <li>On <code>Errors.NONE</code>, if the response carries a <em>diverging epoch</em> and the leader supports truncation-on-fetch, the partition is recorded for truncation but <strong>not</strong> appended (HW/LSO are left untouched until the next fetch) (<code>:356</code>). Otherwise it hands the batch to <code>processPartitionData</code> and advances <code>fetchOffset = lastOffset + 1</code>, recomputes <code>lag = max(0, respHW − nextOffset)</code>, and rotates the partition to the back of <code>partitionStates</code> (<code>:380</code>–<code>:393</code>).</li>
+</ol>
+<p><strong>Follower append</strong> (<code>ReplicaFetcherThread.processPartitionData</code>, <code>:113</code>): it asserts <code>fetchOffset == log.logEndOffset</code> (a follower must always fetch exactly at its LEO; mismatch throws <code>IllegalStateException</code>, <code>:124</code>), converts <code>FileRecords</code> to <code>MemoryRecords</code> if needed, appends via <code>partition.appendRecordsToFollowerOrFutureReplica</code>, then <code>log.maybeUpdateHighWatermark(partitionData.highWatermark)</code> and <code>log.maybeIncrementLogStartOffset(leaderLogStartOffset, ...)</code>. Critically the batch is only appended up to the leader epoch that was current when the FETCH was built (passed as <code>partitionLeaderEpoch</code>) to avoid appending across a truncation/append race — see KAFKA-18723 (<code>AbstractFetcherThread.scala:367</code>). Replication-quota bytes are recorded if the partition is throttled.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A follower's high watermark never exceeds the leader's: it is set strictly from the value the leader reports in the fetch response (<code>ReplicaFetcherThread.scala:143</code>), and only ever moves forward (<code>maybeUpdateHighWatermark</code>). A follower also fetches strictly at its own log-end offset (<code>:124</code>), so its log is always a prefix of what the leader has acknowledged.</p></div>
+
+<h2>The truncation handshake (becoming a follower)</h2>
+<p>When a replica becomes a follower (or the leader changes), its log may contain records the new leader never had (e.g. after an unclean election). It must truncate to the largest common prefix <em>before</em> appending anything new. Two mechanisms exist:</p>
+
+<h3>1. Truncation-on-fetch (the modern path, KIP-595/KIP-320)</h3>
+<p><code>RemoteLeaderEndPoint.isTruncationOnFetchSupported = true</code> (<code>:68</code>). The follower includes <code>lastFetchedEpoch</code> in each <code>FetchRequest.PartitionData</code> (<code>:191</code>). The leader compares it against its own leader-epoch history; if they diverge it returns a <em>diverging epoch</em> (epoch + endOffset) in the fetch response rather than data. The follower's <code>processFetchRequest</code> collects these and calls <code>truncateOnFetchResponse</code> (<code>:471</code>, <code>:233</code>), which runs <code>getOffsetTruncationState</code> and truncates — no separate round-trip needed.</p>
+
+<h3>2. The explicit OffsetsForLeaderEpoch handshake</h3>
+<p>For partitions that enter <code>TRUNCATING</code> state, <code>maybeTruncate</code> (<code>:172</code>) builds an <code>OffsetForLeaderEpoch</code> request from each partition's <code>latestEpoch</code> (<code>fetchTruncatingPartitions</code>, <code>:150</code>), sends it via <code>leader.fetchEpochEndOffsets</code>, then — re-checking under the lock that no leadership change occurred meanwhile (<code>:216</code>) — truncates to the offset computed by <code>getOffsetTruncationState</code> (<code>:604</code>). That function encodes the full KIP-101/KIP-279 logic:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Leader reply</th><th>Truncate to</th></tr></thead>
+<tbody>
+<tr><td><code>endOffset == UNDEFINED_EPOCH_OFFSET</code></td><td>the follower's initial/HW fetch offset (leader has no such epoch).</td></tr>
+<tr><td><code>leaderEpoch == UNDEFINED_EPOCH</code></td><td><code>min(leaderEndOffset, followerLEO)</code> (legacy protocol).</td></tr>
+<tr><td>follower knows an epoch <code>&lt;</code> the replied epoch</td><td>truncate to that smaller epoch's end offset, then send <em>another</em> epoch request (<code>truncationCompleted = false</code>).</td></tr>
+<tr><td>follower's epoch matches</td><td><code>min(followerEpochEndOffset, leaderEndOffset, followerLEO)</code> — the common prefix.</td></tr>
+</tbody>
+</table></div>
+<p>On the new follower, <code>partitionFetchState</code> (<code>:508</code>) decides the initial state: with truncation-on-fetch and a known <code>latestEpoch</code> it starts directly in <code>FETCHING</code> (divergence will be caught on the first fetch); otherwise it starts in <code>TRUNCATING</code>.</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>FENCED_LEADER_EPOCH</code> is handled by comparing the request's epoch to the current state: if they match, the follower is genuinely behind and the partition is <em>marked failed</em> until a fresh LeaderAndIsr-equivalent metadata update arrives; if the local epoch is already newer, it just retries later (<code>onPartitionFenced</code>, <code>:301</code>). A failed partition is removed from the fetcher and tracked in <code>FailedPartitions</code> (<code>:494</code>).</p></div>
+
+<h3>Out-of-range and unclean-election recovery</h3>
+<p><code>handleOutOfRangeError</code> → <code>fetchOffsetAndTruncate</code> (<code>:660</code>) covers the corner cases. If the leader's LEO is <em>behind</em> the follower's (the follower was an old leader that over-ran), it truncates down to the leader's LEO and resumes (<code>:681</code>). If the follower is below the leader's <em>log start</em> offset (it was offline while old data was deleted), it truncates fully and restarts at the leader's start offset (<code>truncateFullyAndStartAt</code>, <code>:719</code>). Otherwise it fetches from <code>max(leaderStartOffset, followerLEO)</code>.</p>
+
+<h2>Tiered-storage interplay on the fetch path</h2>
+<p>If the leader has moved the requested offset to remote storage, it returns <code>OFFSET_MOVED_TO_TIERED_STORAGE</code>. The follower's <code>handleOffsetsMovedToTieredStorage</code> (<code>:786</code>) drives a <code>TierStateMachine.start</code> to rebuild the partition's auxiliary state (leader-epoch cache, producer snapshot) from the leader's earliest-local or earliest-pending-upload offset, then resumes fetching from local data. A special "fetch from last tiered offset" mode (<code>follower.fetch.last.tiered.offset.enable</code>, default off; <code>ReplicaFetcherThread.scala:71</code>) lets a brand-new empty replica (<code>replicaEndOffset == 0</code>) skip ahead instead of replaying everything. See <a href="05-tiered-storage.html">Tiered Storage</a>.</p>
+
+<h2>Serving fetches on the leader</h2>
+
+<h3>ReplicaManager.fetchMessages</h3>
+<p><code>fetchMessages</code> (<code>ReplicaManager.scala:1665</code>) first does a synchronous <code>readFromLog(..., readFromPurgatory = false)</code>, accumulating <code>bytesReadable</code>. It then responds <em>immediately</em> if there is no remote fetch pending and any of: <code>maxWaitMs &le; 0</code>, no partitions requested, <code>bytesReadable &ge; minBytes</code>, a read error, a diverging epoch, or a preferred read replica was chosen (<code>:1705</code>). Otherwise it constructs a <code>DelayedFetch</code> and registers it in the purgatory keyed by every partition (<code>:1728</code>–<code>:1745</code>), so a later produce to any of those partitions can complete it.</p>
+
+<h3>readFromLog and the isolation bound</h3>
+<p><code>readFromLog</code> (<code>:1753</code>) iterates partitions, shrinking a shared <code>limitBytes</code> budget (so one fetch response never exceeds <code>fetch.max.bytes</code>) but always returning <em>at least one message</em> for the first partition (<code>minOneMessage</code>, <code>:1878</code>) to guarantee progress past a large batch. For each partition it calls <code>partition.fetchRecords</code>, whose upper read bound is the <code>FetchIsolation</code> derived from the request (<code>FetchIsolation.java:31</code>):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Requester</th><th>Isolation</th><th>Reads up to</th></tr></thead>
+<tbody>
+<tr><td>Follower (valid broker id)</td><td><code>LOG_END</code></td><td>the leader's log-end offset — followers see <em>uncommitted</em> data so the HW can advance.</td></tr>
+<tr><td>Consumer, <code>read_uncommitted</code></td><td><code>HIGH_WATERMARK</code></td><td>the high watermark.</td></tr>
+<tr><td>Consumer, <code>read_committed</code></td><td><code>TXN_COMMITTED</code></td><td>the last stable offset (LSO).</td></tr>
+</tbody>
+</table></div>
+<p><code>fetchOnlyLeader()</code> (<code>FetchParams.java:79</code>) forces leader-only reads for followers and for consumers that did not supply client metadata; a consumer <em>with</em> rack metadata may be steered to a follower.</p>
+
+<div class="callout key"><span class="callout-title">Key idea</span><p>The HW/LSO bound is enforced on the <em>leader at read time</em>, not by the client. A consumer literally cannot read past the high watermark (read_uncommitted) or the last stable offset (read_committed), because <code>fetchRecords</code> clamps the read to that offset.</p></div>
+
+<h3>DelayedFetch: waiting for min.bytes</h3>
+<p><code>DelayedFetch.tryComplete</code> (<code>DelayedFetch.scala:70</code>) re-evaluates completability whenever poked. It recomputes each partition's bound offset for the request's isolation and force-completes if any partition has rolled to a newer segment (Case F), or if data is now available below the bound; it accumulates <code>min(bytesAvailable, partitionMaxBytes)</code> and completes once the total reaches <code>params.minBytes</code> (Case G, <code>:142</code>). It short-circuits on leadership loss, offline dir, or fenced epoch (Cases A–E), and force-completes if a diverging epoch appeared while parked (Case H, <code>:109</code>), so truncation is not delayed. On expiry (<code>max.wait.ms</code> elapsed) or completion, <code>onComplete</code> re-reads with <code>readFromPurgatory = true</code> and fires the response callback (<code>:158</code>). Followers are excluded from triggering completion while throttled (<code>:99</code>), to avoid ISR thrashing.</p>
+
+<p>How does a parked consumer fetch ever wake? Two ways. A produce that advances the HW calls <code>delayedFetchPurgatory.checkAndComplete</code> on the affected key (<code>ReplicaManager.scala:864</code>). And a <em>follower</em>, after appending and advancing the leader's HW locally, collects <code>partitionsWithNewHighWatermark</code> and calls <code>completeDelayedFetchRequests</code> at the end of its loop (<code>ReplicaFetcherThread.scala:166</code>) — so a leader's own follower-replication progress is what releases consumer fetches waiting on freshly-committed data.</p>
+
+<h2>Incremental fetch sessions (KIP-227)</h2>
+<p>Sending the full partition set on every fetch does not scale to thousands of partitions. KIP-227 makes fetches incremental.</p>
+
+<h3>Server side: FetchManager.newContext</h3>
+<p>Each fetch carries <code>FetchMetadata(sessionId, epoch)</code>. <code>FetchManager.newContext</code> (<code>FetchManager.java:58</code>) dispatches:</p>
+<ul>
+  <li><strong>Full request</strong> (<code>isFull()</code>): any existing session with that id is removed; a new <code>FullFetchContext</code> is created (or <code>SessionlessFetchContext</code> if <code>epoch == FINAL_EPOCH</code>). A <code>FullFetchContext.updateAndGenerateResponseData</code> calls <code>maybeCreateSession</code> to allocate a session and assign a fresh id (<code>FetchContext.java:215</code>).</li>
+  <li><strong>Incremental request</strong>: the session is looked up in its shard under lock; the request <code>epoch</code> must equal the stored epoch or it is rejected with <code>INVALID_FETCH_SESSION_EPOCH</code> (<code>FetchManager.java:95</code>). A topic-ID/version mismatch yields <code>FETCH_SESSION_TOPIC_ID_ERROR</code>. On success the session's <code>partitionMap</code> is patched with added/updated/removed partitions, <code>lastUsedMs</code> is touched, the epoch is bumped via <code>nextEpoch</code>, and an <code>IncrementalFetchContext</code> is returned (<code>:106</code>–<code>:125</code>). If the request emptied the session it is removed and treated as sessionless.</li>
+</ul>
+<p>When building the response, <code>CachedPartition.maybeUpdateResponseData</code> (<code>FetchSession.java:336</code>) returns true — i.e. the partition is <em>included</em> — only if it has new records, a changed high watermark or log-start offset, an error, a diverging epoch, or a preferred-replica nomination. Unchanged partitions are silently dropped from the response, which is the entire point.</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:2">
+  <div class="lanes"><span class="actor cat-client">Client / follower</span><span class="actor cat-broker">Broker (FetchManager)</span></div>
+  <div class="body"><div class="lifelines"><i></i><i></i></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">FULL fetch (sessionId=0, epoch=0)</span><span class="ln"></span></div>
+    <div class="note" style="--from:2;--to:2">maybeCreateSession &rArr; assign id S</div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">response (sessionId=S, epoch=1)</span><span class="ln"></span></div>
+    <div class="note" style="--from:1;--to:1">caches S, echoes (S, 1)</div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">INCR fetch (S, 1)</span><span class="ln"></span></div>
+    <div class="note" style="--from:2;--to:2">epoch matches &rArr; patch map &middot; touch &middot; epoch:=2</div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">response (S, changed partitions only)</span><span class="ln"></span></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">INCR fetch (S, 2)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">response (S, &hellip;), epoch:=3</span><span class="ln"></span></div>
+    <div class="m r ec-err" style="--from:1;--to:2;--ec:var(--cat-error)"><span class="ml">INCR fetch (S, e&prime;) where e&prime; &ne; stored</span><span class="ln"></span></div>
+    <div class="m l dashed ec-err" style="--from:2;--to:1;--ec:var(--cat-error)"><span class="ml">INVALID_FETCH_SESSION_EPOCH &rArr; client resyncs FULL</span><span class="ln"></span></div>
+    <div class="m r" style="--from:1;--to:2"><span class="ml">FULL fetch (epoch=FINAL_EPOCH)</span><span class="ln"></span></div>
+    <div class="m l dashed" style="--from:2;--to:1"><span class="ml">session removed (clean close)</span><span class="ln"></span></div>
+  </div>
+</div><figcaption>The incremental fetch session lifecycle (KIP-227): a full fetch mints session id <code>S</code> at epoch 1; each incremental fetch must echo the exact stored epoch, which the broker bumps on every accepted request; any gap is rejected with <code>INVALID_FETCH_SESSION_EPOCH</code>, forcing the client back to a full fetch. A final-epoch full fetch closes the session.</figcaption>
+<div class="legend">
+  <span class="lgi"><span class="sw cat-client"></span>client / follower</span>
+  <span class="lgi"><span class="sw cat-broker"></span>broker (FetchManager)</span>
+  <span class="lgi"><span class="arr"></span>fetch request</span>
+  <span class="lgi"><span class="arr dashed"></span>response</span>
+  <span class="lgi"><span class="arr dashed cat-error ec-err"></span>error: epoch mismatch / resync</span>
+  <span class="lgi"><span class="mono">box</span> = server-side work in a lane</span>
+  <span class="lgi">lanes read top &rarr; bottom over time</span>
+</div></figure>
+
+<h3>Cache eviction</h3>
+<p>When a shard is full, <code>FetchSessionCacheShard.tryEvict</code> (<code>:204</code>) evicts in priority order: (1) a session idle longer than <code>evictionMs</code> (= <code>MIN_INCREMENTAL_FETCH_SESSION_EVICTION_MS = 120000</code> ms, <code>KafkaBroker.scala:73</code>); else (2) the least-valuable evictable entry if the newcomer outranks it. The <code>EvictableKey</code> ordering is <em>unprivileged-before-privileged, then smaller, then by id</em> (<code>FetchSession.java:438</code>), so follower (privileged) sessions and larger sessions survive over small consumer sessions. Evictions increment <code>IncrementalFetchSessionEvictionsPerSec</code>.</p>
+
+<h3>Client/follower side: FetchSessionHandler</h3>
+<p>The follower's <code>RemoteLeaderEndPoint.buildFetch</code> (<code>:179</code>) uses a <code>FetchSessionHandler</code> builder: it adds the current <code>FetchRequest.PartitionData</code> for every ready, un-throttled partition, then <code>build()</code> diffs against the previous session to produce <code>toSend</code>, <code>toForget</code>, <code>toReplace</code>, and the session <code>metadata</code> (<code>:207</code>–<code>:222</code>). If nothing is to send or forget, no request is issued at all (<code>:208</code>). After the response, <code>fetch</code> calls <code>fetchSessionHandler.handleResponse</code> to validate the session id/epoch before decoding partition data (<code>RemoteLeaderEndPoint.scala:85</code>).</p>
+
+<h2>Fetch-from-follower for rack locality (KIP-392)</h2>
+<p>When a consumer sends FetchRequest v11+ it includes a <code>rackId</code>; <code>KafkaApis</code> wraps it in <code>DefaultClientMetadata</code> (<code>KafkaApis.scala:747</code>). In <code>readFromLog</code>, if the broker is the leader and the requester is a consumer (not a valid broker id), <code>findPreferredReadReplica</code> (<code>ReplicaManager.scala:1964</code>) is consulted. It builds a <code>PartitionView</code> of the leader plus every <em>in-sync</em> remote replica whose <code>logEndOffset &ge; fetchOffset &ge; logStartOffset</code> (<code>:1985</code>) — only in-sync replicas, so the consumer never gets steered to a lagging follower — and passes it to the configured <code>ReplicaSelector.select</code>. The default <code>RackAwareReplicaSelector</code> returns the most caught-up replica sharing the client's rack, or the leader if none (<code>RackAwareReplicaSelector.java:31</code>).</p>
+<p>If a non-leader replica is chosen, the leader returns <strong>no data</strong> — only a <code>preferredReadReplica</code> id and an offset snapshot (<code>ReplicaManager.scala:1806</code>). The consumer then redirects its fetches to that follower (which serves them at the <code>HIGH_WATERMARK</code>/<code>TXN_COMMITTED</code> bound like any leader-serving read). This nomination always force-completes the fetch immediately (it is one of the immediate-response conditions, <code>:1706</code>). No <code>replica.selector.class</code> configured ⇒ <code>replicaSelectorPlugin</code> is <code>None</code> and all consumers read from the leader (<code>createReplicaSelector</code>, <code>ReplicaManager.scala</code>).</p>
+
+<div class="callout warning"><span class="callout-title">Caution</span><p>Followers serve consumer reads only up to <em>their own</em> high watermark, which lags the leader's by one replication round-trip. Fetch-from-follower trades a small extra staleness for reduced cross-rack/cross-AZ bandwidth. A follower that has fallen out of the ISR is excluded from selection precisely so the consumer cannot get pinned to a stalled replica indefinitely (<code>ReplicaManager.scala:1985</code>).</p></div>
+
+<h2>Zero-copy delivery (sendfile)</h2>
+<p>Records read from a log segment are returned as <code>FileRecords</code> — a window over the segment's <code>FileChannel</code>, not a heap copy. When the network layer writes a fetch response, <code>FileRecords.writeTo</code> (<code>FileRecords.java:291</code>) delegates to <code>destChannel.transferFrom(channel, position, count)</code>, which on Linux bottoms out in the <code>sendfile(2)</code> syscall: bytes go from page cache straight to the socket without traversing user space or the JVM heap. The follower's fetcher converts <code>FileRecords</code> to <code>MemoryRecords</code> only because it must inspect and re-append them (<code>AbstractFetcherThread.toMemoryRecords</code>, <code>:910</code>); consumers receive the file-backed bytes untouched. See <a href="06-network-and-threading.html">Network Layer &amp; Threading</a> for how the <code>Send</code> is driven.</p>
+
+<h2>Concurrency &amp; threading</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Thread</th><th>Count</th><th>Does what</th><th>Guards</th></tr></thead>
+<tbody>
+<tr><td><code>ReplicaFetcherThread-{id}-{leader}</code></td><td><code>num.replica.fetchers</code> × #leaders</td><td>Runs the truncate→fetch→append loop for its partitions.</td><td><code>partitionMapLock</code> (a <code>ReentrantLock</code>) + <code>partitionMapCond</code>.</td></tr>
+<tr><td><code>ReplicaAlterLogDirsThread-…</code></td><td>≤ <code>num.replica.alter.log.dirs.threads</code></td><td>Copies partitions between local dirs; promotes future replicas.</td><td>same lock; <code>promotionStates</code> is a <code>ConcurrentHashMap</code>.</td></tr>
+<tr><td>Request handler (KafkaRequestHandler)</td><td><code>num.io.threads</code></td><td>Runs <code>handleFetchRequest</code> → <code>fetchMessages</code> → synchronous <code>readFromLog</code>.</td><td>per-session monitor; shard monitor in <code>FetchSessionCacheShard</code>.</td></tr>
+<tr><td><code>ExpirationReaper-…-Fetch</code></td><td>1 per purgatory</td><td>Times out <code>DelayedFetch</code> ops at <code>max.wait.ms</code>.</td><td>purgatory internal locks.</td></tr>
+</tbody>
+</table></div>
+<p>The fetcher thread is a <code>ShutdownableThread</code>; its <code>run()</code> simply loops <code>doWork()</code> while <code>isRunning()</code> (<code>ShutdownableThread.java:131</code>). <strong>All</strong> mutation of <code>partitionStates</code> — add, remove, truncate, advance offset, delay — happens under <code>partitionMapLock</code>, while the actual blocking network fetch in <code>processFetchRequest</code> happens <em>without</em> it, then re-acquires it to apply results (re-validating each partition because it may have changed meanwhile). <code>FailedPartitions</code> and the manager's <code>fetcherThreadMap</code> are each guarded by their own monitor. <code>FetcherLagStats</code> uses a <code>ConcurrentHashMap</code> (<code>AbstractFetcherThread.scala:950</code>) whose per-partition <code>FetcherLagMetrics</code> each hold an <code>AtomicLong</code> gauge (<code>:933</code>).</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A response is applied to <code>partitionStates</code> only if, under <code>partitionMapLock</code>, the partition is still present and its <code>fetchOffset</code> + <code>currentLeaderEpoch</code> still match what was requested (<code>AbstractFetcherThread.scala:348</code>). This prevents a stale in-flight response from clobbering state for a partition that was reassigned to a different fetcher thread or truncated in the interim.</p></div>
+
+<h2>Configuration reference</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>num.replica.fetchers</code></td><td>1</td><td>Fetcher threads per source broker; raises replication parallelism per leader. <code>ReplicationConfigs.java:96</code>.</td></tr>
+<tr><td><code>replica.fetch.max.bytes</code></td><td>1 MiB (1048576)</td><td>Per-partition fetch size cap (soft; one batch is always returned). <code>:67</code>.</td></tr>
+<tr><td><code>replica.fetch.response.max.bytes</code></td><td>10 MiB</td><td>Cap on a whole follower fetch <em>response</em>. <code>:87</code>.</td></tr>
+<tr><td><code>replica.fetch.wait.max.ms</code></td><td>500</td><td>Follower's <code>max.wait.ms</code> on the leader — how long the leader parks the follower fetch. <code>:74</code>.</td></tr>
+<tr><td><code>replica.fetch.min.bytes</code></td><td>1</td><td>Follower's <code>min.bytes</code> — leader waits for this much before responding. <code>:79</code>.</td></tr>
+<tr><td><code>replica.fetch.backoff.ms</code></td><td>1000</td><td>Sleep when no partition is ready or after an error. <code>:83</code>.</td></tr>
+<tr><td><code>fetch.max.bytes</code></td><td>50 MiB (52428800)</td><td>Server cap on any single consumer fetch response. <code>ConsumerConfig.java:200</code>.</td></tr>
+<tr><td><code>max.incremental.fetch.session.cache.slots</code></td><td>1000</td><td>Total cached fetch sessions, split across 8 shards. <code>ServerConfigs.java:102</code>.</td></tr>
+<tr><td><code>replica.selector.class</code></td><td><em>null</em> (leader only)</td><td>Pluggable <code>ReplicaSelector</code> enabling KIP-392 fetch-from-follower. <code>ReplicationConfigs.java:140</code>.</td></tr>
+<tr><td><code>follower.fetch.last.tiered.offset.enable</code></td><td>false</td><td>New empty replicas with tiered storage may start at the last tiered offset. <code>KafkaConfig.scala:255</code>.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Failure modes, edge cases &amp; recovery</h2>
+<ul>
+  <li><strong>Corrupt/invalid records.</strong> <code>CorruptRecordException</code>/<code>InvalidRecordException</code> during append are logged and the partition is added to <code>partitionsWithError</code> (backed off), not failed — one bad batch must not stall a thread's other partitions (<code>AbstractFetcherThread.scala:399</code>).</li>
+  <li><strong>Storage failure.</strong> A <code>KafkaStorageException</code> on truncate or append marks the partition failed and removes it from the fetcher; the offline directory is later taken down by <code>ReplicaManager.handleLogDirFailure</code> (<code>:408</code>, <code>:494</code>).</li>
+  <li><strong>Leadership churn.</strong> <code>NOT_LEADER_OR_FOLLOWER</code>, <code>UNKNOWN_TOPIC_OR_PARTITION</code>, <code>UNKNOWN_TOPIC_ID</code>, <code>INCONSISTENT_TOPIC_ID</code> are all transient-during-reassignment and simply trigger backoff (<code>:437</code>–<code>:458</code>).</li>
+  <li><strong>Lost session.</strong> If the leader evicted the follower's session, the next incremental request gets <code>FETCH_SESSION_ID_NOT_FOUND</code>/<code>INVALID_FETCH_SESSION_EPOCH</code>; <code>FetchSessionHandler.handleResponse</code> returns false and the follower falls back to a full fetch.</li>
+  <li><strong>Diverging epoch while parked.</strong> A consumer/follower request sitting in purgatory is force-completed the moment truncation creates a divergence, so the follower truncates promptly (<code>DelayedFetch.scala:109</code>).</li>
+  <li><strong>Offset out of range / moved to tier.</strong> Recovered via <code>fetchOffsetAndTruncate</code> or the <code>TierStateMachine</code> as described above; for a consumer, <code>handleOffsetOutOfRangeError</code> on the leader may convert it into a remote-storage read (<code>ReplicaManager.scala:1895</code>).</li>
+</ul>
+
+<h2>Invariants &amp; guarantees</h2>
+<ul>
+  <li>A follower always fetches at exactly its log-end offset; its log is a prefix of the leader's committed log (<code>ReplicaFetcherThread.scala:124</code>).</li>
+  <li>Follower HW = the leader's reported HW, monotonically non-decreasing; never ahead of the leader.</li>
+  <li>Consumers cannot observe data beyond the HW (read_uncommitted) or LSO (read_committed); the bound is enforced at read time on the serving broker.</li>
+  <li>Fetch session epochs are gap-free per session; any mismatch forces a full re-sync, so client and broker never silently disagree about the partition set.</li>
+  <li>A fetch response is applied to fetcher state only if the partition's offset/epoch are unchanged since the request was built.</li>
+  <li>Only in-sync replicas are eligible preferred read replicas, so fetch-from-follower cannot pin a consumer to a lagging follower.</li>
+</ul>
+
+<h2>Interactions with other subsystems</h2>
+<ul>
+  <li><a href="08-replication.html">Replication, ISR &amp; HW</a> — the fetcher is the mechanism by which followers stay in the ISR; the leader advances its HW from follower fetch offsets recorded during these reads.</li>
+  <li><a href="03-storage-log-engine.html">Log Storage Engine</a> — <code>fetchRecords</code>, <code>appendRecordsToFollowerOrFutureReplica</code>, <code>maybeUpdateHighWatermark</code>, <code>truncateTo</code>, and the leader-epoch cache all live there.</li>
+  <li><a href="07-request-processing.html">Request Processing</a> — <code>KafkaApis.handleFetchRequest</code> wires the session context, authorization, throttling, and the response callback.</li>
+  <li><a href="05-tiered-storage.html">Tiered Storage</a> — <code>OFFSET_MOVED_TO_TIERED_STORAGE</code> handling and the <code>TierStateMachine</code>.</li>
+  <li><a href="14-transactions-eos.html">Transactions &amp; EOS</a> — the LSO bound and aborted-transaction metadata in fetch responses.</li>
+  <li><a href="19-quotas.html">Quotas &amp; Throttling</a> — replication and consumer fetch quotas gate both <code>buildFetch</code> (follower) and the response path (consumer).</li>
+  <li><a href="17-consumer-client.html">Consumer Client</a> / <a href="16-producer-client.html">Producer Client</a> — the consumer drives this path for reads; producer appends are what wake parked consumer fetches.</li>
+  <li><a href="15-share-groups.html">Share Groups</a> — share-fetch reuses <code>FetchParams</code> with the trailing <code>shareFetchRequest = true</code> flag (<code>KafkaApis.scala:3510</code>) but routes through <code>SharePartitionManager.fetchMessages</code> (<code>KafkaApis.scala:3522</code>), not <code>ReplicaManager.fetchMessages</code> directly.</li>
+</ul>
+
+<h2>Design rationale &amp; evolution</h2>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p><strong>Incremental fetch sessions (<span class="pill kip">KIP-227</span>).</strong> With thousands of partitions, re-listing every partition on every fetch made request size and broker CPU scale with total partition count rather than with the number of <em>active</em> partitions. A stateful session lets a request send only changed partitions and a response return only partitions with news, decoupling steady-state cost from fleet size.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p><strong>Fetch from closest replica (<span class="pill kip">KIP-392</span>).</strong> In multi-AZ deployments, leader-only reads forced consumers to cross availability-zone boundaries, incurring cost and latency. A pluggable <code>ReplicaSelector</code> lets the leader nominate a same-rack in-sync follower, keeping reads local; the leader returns only the nomination so the consumer redirects itself.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p><strong>Truncation on fetch (<span class="pill kip">KIP-595</span>, building on leader-epoch fencing in <span class="pill kip">KIP-320</span>/<span class="pill kip">KIP-101</span>).</strong> Sending <code>lastFetchedEpoch</code> in the fetch and returning a diverging epoch in the response folds divergence detection into the data path, eliminating a separate <code>OffsetsForLeaderEpoch</code> round-trip in the common case and shrinking the window during which a follower could append diverged data.</p></div>
+<p>Other lineage: tiered-storage fetch handling is <span class="pill kip">KIP-405</span>; the JBOD intra-broker directory move and future-replica promotion machinery in <code>ReplicaAlterLogDirsThread</code> use the directory-assignment events of <span class="pill kip">KIP-858</span> (KRaft JBOD).</p>
+
+<h2>Gotchas &amp; operational notes</h2>
+<ul>
+  <li><strong>One fetcher thread per leader by default.</strong> If many partitions share a single hot leader, replication can bottleneck on one thread; raise <code>num.replica.fetchers</code>. Resizing reshuffles <em>all</em> partitions to keep the hash mapping consistent (<code>AbstractFetcherManager.scala:69</code>).</li>
+  <li><strong><code>replica.fetch.wait.max.ms</code> should be below <code>replica.lag.time.max.ms</code></strong> (default 30000) or a follower could be marked out-of-sync merely because its fetch was parked too long.</li>
+  <li><strong>Alter-log-dirs copies one partition at a time</strong> on a thread (<code>LocalLeaderEndPoint.selectPartitionToFetch</code>, <code>:207</code>) to maximize a single replica's catch-up rate, and uses <code>maxWait = minBytes = 0</code> so the local fetch returns instantly once the future log has caught up (<code>:262</code>).</li>
+  <li><strong>Session eviction favours followers.</strong> Under cache pressure, consumer (unprivileged) sessions are evicted before follower (privileged) ones; a flood of short-lived consumers can churn the cache, visible via <code>IncrementalFetchSessionEvictionsPerSec</code>.</li>
+  <li><strong>Preferred-replica reads add staleness.</strong> A same-rack follower lags the leader's HW by a replication round-trip; latency-sensitive consumers that need the freshest committed data should not enable fetch-from-follower.</li>
+  <li><strong>The follower-to-leader fetch is privileged.</strong> It requires <code>ClusterAction</code> on the cluster resource (<code>KafkaApis.scala:589</code>); consumer fetches require <code>Read</code> on each topic — see <a href="18-security.html">Security</a>.</li>
+</ul>
+
+<p>For the broader picture of how leaders advance the high watermark from these fetch offsets and manage the ISR, continue to <a href="08-replication.html">Replication, ISR &amp; High Watermark</a>; for the segment-level read mechanics, see <a href="03-storage-log-engine.html">The Log Storage Engine</a>.</p>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

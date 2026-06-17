@@ -1,0 +1,231 @@
+<h1>II · 03 · Partitioning Strategy: How Many Partitions?</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">The partition count is the single most consequential — and most irreversible — number you set on a topic. It fixes the ceiling on producer parallelism, the maximum useful size of every consumer group, and the only ordering guarantee Kafka offers. Set it too low and you cannot consume faster no matter how many machines you throw at the problem; set it too high and you pay a standing tax in file descriptors, memory-mapped index regions, client memory, replication fan-out, failover latency, and rebalance time on every broker for the life of the topic. This chapter answers the central question — <em>how many?</em> — with the source mechanisms that make partitions the unit of parallelism, the empirical ceilings (~10 MB/s per partition, latency degradation past ~1000), the sizing heuristic <code>max(T/Tp, T/Tc)</code>, the per-partition cost rooted in concrete code, the signals that tell you to reshard, and the repartitioning trap that makes a keyed topic's partition count effectively immutable.</p>
+
+<h2>Why the partition is the unit of everything</h2>
+
+<p>A Kafka topic is a logical name; the partition is the physical thing. Each partition is an independent append-only log (Part I <a href="03-storage-log-engine.html">03 · Storage &amp; the Log Engine</a>) with its own leader, its own replica set, its own offset space, and its own segment files. Three properties of the system flow directly from this, and all three are bounded by the partition count.</p>
+
+<h3>Producer parallelism — partitions are the write fan-out</h3>
+
+<p>A producer spreads records across partitions. With no key, the default partitioner (<code>BuiltInPartitioner</code>) uses adaptive sticky partitioning (<span class="pill kip">KIP-794</span>): it fills one partition with a batch worth of bytes, then switches, weighting the next choice by the inverse of each partition's queue depth so slower brokers receive fewer records (<code>clients/src/main/java/org/apache/kafka/clients/producer/internals/BuiltInPartitioner.java:71</code>). With a key, the partition is deterministic — <code>murmur2(key) % numPartitions</code> (<code>BuiltInPartitioner.java:397</code>). Either way, writes for a topic can be in flight to at most <code>numPartitions</code> leaders simultaneously, and those leaders are spread across brokers. <strong>The partition count is therefore the ceiling on how much write concurrency the cluster can absorb for one topic.</strong></p>
+
+<h3>Consumer parallelism — one consumer per partition, hard ceiling</h3>
+
+<p>This is the constraint engineers underestimate most. Within a consumer group, a partition is assigned to exactly one member at a time. The assignor lays out the partitions and divides them across the members: "we lay out the available partitions in numeric order and the consumers in lexicographic order... divide the number of partitions by the total number of consumers to determine the number of partitions to assign to each" (<code>clients/src/main/java/org/apache/kafka/clients/consumer/RangeAssignor.java:43</code>). The server-side assignor for the new consumer-group protocol (<span class="pill kip">KIP-848</span>) states the same invariant: "each subscribed member receives at least one partition" (<code>group-coordinator/src/main/java/org/apache/kafka/coordinator/group/assignor/RangeAssignor.java</code>). See Part I <a href="13-group-coordination.html">13 · Group Coordination</a>.</p>
+
+<div class="callout invariant"><span class="callout-title">Invariant: useful group size ≤ partition count</span><p>A consumer group can have at most <code>numPartitions</code> actively-consuming members. Add more consumers than partitions and the surplus sit <strong>idle</strong> — assigned nothing, holding a TCP connection and a heartbeat but doing zero work. You cannot scale consumption past the partition count by adding machines. If a topic has 12 partitions, the 13th consumer is dead weight. This is the hard reason partition count must anticipate peak consumer parallelism, not just peak throughput.</p></div>
+
+<figure class="diagram"><div class="dflow h"><div class="node cat-storage store"><span class="nt">topic: 4 partitions</span></div><div class="conn" data-label="assign"></div><div class="row"><div class="col"><div class="conn ec-data" data-label="P0,P1"></div><div class="node cat-client">consumer A</div></div><div class="col"><div class="conn ec-data" data-label="P2,P3"></div><div class="node cat-client">consumer B</div></div><div class="col"><div class="conn ec-err dashed" data-label="∅"></div><div class="node cat-error">consumer C (idle)</div></div></div></div><figcaption>Four partitions, three consumers: two get two partitions each, the third is assigned nothing.</figcaption><div class="legend"><span class="sw cat-storage"></span> topic/log · <span class="sw cat-client"></span> consumer · <span class="sw cat-error"></span> idle/no-work · <span class="arr"></span> active assignment · <span class="arr dashed"></span> empty assignment.</div></figure>
+
+<h3>Ordering — only per partition, only per key</h3>
+
+<p>Kafka guarantees ordering <em>within a partition only</em>. There is no total order across a topic. For keyed records the order guarantee is per-key, and it holds precisely because every record with a given key lands on the same partition via <code>murmur2(key) % numPartitions</code>. This is why the partition count and the key schema are joined at the hip — and why changing the partition count silently breaks the guarantee (covered below). See Part I <a href="16-producer-client.html">16 · Producer Client</a>.</p>
+
+<div class="callout rationale"><span class="callout-title">Why these three are the same number</span><p>Producer fan-out, consumer fan-out, and per-key ordering are not three independent design axes — they are three views of one quantity, <code>numPartitions</code>, because each partition is a single-leader, single-writer, single-consumer-per-group log. Sizing partitions <em>is</em> capacity planning for parallelism; everything else in this chapter is the cost of that choice.</p></div>
+
+<h2>The per-partition throughput ceiling</h2>
+
+<p>How much can one partition do? The planning number, from Jun Rao's canonical guidance (Confluent, March 2015; empirical), is that "one can produce at 10s of MB/sec on just a single partition," with a conservative planning figure of <strong>~10 MB/s</strong>. This is not a code constant — it is an emergent property of disk write bandwidth on the leader, the follower fetch rate, batch size, compression ratio, and <code>acks</code>. Treat it as directional and measure your own.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Knob</th><th>Effect on single-partition throughput</th><th>Source</th></tr></thead><tbody>
+<tr><td>Batch size / linger</td><td>Larger batches amortize per-request overhead; ~10–50× throughput gains reported moving from tiny to large batches</td><td>Confluent producer course (empirical)</td></tr>
+<tr><td>Compression (lz4/zstd)</td><td>More bytes per disk write &amp; per network frame; trades producer CPU for effective throughput</td><td>Cloudflare (empirical)</td></tr>
+<tr><td><code>acks=all</code> + replication</td><td>Sync replication roughly <strong>halved</strong> single-producer throughput in LinkedIn's benchmark (821K → 422K rec/s)</td><td>Jay Kreps / LinkedIn 2014 (empirical)</td></tr>
+<tr><td>Replication factor</td><td>Each partition's writes are re-fetched RF−1 times; follower fetch rate caps the leader</td><td>Part I <a href="08-replication.html">08 · Replication</a></td></tr>
+</tbody></table></div>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha: the consumer side is usually the slower path</span><p>When you compute the per-partition consume rate <code>Tc</code>, measure your <em>application's</em> end-to-end processing rate per partition — deserialize, business logic, downstream write — not the broker's disk-read ceiling. A partition the broker can serve at 50 MB/s is useless if your consumer processes 2 MB/s of it. Size <code>Tc</code> from the slowest stage in your consumer, then take the larger of the two requirements.</p></div>
+
+<h2>The sizing heuristic: partitions = max(T/Tp, T/Tc)</h2>
+
+<p>The accepted formula (Jun Rao, 2015; empirical) is:</p>
+
+<dl class="kv">
+<dt><code>N ≥ max(T / Tp, T / Tc)</code></dt><dd>Take the larger of the producer-side and consumer-side partition requirements. All three quantities must be in the <em>same</em> unit so the division cancels to a pure partition count.</dd>
+<dt><code>T</code></dt><dd>Target throughput for the topic at peak (MB/s or records/s), measured in the same unit as <code>Tp</code> and <code>Tc</code>.</dd>
+<dt><code>Tp</code></dt><dd>Throughput a single partition sustains on the <strong>produce</strong> path, given your batch/compression/acks. Conservative planning value ~10 MB/s.</dd>
+<dt><code>Tc</code></dt><dd>Throughput a single partition sustains on the <strong>consume</strong> path — the application's per-partition processing rate, usually the binding constraint.</dd>
+</dl>
+
+<p>Before working the example, pin every constant it consumes. None of these is a Kafka guarantee — <code>Tp</code> and <code>Tc</code> are <em>workload-dependent</em> rates you must measure; the values below are illustrative planning figures. Substitute your own measured numbers.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Value (with units)</th><th>Kind</th><th>Why / source</th></tr></thead><tbody>
+<tr><td><code>T</code></td><td><strong>100 MB/s</strong> (peak topic ingress)</td><td>Workload (illustrative)</td><td>The target this topic must absorb at peak — assumed for this worked example; measure yours.</td></tr>
+<tr><td><code>Tp</code></td><td><strong>~10 MB/s per partition</strong></td><td>Workload planning figure (empirical)</td><td>Conservative single-partition produce rate; "one can produce at 10s of MB/sec on just a single partition" — Jun Rao (this guide's empirical reference §2). Directional, not a code constant — measure with your batch/compression/<code>acks</code>.</td></tr>
+<tr><td><code>Tc</code></td><td><strong>~5 MB/s per partition</strong> (one consumer thread)</td><td>Workload (illustrative)</td><td>The slowest stage of the consumer app (deserialize + business logic + downstream write) per partition — assumed here; measure yours per the gotcha above.</td></tr>
+</tbody></table></div>
+
+<p><strong>Derivation (worked example from the reference).</strong> Plug the assumptions into each side of the <code>max</code>, keeping units explicit so they cancel to a partition count:</p>
+
+<dl class="kv">
+<dt>Producer side</dt><dd><code>T / Tp = 100 MB/s ÷ 10 MB/s per partition ≈ 10 partitions</code> — the MB/s cancels, leaving partitions. So 10 partitions is the floor the produce path needs.</dd>
+<dt>Consumer side</dt><dd><code>T / Tc = 100 MB/s ÷ 5 MB/s per partition ≈ 20 partitions</code> — again the MB/s cancels. The consume path needs 20 partitions so a 20-member group (one consumer per partition, per the invariant above) can keep up.</dd>
+<dt>Take the larger</dt><dd><code>N ≥ max(10, 20) = 20 partitions</code>.</dd>
+</dl>
+
+<p><strong>Why the consumer side binds here:</strong> the assumed per-consumer drain (<code>Tc</code> = 5 MB/s) is <em>below</em> the per-partition produce rate (<code>Tp</code> = 10 MB/s), so each partition's consumer is the slowest link; consumer parallelism — not produce throughput or disk — sets the count, and the <code>max</code> correctly picks the larger (20) requirement. Had the consumer been faster than the producer (<code>Tc &gt; Tp</code>), the produce side would have bound instead. The formula picks whichever dimension is slowest.</p>
+
+<figure class="diagram"><div class="dflow"><div class="node cat-control"><span class="nt">target T (peak MB/s)</span></div><div class="conn"></div><div class="row"><div class="col"><div class="conn" data-label="produce"></div><div class="node cat-broker decision">T / Tp</div><div class="conn" data-label="Tp≈10 MB/s"></div><div class="node cat-broker">producer-side N</div></div><div class="col"><div class="conn" data-label="consume"></div><div class="node cat-coord decision">T / Tc</div><div class="conn" data-label="Tc = app rate"></div><div class="node cat-coord">consumer-side N</div></div></div><div class="conn" data-label="take larger"></div><div class="node cat-storage store"><span class="nt">N = max(…) — round up, add growth headroom</span></div></div><figcaption>The sizing decision: compute both sides, take the maximum, then add headroom for growth (within the cost bounds below).</figcaption><div class="legend"><span class="sw cat-control"></span> input/target · <span class="sw cat-broker"></span> produce path · <span class="sw cat-coord"></span> consume path · <span class="sw cat-storage"></span> chosen count · <span class="mono">decision nodes rounded</span>.</div></figure>
+
+<h2>The cost of a partition — each rooted in a mechanism</h2>
+
+<p>Partitions are not free. Every one carries a standing, per-broker cost for the life of the topic. Here is the full bill, each line tied to the concrete mechanism that produces it.</p>
+
+<h3>1. Open file descriptors and memory-mapped index regions</h3>
+
+<p>Each partition replica on a broker is a directory of <strong>segments</strong>, and each segment is three files: <code>.log</code>, <code>.index</code> (offset index), <code>.timeindex</code> (time index). The two index files are <strong>memory-mapped</strong> — <code>AbstractIndex</code> holds a <code>MappedByteBuffer mmap</code> (<code>storage/src/main/java/org/apache/kafka/storage/internals/log/AbstractIndex.java:72</code>), realized as <code>OffsetIndex</code> and <code>TimeIndex</code>. So <strong>each retained segment contributes ~2 mmap regions</strong> (its two memory-mapped indexes) plus ~3 open file handles (<code>.log</code> + <code>.index</code> + <code>.timeindex</code>). To size the per-partition cost, fix three numbers:</p>
+
+<dl class="kv">
+<dt>Segment size</dt><dd><strong>1 GiB</strong> — Kafka default <code>DEFAULT_SEGMENT_BYTES = 1024 * 1024 * 1024</code> (<em>cited config default</em>, <code>storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java:131</code>).</dd>
+<dt>mmap regions per segment</dt><dd><strong>~2</strong> — the offset index and time index are each one <code>MappedByteBuffer</code> (<em>mechanism</em>, <code>AbstractIndex.java:72</code>); the <code>.log</code> itself is not mmapped.</dd>
+<dt>Partition data size</dt><dd><strong>10 GB</strong> retained per partition — <em>illustrative workload assumption</em> for this example (= retention bytes per partition); substitute your own from retention × ingress.</dd>
+</dl>
+
+<p>Then, with units cancelling to a count:</p>
+<dl class="kv">
+<dt>Segments per partition</dt><dd><code>10 GB ÷ 1 GiB per segment ≈ 10 segments</code> (treating GB ≈ GiB for planning).</dd>
+<dt>mmap regions per partition</dt><dd><code>10 segments × 2 mmap regions per segment ≈ 20 mmap regions</code>, with a similar count of FDs. (If a partition is near-empty, only its <em>active</em> segment is mapped, so the floor is ~2 mmap regions per partition.)</dd>
+</dl>
+
+<div class="callout warning"><span class="callout-title">Warning: vm.max_map_count is a hard per-broker ceiling</span><p>Linux defaults <code>vm.max_map_count</code> to <strong>65,530</strong> (an <em>OS hard limit</em> — the max number of memory-map areas one process may hold). Taking the floor of <strong>~2 mmap areas per partition</strong> (the active segment's two indexes, from above), the default ceiling derives as <code>65,530 mmap areas ÷ 2 mmap areas per partition ≈ 32,765 partitions/broker</code> before the broker fails to <code>mmap</code> and crashes — even on KRaft. Instaclustr hit exactly this pushing toward 600k partitions on one KRaft broker (empirical reference §2). Production guidance: raise <code>vm.max_map_count</code> to ≥ <strong>262,144</strong> and broker <code>nofile</code> to ≥ <strong>100,000</strong>. FD budget (units cancel to a file count): <code>open files ≈ Σ(partition_size ÷ segment_size) + connections</code> (Jun Rao; empirical reference §2). Cross-link Part I <a href="04-storage-management.html">04 · Storage Management</a>.</p></div>
+
+<h3>2. Producer client memory — a buffer per partition</h3>
+
+<p>The producer's <code>RecordAccumulator</code> keeps an independent batch queue <strong>per partition</strong>: <code>topicInfo.batches.computeIfAbsent(effectivePartition, k -&gt; new ArrayDeque&lt;&gt;())</code> (<code>clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java:318</code>). All those queues draw from a single bounded pool, <code>buffer.memory</code> (<em>Kafka default</em> <strong>32 MiB</strong>, <code>ProducerConfig.java:401</code> → <code>32 * 1024 * 1024</code>). Budget <strong>~tens of KB per partition</strong> being produced (<em>empirical planning figure</em>, Jun Rao; reference §2). To find where a single producer runs dry, divide the pool by the per-partition budget (KB cancels, leaving a partition count):</p>
+<dl class="kv">
+<dt>Partitions one 32 MiB pool covers</dt><dd><code>32 MiB ÷ ~64 KB per partition ≈ 32,768 KiB ÷ 64 KB per partition ≈ 512 partitions</code> at the high end of "tens of KB" — beyond that the queues thin out.</dd>
+</dl>
+<p>A producer fanning out past that either needs a larger <code>buffer.memory</code> or it stalls on <code>max.block.ms</code> when the pool drains. See Part I <a href="16-producer-client.html">16 · Producer Client</a>.</p>
+
+<h3>3. Replication fan-out</h3>
+
+<p>Every partition is replicated RF times; followers fetch from the leader continuously (Part I <a href="08-replication.html">08 · Replication</a>, <a href="09-fetch-path.html">09 · Fetch Path</a>). More partitions = more fetcher work and more inter-broker traffic. Two planning figures bound this, both <em>empirical</em> (Jun Rao; this guide's reference §2 — directional, not Kafka guarantees):</p>
+<dl class="kv">
+<dt>Replication-latency figure</dt><dd><strong>~20 ms added per 1,000 partitions</strong> replicated from one broker to another (equivalently <code>~0.02 ms/partition</code>).</dd>
+<dt>Per-broker cap formula</dt><dd><code>partitions/broker ≤ 100 × (#brokers) × RF</code> — the published heuristic that keeps single-broker replication latency in a safe band given the figure above.</dd>
+</dl>
+<p>So for a 6-broker cluster at RF=3 the cap evaluates to <code>100 × 6 brokers × 3 ≈ 1,800 partitions/broker</code>. Plan cluster egress at <strong>≥ 2× ingress</strong> (a planning ratio, reference §1) because each written byte is re-fetched by RF−1 followers <em>and</em> read by consumer fan-out.</p>
+
+<h3>4. Controller / metadata load and failover time</h3>
+
+<p>The controller tracks every partition's leader, ISR, and assignment in the metadata log (Part I <a href="11-kraft-controller.html">11 · KRaft Controller</a>, <a href="12-metadata-propagation.html">12 · Metadata Propagation</a>). The two cost constants here are <em>empirical, ZooKeeper-era, 2015-hardware</em> figures (Jun Rao; reference §2 — teach the mechanism, not the millisecond; do not predict 2026 behavior):</p>
+<dl class="kv">
+<dt>Leader election</dt><dd><strong>~5 ms per partition</strong> to elect a new leader on the surviving brokers.</dd>
+<dt>Controller metadata init</dt><dd><strong>~2 ms per partition</strong> to reload metadata when a ZooKeeper-era controller fails over.</dd>
+</dl>
+<p>These scale linearly with the partition count on the affected broker/controller, so on unclean loss the unavailability windows are products with units cancelling to time:</p>
+<dl class="kv">
+<dt>Broker with ~1,000 leaderships</dt><dd><code>1,000 leaders × 5 ms/leader = 5,000 ms ≈ 5 s</code> to re-elect.</dd>
+<dt>ZK controller failover, ~10,000 partitions</dt><dd><code>10,000 partitions × 2 ms/partition = 20,000 ms ≈ 20 s</code> of metadata-init unavailability.</dd>
+</dl>
+<p>KRaft fundamentally changes this: the controller holds metadata in memory and replicates it as a log, so a standby controller takes over without a reload pass (<span class="pill kip">KIP-500</span>) — it <em>removes the ~2 ms/partition controller-init term entirely</em>. That is what lifts the ceiling from ZK-era ~200,000/cluster toward the KRaft target of "a million partitions or more" (Confluent lab: 2M; empirical reference §2).</p>
+
+<div class="callout gotcha"><span class="callout-title">Gotcha: "KRaft means partitions are free" is wrong</span><p>KRaft removes the controller-failover term, not the per-broker cost. Real per-broker counts are still gated by FDs, mmap regions (<code>vm.max_map_count</code>), heap, fetcher overhead, and rebalance time. And critically: <strong>throughput does not scale with partitions</strong> — peak producer rate occurred around ~<strong>100 partitions</strong> and end-to-end latency rose sharply past ~<strong>1000 partitions</strong> in Instaclustr's test (Kafka 3.1.1, <code>acks=all</code>; ZooKeeper and KRaft were identical here — empirical). Over-partitioning to chase throughput is a documented anti-pattern.</p></div>
+
+<h3>5. Rebalance time</h3>
+
+<p>When group membership changes, the coordinator must recompute and redistribute the assignment across all subscribed partitions (Part I <a href="13-group-coordination.html">13 · Group Coordination</a>). More partitions = more to move and longer rebalances; this is one more reason the partition count is a cost, not just a capability. The newer protocol (<span class="pill kip">KIP-848</span>) and cooperative/sticky assignors reduce stop-the-world rebalances, but the work still scales with partition count.</p>
+
+<div class="table-wrap"><table><thead><tr><th>Cost</th><th>Type</th><th>Mechanism / source</th><th>Mitigation</th></tr></thead><tbody>
+<tr><td>Open FDs</td><td>Emergent (OS)</td><td>3 files/segment; many segments/partition</td><td><code>nofile ≥ 100,000</code></td></tr>
+<tr><td>mmap regions</td><td>Hard (OS)</td><td>~2/segment via <code>MappedByteBuffer</code> — <code>AbstractIndex.java:72</code></td><td><code>vm.max_map_count ≥ 262144</code></td></tr>
+<tr><td>Producer memory</td><td>Soft + emergent</td><td><code>Deque</code> per partition — <code>RecordAccumulator.java:318</code>; <code>buffer.memory</code> default 32 MB</td><td>raise <code>buffer.memory</code>; ~tens of KB/partition</td></tr>
+<tr><td>Replication fan-out</td><td>Emergent</td><td>RF × fetcher work; +20 ms / 1000 partitions (empirical)</td><td>cap ≈ <code>100 × brokers × RF</code></td></tr>
+<tr><td>Failover latency</td><td>Emergent</td><td>leader election ~5 ms/partition ZK-era; near-zero on KRaft standby (KIP-500)</td><td>use KRaft; bound leaders/broker</td></tr>
+<tr><td>Rebalance time</td><td>Emergent</td><td>assignment work ∝ partitions — <code>RangeAssignor.java:43</code></td><td>KIP-848, cooperative assignor</td></tr>
+<tr><td>Latency past ~1000</td><td>Emergent</td><td>e2e latency degrades (empirical, Instaclustr)</td><td>do not over-partition</td></tr>
+</tbody></table></div>
+
+<h2>The defaults — and why they are deliberately tiny</h2>
+
+<div class="table-wrap"><table><thead><tr><th>Config</th><th>Default</th><th>Source</th><th>Type</th></tr></thead><tbody>
+<tr><td><code>num.partitions</code></td><td><strong>1</strong></td><td><code>server-common/src/main/java/org/apache/kafka/server/config/ServerLogConfigs.java:36</code></td><td>Soft (config)</td></tr>
+<tr><td><code>default.replication.factor</code></td><td><strong>1</strong></td><td><code>server/src/main/java/org/apache/kafka/server/config/ReplicationConfigs.java:42</code></td><td>Soft (config)</td></tr>
+<tr><td><code>min.insync.replicas</code></td><td><strong>1</strong></td><td><code>server-common/src/main/java/org/apache/kafka/server/config/ServerLogConfigs.java:155</code></td><td>Soft (config)</td></tr>
+<tr><td>controller op size</td><td><strong>10,000</strong> records/op</td><td><code>DEFAULT_MAX_RECORDS_PER_BATCH</code>, <code>metadata/src/main/java/org/apache/kafka/controller/QuorumController.java:180</code></td><td>Hard (constant)</td></tr>
+</tbody></table></div>
+
+<div class="callout warning"><span class="callout-title">Warning: these are auto-create defaults, not production defaults</span><p><code>num.partitions=1</code>, <code>default.replication.factor=1</code>, and <code>min.insync.replicas=1</code> exist so a single-broker dev box works out of the box — they are <strong>not</strong> a recommendation. A topic auto-created at these defaults has one partition (no parallelism) and one replica (any broker loss = data loss). In production, disable auto-creation and create topics explicitly with a deliberate partition count, RF=3, and <code>min.insync.replicas=2</code>. The <code>min.insync.replicas=2 + acks=all + RF=3</code> triad is the durability baseline — see Part I <a href="08-replication.html">08 · Replication</a> and Part II <a href="op06-durability.html">op06 · Durability</a>.</p></div>
+
+<p>The <strong>10,000-record</strong> ceiling on a single controller operation (<code>QuorumController.java:180</code>) is a real hard limit you can hit: a single <code>CreatePartitions</code> or <code>CreateTopics</code> that would emit more than 10,000 metadata records (each new partition is a record) is rejected. Practically, you cannot create a topic with tens of thousands of partitions in one call, and bulk topic creation must be chunked.</p>
+
+<h2>When to reshard: 2 → 3 → 5</h2>
+
+<p>Increasing partition count (you cannot decrease — see below) is justified by a small set of trigger signals. The test is whether you are <em>parallelism-bound</em>, not whether the topic is merely busy.</p>
+
+<figure class="diagram"><div class="dflow"><div class="node cat-coord"><span class="nt">symptom: consumer lag rising</span></div><div class="conn" data-label="check"></div><div class="node cat-coord decision">group size == partition count?</div><div class="conn"></div><div class="row"><div class="col"><div class="conn ec-err" data-label="no — fewer consumers"></div><div class="node cat-error">add consumers first<br/>(do NOT reshard)</div></div><div class="col"><div class="conn" data-label="yes — maxed out"></div><div class="node cat-broker decision">per-partition throughput saturated?</div></div></div><div class="conn" data-label="yes"></div><div class="node cat-storage store"><span class="nt">RESHARD: increase partitions (or new topic if keyed)</span></div></div><figcaption>Reshard only when the group is already at one-consumer-per-partition AND per-partition throughput is saturated. If you have fewer consumers than partitions, add consumers — that is free parallelism you already provisioned.</figcaption><div class="legend"><span class="sw cat-coord"></span> consumer/lag signal · <span class="sw cat-broker"></span> throughput check · <span class="sw cat-error"></span> wrong fix · <span class="sw cat-storage"></span> reshard action · <span class="mono">decisions rounded</span>.</div></figure>
+
+<p><strong>Reshard triggers (all should hold):</strong></p>
+<ul>
+<li><strong>Sustained consumer lag</strong> that grows over a window (not a transient spike) — see Part II <a href="op08-metrics-signals.html">op08 · Metrics &amp; Signals</a> for lag-on-trend alerting.</li>
+<li><strong>The group is already at one consumer per partition</strong> — you have spent all the parallelism the current count allows. If not, add consumers; you provisioned that headroom already.</li>
+<li><strong>Per-partition throughput is saturated</strong> — the binding stage (broker disk, network, or your processing) is at its ceiling for a single partition.</li>
+</ul>
+
+<div class="callout warning"><span class="callout-title">Warning: adding partitions never fixes a hot key</span><p>If lag is concentrated on one partition because a single key dominates traffic, more partitions does <strong>nothing</strong> — that key still hashes to one partition via <code>murmur2(key) % numPartitions</code>. The fix is to redesign or salt the key (only where ordering allows), or use a custom partitioner — never to reshard. Cloudflare hit exactly this when a client-library abstraction funneled most messages to one partition (empirical). See Part II <a href="op07-failure-modes.html">op07 · Failure Modes</a>.</p></div>
+
+<h2>The repartitioning trap</h2>
+
+<p>This is the part that bites operators, and it is enforced in two hard mechanisms in the source.</p>
+
+<h3>You cannot decrease partitions — enforced in the controller</h3>
+
+<p><code>ReplicationControlManager.createPartitions</code> rejects any request whose target count is not strictly greater than the current count:</p>
+
+<div class="table-wrap"><table><thead><tr><th>Request</th><th>Result</th><th>Source</th></tr></thead><tbody>
+<tr><td>target == current</td><td><code>InvalidPartitionsException</code> "Topic already has N partition(s)."</td><td><code>ReplicationControlManager.java:1917</code></td></tr>
+<tr><td>target &lt; current</td><td><code>InvalidPartitionsException</code> "... would not be an increase."</td><td><code>ReplicationControlManager.java:1920</code></td></tr>
+<tr><td>target &gt; current</td><td>append <code>(target − current)</code> new partitions, ids starting at <code>startPartitionId = topicInfo.parts.size()</code></td><td><code>ReplicationControlManager.java:1925</code>, <code>:1953</code></td></tr>
+</tbody></table></div>
+
+<p>The "decrease" path simply does not exist; the API only ever <em>appends</em> partition ids onto the end of the existing range. There is no truncation, no merge, no rebalancing of existing data across the new layout. This is by design — existing offsets, the leaders, and every committed record live in partitions <code>0..current−1</code> and cannot be relocated without rewriting consumer offsets globally.</p>
+
+<h3>Increasing partitions on a keyed topic breaks ordering and co-partitioning</h3>
+
+<p>Because the producer maps keys with <code>toPositive(murmur2(serializedKey)) % numPartitions</code> (<code>clients/src/main/java/org/apache/kafka/clients/producer/internals/BuiltInPartitioner.java:398</code>), the moment <code>numPartitions</code> changes, the <em>same key routes to a different partition</em> — the modulus shifts the entire mapping. To make this followable, let <code>h = toPositive(murmur2(serializedKey))</code> be the key's (fixed) hash; only the divisor changes. Real murmur2 output is a large opaque integer, so the value below is an <em>illustrative hash</em> chosen so the arithmetic is checkable — substitute your own key's hash. Take <code>h = 9</code>:</p>
+<dl class="kv">
+<dt>Before (4 partitions)</dt><dd><code>9 % 4 = 1</code> → the key lives in <strong>partition 1</strong>.</dd>
+<dt>After resize to 6 partitions</dt><dd><code>9 % 6 = 3</code> → the same key now routes to <strong>partition 3</strong>, while its old records remain in partition 1.</dd>
+</dl>
+<p>(The hash <code>h</code> is unchanged; only the divisor went 4 → 6, and that alone relocates the key. Note: the reference's literal example "<code>7654321 % 6 = 3</code>" does not actually compute — <code>7654321 % 6 = 1</code>, and Kafka hashes the key <em>bytes</em> through murmur2 first rather than the integer — so the schematic <code>h = 9</code> above is used to demonstrate the same remap with arithmetic that checks out.)</p>
+
+<figure class="diagram"><div class="dflow h"><div class="node cat-client"><span class="nt">key K, h=9, before</span></div><div class="conn" data-label="9 % 4 = 1"></div><div class="node cat-storage store">partition 1</div><div class="conn dashed" data-label="resize 4→6"></div><div class="node cat-error decision">9 % 6 = 3</div><div class="conn ec-err" data-label="now"></div><div class="node cat-storage store">partition 3</div></div><figcaption>With illustrative hash h = toPositive(murmur2(K)) = 9: the same key K moves from partition 1 (9 % 4) to partition 3 (9 % 6) the instant the count goes 4→6. New records for K append to partition 3; old records stay in partition 1 — per-key order is now split across two partitions with no cross-partition ordering.</figcaption><div class="legend"><span class="sw cat-client"></span> producer/key · <span class="sw cat-storage"></span> partition/log · <span class="sw cat-error"></span> remap break · <span class="arr dashed"></span> the resize event.</div></figure>
+
+<p>The consequences are concrete and unrecoverable in place:</p>
+<ul>
+<li><strong>Per-key ordering breaks across the resize boundary.</strong> A consumer reading partition 3 sees only the post-resize records for K; the pre-resize records sit in partition 1 and there is no ordering between the two partitions.</li>
+<li><strong>Co-partitioned joins break.</strong> Two topics joined by key rely on identical key→partition mapping. Resize one and they no longer co-partition — Kafka Streams joins and the assignor's co-partitioning guarantee (Part I <a href="20-kafka-streams.html">20 · Kafka Streams</a>) silently produce wrong results.</li>
+<li><strong>Stateful processing breaks.</strong> Kafka Streams state stores are partitioned; when a key moves partitions, "the associated state does not follow them" — the local state for K is on the task that owned the old partition (empirical; Confluent docs).</li>
+</ul>
+
+<h3>The accepted fix: a new topic at the target count, then migrate</h3>
+
+<p>Because in-place resize is destructive for keyed topics, the production pattern is to <strong>create a new topic at the target partition count and migrate</strong>:</p>
+
+<figure class="diagram"><div class="dseq" style="--cols:4"><div class="lanes"><span class="actor cat-client">producers</span><span class="actor cat-storage">topic-old (N)</span><span class="actor cat-storage">topic-new (M)</span><span class="actor cat-client">consumers</span></div><div class="body"><div class="lifelines"><i></i><i></i><i></i><i></i></div><div class="m r" style="--from:1;--to:3"><span class="ml">1. dual-write to new</span><span class="ln"></span></div><div class="m r" style="--from:2;--to:3"><span class="ml">2. replay/copy backlog old → new</span><span class="ln"></span></div><div class="m r" style="--from:3;--to:4"><span class="ml">3. drain old, switch to new</span><span class="ln"></span></div><div class="m l dashed" style="--from:4;--to:1"><span class="ml">4. stop writing old, retire</span><span class="ln"></span></div></div></div><figcaption>Migration sequence: producers dual-write, the backlog is re-produced into the new topic (re-keyed by the new modulus), consumers drain then cut over, and the old topic is retired.</figcaption><div class="legend"><span class="sw cat-client"></span> client · <span class="sw cat-storage"></span> topic/log · <span class="arr"></span> data move · <span class="arr dashed"></span> retire/cutover.</div></figure>
+
+<ol>
+<li><strong>Dual-write:</strong> producers begin writing to the new topic (and optionally keep writing the old during cutover).</li>
+<li><strong>Backfill:</strong> copy/replay the old topic's retained records into the new topic so history is preserved under the new key mapping (re-keying happens automatically as records are re-produced through the partitioner).</li>
+<li><strong>Drain &amp; switch:</strong> consumers finish the old topic, then move to the new topic.</li>
+<li><strong>Retire:</strong> stop writing the old topic and delete it once consumers are clear.</li>
+</ol>
+
+<div class="callout key"><span class="callout-title">Rule of thumb: provision for growth, but respect the standing cost</span><p>Because resize is irreversible and breaks keyed ordering, <strong>over-partition modestly up front</strong> (Confluent's explicit advice; empirical) — but "modestly" is the operative word. Each partition costs FDs, ~2 mmap regions, producer memory, replication fan-out, and rebalance time on every broker, and throughput does not improve past ~100 partitions per topic. A practical target: size with the <code>max(T/Tp, T/Tc)</code> formula, then multiply by a growth factor of <strong>~1.5–2×</strong> (a <em>planning heuristic</em>, reference §2 / Confluent "over-partition modestly") to cover the next year — not 10×. Keep total partitions per broker well under the <code>vm.max_map_count ÷ 2 mmap-per-partition</code> ceiling derived above (~32,765 on default Linux) and ideally in the low thousands. For unkeyed topics, resize is cheap and safe, so you can size leaner and grow on demand. For keyed topics, treat the partition count as <strong>near-immutable</strong> and size it once, carefully.</p></div>
+
+<h2>Decision checklist</h2>
+
+<div class="table-wrap"><table><thead><tr><th>Question</th><th>Answer / rule</th></tr></thead><tbody>
+<tr><td>Starting partition count?</td><td><code>max(T/Tp, T/Tc)</code> with <code>Tp</code>≈10 MB/s (empirical planning figure), <code>Tc</code>=measured app rate, both same unit as <code>T</code>; e.g. <code>max(100÷10, 100÷5)=20</code>. Then × ~1.5–2 growth headroom (heuristic)</td></tr>
+<tr><td>Is this topic keyed?</td><td>Yes → count is near-immutable; size once. No → resize is safe; size leaner</td></tr>
+<tr><td>Lag rising — reshard?</td><td>Only if group == partition count AND per-partition saturated AND not a hot key</td></tr>
+<tr><td>Hot single key?</td><td>Redesign/salt the key — never add partitions</td></tr>
+<tr><td>Can I reduce partitions?</td><td>No — <code>InvalidPartitionsException</code>, <code>ReplicationControlManager.java:1920</code></td></tr>
+<tr><td>Increase on keyed topic?</td><td>New topic at target count + migrate (dual-write, backfill, switch)</td></tr>
+<tr><td>Per-broker partition ceiling?</td><td>Hard: <code>vm.max_map_count ÷ 2 mmap/partition</code> = <code>65,530 ÷ 2 ≈ 32,765</code> default Linux; raise to ≥262,144. Keep counts low thousands</td></tr>
+<tr><td>Throughput not improving with more partitions?</td><td>Expected past ~100/topic; latency degrades past ~1000 (empirical) — you are over-partitioned</td></tr>
+</tbody></table></div>
+
+<p>Continue to Part II <a href="op04-capacity-planning.html">op04 · Capacity Planning</a> for broker counts and cluster sizing, <a href="op06-durability.html">op06 · Durability</a> for the replication/ISR settings that pair with these partitions, and <a href="op08-metrics-signals.html">op08 · Metrics &amp; Signals</a> for the lag and under-replication signals that drive reshard decisions.</p>

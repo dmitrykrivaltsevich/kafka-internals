@@ -1,0 +1,231 @@
+{
+ "byChapter": {
+  "00-overview": [
+   {
+    "severity": "major",
+    "location": "00-overview.html:240, codebase/feature table row 'Streams (KIP-1071)' \u2014 \"The KIP-848 model extended to Kafka Streams task assignment; Early Access in 4.1\"",
+    "issue": "Stale maturity/version claim, contradicted by the shipped 4.4.0-SNAPSHOT docs. The Streams Rebalance Protocol (KIP-1071) was Early Access in 4.1, but reached General Availability in 4.2, and is GA as of 4.4.0-SNAPSHOT. Describing it as merely 'Early Access' understates a headline feature's maturity. This is especially notable because the overview's closing 'Why this structure' callout boasts that the guide corrects commonly mis-stated version facts. (The chapter-briefs ch20 keyFact also carries the same stale 'Early Access' wording, so the error is inherited, not original \u2014 but source is ground truth here.) KIP-848 'GA in 4.0' on the adjacent row IS correct.",
+    "suggestedFix": "Change to reflect GA, e.g. 'The KIP-848 model extended to Kafka Streams task assignment; Early Access in 4.1, GA (core feature set) since 4.2.' Grounded in source docs: kafka-source/docs/streams/upgrade-guide.md:137-140 ('General Availability for a core feature set of the Streams Rebalance Protocol (KIP-1071) ... This release marks the General Availability') under the '## Streams API changes in 4.2.0' heading (line 135); Early-Access origin at docs/streams/upgrade-guide.md:164-168 under '## Streams API changes in 4.1.0' (line 160); also docs/streams/developer-guide/app-reset-tool.md:59 ('streams rebalance protocol (available since AK 4.2)')."
+   },
+   {
+    "severity": "minor",
+    "location": "00-overview.html:153 (data-path diagram) and 00-overview.html:186 (narration step 5) \u2014 \"acks=0 \u2500\u25b6 reply immediately (offset \u22121)\" / \"acks=0 replies immediately with offset \u22121\"",
+    "issue": "Slightly misleading: for acks=0 the broker sends NO response at all (a NoOpResponse), so there is no 'reply' carrying offset \u22121. The offset \u22121 (INVALID_OFFSET) is fabricated client-side in RecordMetadata. As written, a reader could infer the broker returns a \u22121 offset reply. The detailed chapters state it correctly (ch07 keyFact: 'NoOpResponse (e.g. acks=0 produce)'; ch16 keyFact: 'acks=0 yields offset -1 and no response').",
+    "suggestedFix": "Reword to e.g. 'acks=0 \u2192 no broker reply; client surfaces offset \u22121'. Grounded in source: kafka-source/core/src/main/scala/kafka/server/KafkaApis.scala:508-525 (acks==0 path calls sendNoOpResponseExemptThrottle \u2014 no produce response is sent); client-side INVALID_OFFSET surfaced per ch16 brief."
+   },
+   {
+    "severity": "minor",
+    "location": "00-overview.html:83 (METADATA PLANE figure, record-list text) \u2014 \"Record, RegisterBrokerRecord, AclRecord\u2026\" (also referenced in prose line 82 as example metadata records)",
+    "issue": "'AclRecord' is not a real metadata record type; it is an invented shorthand. The other examples (TopicRecord, PartitionChangeRecord, RegisterBrokerRecord) are real schema names, so the made-up one stands out in a guide that advertises source-grounding. The detailed security/metadata chapters use the correct name (ch18/ch12 keyFacts cite AccessControlEntryRecord / RemoveAccessControlEntryRecord).",
+    "suggestedFix": "Replace 'AclRecord' with the actual record name 'AccessControlEntryRecord' (or 'AccessControlEntryRecord/RemoveAccessControlEntryRecord'). Grounded in source: kafka-source/metadata/src/main/resources/common/metadata/AccessControlEntryRecord.json (and RemoveAccessControlEntryRecord.json); no file named AclRecord.json exists."
+   },
+   {
+    "severity": "minor",
+    "location": "00-overview.html:203 (on-disk storage layout figure) \u2014 \"00000000000004096.snapshot\"",
+    "issue": "Cosmetic inconsistency in the ASCII figure: this filename has only 17 digits, while every other segment file in the same figure (e.g. 00000000000000004096.log on line 201) uses 20-digit zero padding. Kafka always zero-pads segment-file base offsets to 20 digits.",
+    "suggestedFix": "Pad to 20 digits: '00000000000000004096.snapshot'. Grounded in source: kafka-source/storage/src/main/java/org/apache/kafka/storage/internals/log/LogFileUtils.java:102-104 (filenamePrefixFromOffset sets nf.setMinimumIntegerDigits(20)) and producerSnapshotFile() at :92 reuses that prefix."
+   },
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:153 diagram \"acks=0 \u2500\u25b6 reply immediately (offset \u22121)\" and :186 \"acks=0 replies immediately with offset \u22121\") vs ch06 (06-network-and-threading.html:143,309) and ch07 (07-request-processing.html:92)",
+    "issue": "Contradiction on whether the broker replies to an acks=0 produce. ch00 says the broker \"replies immediately with offset \u22121\". ch06 and ch07 both correctly state acks=0 \u2192 NoOpResponse, i.e. NO bytes/response are sent (ch06: \"no bytes sent\", \"no bytes are written\"; ch07: \"NoOpResponse (e.g. acks=0 produce: nothing to send)\"). The broker is fire-and-forget for acks=0; the \"-1\" offset is the value in the producer's LOCAL RecordMetadata, not a broker reply. A reader of the overview will form the wrong mental model that the broker sends an offset=-1 response.",
+    "suggestedFix": "Reword ch00 to match ch06/ch07 and source: for acks=0 the broker sends no response at all (NoOpResponse); the client's send callback completes locally with RecordMetadata offset = -1. Source: core/src/main/scala/kafka/server/KafkaApis.scala:508-525 (acks==0 branch calls requestHelper.sendNoOpResponseExemptThrottle(request); on error it closes the connection instead of replying)."
+   },
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:286 diagram \"~90 handlers\" and :307 \"a giant dispatch on apiKey to ~90 handlers\") vs ch07 (07-request-processing.html:4 \"roughly eighty cases\", :25 \"~80 dispatch cases\", :110 \"~80\")",
+    "issue": "Same fact (number of KafkaApis dispatch cases) stated as ~90 in ch00 but ~80 in ch07 \u2014 the two chapters disagree by ~10. Source has 80 `case ApiKeys.` total (78 inside the handle() method body, lines 155\u2013270). ch07 is correct; ch00 overstates.",
+    "suggestedFix": "Change ch00's \"~90 handlers\" (both occurrences) to \"~80 handlers\" to match ch07 and source. Source: core/src/main/scala/kafka/server/KafkaApis.scala \u2014 80 `case ApiKeys.` total; the handle() match (def at :155, ends before tryCompleteActions at :270) contains 78 cases."
+   },
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:118 diagram \"new immutable MetadataImage (10 sub-images: topics, configs, cluster, ACLs, quotas, features\u2026)\" and :128 \"folds them into immutable MetadataImage snapshots (a record of ten sub-images ...)\")",
+    "issue": "Factual count error, stated twice: ch00 says the MetadataImage is a record of TEN sub-images. The source MetadataImage holds MetadataProvenance + NINE content sub-images (Features, Cluster, Topics, Configurations, ClientQuotas, ProducerIds, Acls, Scram, DelegationToken). Provenance is offset/epoch metadata, not a content sub-image, and there is no separate client-metrics image inside MetadataImage. ch11/ch12 do not repeat the \"ten\" figure, so ch00 is the outlier vs both the rest of the guide and source.",
+    "suggestedFix": "Change \"ten sub-images\"/\"10 sub-images\" to \"nine sub-images\" (or rephrase as \"MetadataProvenance plus nine sub-images\"). Source: metadata/src/main/java/org/apache/kafka/image/MetadataImage.java:35-44 (constructor takes provenance + 9 *Image fields); isEmpty() and write() both iterate exactly those 9."
+   },
+   {
+    "severity": "minor",
+    "location": "ch00 (00-overview.html:101 \"About fifteen administrative APIs \u2014 CreateTopics, DeleteTopics, the CreateAcls/DeleteAcls and AlterConfigs families ... forwarded to the active controller\") vs ch07 (07-request-processing.html:122)",
+    "issue": "Cross-chapter inconsistency on whether AlterConfigs is forwarded. ch00 lists \"the AlterConfigs families\" among the APIs that are \"wrapped in an Envelope and forwarded to the active controller.\" ch07 explicitly states the opposite: \"The ALTER_CONFIGS family is not bare-forwarded: handleAlterConfigsRequest/handleIncrementalAlterConfigsRequest preprocess some resources locally and forward only the remainder.\" Source confirms ch07 (ALTER_CONFIGS and INCREMENTAL_ALTER_CONFIGS dispatch to local handlers, not forwardToController). Also ch00's \"about fifteen\" undercounts the 18 bare forwardToController cases, though it is hedged with \"about\".",
+    "suggestedFix": "In ch00, drop AlterConfigs from the plainly-forwarded list (or footnote that AlterConfigs is partially handled locally and only forwards the non-local remainder), to align with ch07. Source: KafkaApis.scala:201 (ALTER_CONFIGS => handleAlterConfigsRequest), :215 (INCREMENTAL_ALTER_CONFIGS => handleIncrementalAlterConfigsRequest); those handlers at :2204/:2228 call forwardingManager.forwardRequest only for the remainder. 18 cases dispatch directly to forwardToController."
+   },
+   {
+    "severity": "minor",
+    "location": "ch00 (00-overview.html:13 \"cut per-record overhead from ~34 bytes (legacy v1) to ~7 bytes\") vs ch01 (01-record-format.html:131 caption \"RECORD_OVERHEAD_V0 = 14, RECORD_OVERHEAD_V1 = 22\")",
+    "issue": "The same legacy-v1 per-record overhead is quoted with two different numbers across chapters: ~34 bytes in ch00 vs 22 (RECORD_OVERHEAD_V1) in ch01. Both are technically correct from different reference frames \u2014 ch00's 34 = the full standalone-message framing (12-byte LOG_OVERHEAD offset+size prefix + 22-byte record overhead), while ch01's 22 is RECORD_OVERHEAD_V1 alone \u2014 but a reader cross-referencing the two will see a discrepancy with no explanation.",
+    "suggestedFix": "Reconcile by making ch00 explicit, e.g. \"~34 bytes per standalone v1 message (a 12-byte offset/size prefix plus the 22-byte RECORD_OVERHEAD_V1)\". Source: clients/src/main/java/org/apache/kafka/common/record/internal/LegacyRecord.java:69-74 (RECORD_OVERHEAD_V0=14, RECORD_OVERHEAD_V1=22); Records.java:49 (LOG_OVERHEAD=12)."
+   },
+   {
+    "severity": "critical",
+    "location": "Whole guide (no chapter); touches overview \"Cluster anatomy in KRaft\" (00-overview.html lines 49-66, process.roles table) and ch11/ch12. Only tangential mentions exist: 11-kraft-controller.html:126,291; 12-metadata-propagation.html:366; 04-storage-management.html:67.",
+    "issue": "KRaft CLUSTER FORMATION / BOOTSTRAP is essentially absent. No chapter explains how a brand-new KRaft cluster comes into existence: generating the cluster ID (kafka-storage random-uuid), the MANDATORY `kafka-storage format --cluster-id X --release-version Y` step, what that writes (meta.properties = cluster.id + node.id + per-log-dir directory UUIDs; and the bootstrap.checkpoint / BootstrapMetadata carrying the initial metadata.version FeatureLevelRecord), and the KIP-853 dynamic-quorum formatting options (--standalone / --initial-controllers / --no-initial-controllers vs controller.quorum.voters). This is a genuine completeness gap specifically BECAUSE the guide is KRaft-only: unlike the ZooKeeper era, formatting storage is now a required first step with no equivalent before, and the overview repeatedly frames KRaft cluster anatomy and process.roles as a headline topic without ever telling the reader how the cluster is initialized. The mechanism is fully realized in source: core/src/main/scala/kafka/tools/StorageTool.scala:321-363 (format command: --cluster-id, --release-version, --standalone/--initial-controllers/--no-initial-controllers) and metadata/.../storage/Formatter.java:250-268,384-402 (writes meta.properties via MetaProperties.Builder and calculates BootstrapMetadata) and metadata/.../bootstrap/BootstrapMetadata.java:45-139 (bootstrap.checkpoint = BINARY_BOOTSTRAP_FILENAME, fromVersion/fromRecords).",
+    "suggestedFix": "Add a focused section (best home: ch12 Metadata Propagation & Broker Lifecycle, which already owns registration, or a short subsection in the overview's 'Cluster anatomy in KRaft') covering cluster bootstrap: cluster-ID generation, the mandatory `kafka-storage format` step, the meta.properties contents (cluster.id, node.id, directory.id per log dir) and bootstrap.checkpoint/BootstrapMetadata pinning the initial metadata.version, plus KIP-853 --standalone/--initial-controllers. Ground in core/src/main/scala/kafka/tools/StorageTool.scala:321-363, metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java:250-268,384-402, and metadata/src/main/java/org/apache/kafka/metadata/bootstrap/BootstrapMetadata.java:46 (BINARY_BOOTSTRAP_FILENAME = \"bootstrap.checkpoint\")."
+   },
+   {
+    "severity": "minor",
+    "location": "00-overview.html line 321 (codebase-map table, clients row: \"the producer, consumer, admin, and share clients\"); no chapter delivers AdminClient.",
+    "issue": "The AdminClient (KafkaAdminClient) is named as a first-class client in the overview's module map but is never covered by any chapter (chapters exist for producer=16, consumer=17, share consumer is folded into 15, but there is no admin-client chapter). It is the client behind every administrative operation the guide repeatedly references (CreateTopics, AlterConfigs, ListOffsets, describe/alter reassignments, the forward-to-controller admin APIs in ch07). The overview does not explicitly promise an admin chapter (the clients row's Chapters column lists only 01,02,16,17,18), so this is a coverage gap rather than a broken promise, but AdminClient's request-routing/retry/forwarding design is a notable omission for a guide of this depth.",
+    "suggestedFix": "Either (a) add a short AdminClient section (its async request pipeline, controller-forwarding, retries) cross-linked from ch07's forwardToController discussion, or (b) if intentionally out of scope, drop or footnote 'admin' in the overview's clients-module description so the reader is not led to expect coverage."
+   },
+   {
+    "severity": "minor",
+    "location": "00-overview.html line 203 (on-disk layout diagram): `00000000000004096.snapshot` vs adjacent `00000000000000004096.log` / `.index` on lines 201-202.",
+    "issue": "Internal inconsistency in the illustrative storage-layout figure: the .log and .index filenames use the correct 20-digit zero-padded base offset (16 zeros + 4096), but the producer-state .snapshot filename is shown with only ~17 digits (3 leading zeros short). Producer snapshot files use the identical 20-digit prefix as log/index files (storage/.../LogFileUtils.java:91-92 producerSnapshotFile -> filenamePrefixFromOffset(offset), the same helper at LogFileUtils.java:102 used for .log/.index). Cosmetic only; the diagram is illustrative.",
+    "suggestedFix": "Pad the snapshot filename to 20 digits to match: `00000000000000004096.snapshot` (per storage/src/main/java/org/apache/kafka/storage/internals/log/LogFileUtils.java:91-92,102)."
+   }
+  ],
+  "01-record-format": [
+   {
+    "severity": "minor",
+    "location": "ch00 (00-overview.html:13 \"cut per-record overhead from ~34 bytes (legacy v1) to ~7 bytes\") vs ch01 (01-record-format.html:131 caption \"RECORD_OVERHEAD_V0 = 14, RECORD_OVERHEAD_V1 = 22\")",
+    "issue": "The same legacy-v1 per-record overhead is quoted with two different numbers across chapters: ~34 bytes in ch00 vs 22 (RECORD_OVERHEAD_V1) in ch01. Both are technically correct from different reference frames \u2014 ch00's 34 = the full standalone-message framing (12-byte LOG_OVERHEAD offset+size prefix + 22-byte record overhead), while ch01's 22 is RECORD_OVERHEAD_V1 alone \u2014 but a reader cross-referencing the two will see a discrepancy with no explanation.",
+    "suggestedFix": "Reconcile by making ch00 explicit, e.g. \"~34 bytes per standalone v1 message (a 12-byte offset/size prefix plus the 22-byte RECORD_OVERHEAD_V1)\". Source: clients/src/main/java/org/apache/kafka/common/record/internal/LegacyRecord.java:69-74 (RECORD_OVERHEAD_V0=14, RECORD_OVERHEAD_V1=22); Records.java:49 (LOG_OVERHEAD=12)."
+   }
+  ],
+  "02-wire-protocol": [],
+  "03-storage-log-engine": [],
+  "04-storage-management": [
+   {
+    "severity": "critical",
+    "location": "Whole guide (no chapter); touches overview \"Cluster anatomy in KRaft\" (00-overview.html lines 49-66, process.roles table) and ch11/ch12. Only tangential mentions exist: 11-kraft-controller.html:126,291; 12-metadata-propagation.html:366; 04-storage-management.html:67.",
+    "issue": "KRaft CLUSTER FORMATION / BOOTSTRAP is essentially absent. No chapter explains how a brand-new KRaft cluster comes into existence: generating the cluster ID (kafka-storage random-uuid), the MANDATORY `kafka-storage format --cluster-id X --release-version Y` step, what that writes (meta.properties = cluster.id + node.id + per-log-dir directory UUIDs; and the bootstrap.checkpoint / BootstrapMetadata carrying the initial metadata.version FeatureLevelRecord), and the KIP-853 dynamic-quorum formatting options (--standalone / --initial-controllers / --no-initial-controllers vs controller.quorum.voters). This is a genuine completeness gap specifically BECAUSE the guide is KRaft-only: unlike the ZooKeeper era, formatting storage is now a required first step with no equivalent before, and the overview repeatedly frames KRaft cluster anatomy and process.roles as a headline topic without ever telling the reader how the cluster is initialized. The mechanism is fully realized in source: core/src/main/scala/kafka/tools/StorageTool.scala:321-363 (format command: --cluster-id, --release-version, --standalone/--initial-controllers/--no-initial-controllers) and metadata/.../storage/Formatter.java:250-268,384-402 (writes meta.properties via MetaProperties.Builder and calculates BootstrapMetadata) and metadata/.../bootstrap/BootstrapMetadata.java:45-139 (bootstrap.checkpoint = BINARY_BOOTSTRAP_FILENAME, fromVersion/fromRecords).",
+    "suggestedFix": "Add a focused section (best home: ch12 Metadata Propagation & Broker Lifecycle, which already owns registration, or a short subsection in the overview's 'Cluster anatomy in KRaft') covering cluster bootstrap: cluster-ID generation, the mandatory `kafka-storage format` step, the meta.properties contents (cluster.id, node.id, directory.id per log dir) and bootstrap.checkpoint/BootstrapMetadata pinning the initial metadata.version, plus KIP-853 --standalone/--initial-controllers. Ground in core/src/main/scala/kafka/tools/StorageTool.scala:321-363, metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java:250-268,384-402, and metadata/src/main/java/org/apache/kafka/metadata/bootstrap/BootstrapMetadata.java:46 (BINARY_BOOTSTRAP_FILENAME = \"bootstrap.checkpoint\")."
+   }
+  ],
+  "05-tiered-storage": [],
+  "06-network-and-threading": [
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:153 diagram \"acks=0 \u2500\u25b6 reply immediately (offset \u22121)\" and :186 \"acks=0 replies immediately with offset \u22121\") vs ch06 (06-network-and-threading.html:143,309) and ch07 (07-request-processing.html:92)",
+    "issue": "Contradiction on whether the broker replies to an acks=0 produce. ch00 says the broker \"replies immediately with offset \u22121\". ch06 and ch07 both correctly state acks=0 \u2192 NoOpResponse, i.e. NO bytes/response are sent (ch06: \"no bytes sent\", \"no bytes are written\"; ch07: \"NoOpResponse (e.g. acks=0 produce: nothing to send)\"). The broker is fire-and-forget for acks=0; the \"-1\" offset is the value in the producer's LOCAL RecordMetadata, not a broker reply. A reader of the overview will form the wrong mental model that the broker sends an offset=-1 response.",
+    "suggestedFix": "Reword ch00 to match ch06/ch07 and source: for acks=0 the broker sends no response at all (NoOpResponse); the client's send callback completes locally with RecordMetadata offset = -1. Source: core/src/main/scala/kafka/server/KafkaApis.scala:508-525 (acks==0 branch calls requestHelper.sendNoOpResponseExemptThrottle(request); on error it closes the connection instead of replying)."
+   }
+  ],
+  "07-request-processing": [
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:153 diagram \"acks=0 \u2500\u25b6 reply immediately (offset \u22121)\" and :186 \"acks=0 replies immediately with offset \u22121\") vs ch06 (06-network-and-threading.html:143,309) and ch07 (07-request-processing.html:92)",
+    "issue": "Contradiction on whether the broker replies to an acks=0 produce. ch00 says the broker \"replies immediately with offset \u22121\". ch06 and ch07 both correctly state acks=0 \u2192 NoOpResponse, i.e. NO bytes/response are sent (ch06: \"no bytes sent\", \"no bytes are written\"; ch07: \"NoOpResponse (e.g. acks=0 produce: nothing to send)\"). The broker is fire-and-forget for acks=0; the \"-1\" offset is the value in the producer's LOCAL RecordMetadata, not a broker reply. A reader of the overview will form the wrong mental model that the broker sends an offset=-1 response.",
+    "suggestedFix": "Reword ch00 to match ch06/ch07 and source: for acks=0 the broker sends no response at all (NoOpResponse); the client's send callback completes locally with RecordMetadata offset = -1. Source: core/src/main/scala/kafka/server/KafkaApis.scala:508-525 (acks==0 branch calls requestHelper.sendNoOpResponseExemptThrottle(request); on error it closes the connection instead of replying)."
+   },
+   {
+    "severity": "major",
+    "location": "ch00 (00-overview.html:286 diagram \"~90 handlers\" and :307 \"a giant dispatch on apiKey to ~90 handlers\") vs ch07 (07-request-processing.html:4 \"roughly eighty cases\", :25 \"~80 dispatch cases\", :110 \"~80\")",
+    "issue": "Same fact (number of KafkaApis dispatch cases) stated as ~90 in ch00 but ~80 in ch07 \u2014 the two chapters disagree by ~10. Source has 80 `case ApiKeys.` total (78 inside the handle() method body, lines 155\u2013270). ch07 is correct; ch00 overstates.",
+    "suggestedFix": "Change ch00's \"~90 handlers\" (both occurrences) to \"~80 handlers\" to match ch07 and source. Source: core/src/main/scala/kafka/server/KafkaApis.scala \u2014 80 `case ApiKeys.` total; the handle() match (def at :155, ends before tryCompleteActions at :270) contains 78 cases."
+   },
+   {
+    "severity": "minor",
+    "location": "ch00 (00-overview.html:101 \"About fifteen administrative APIs \u2014 CreateTopics, DeleteTopics, the CreateAcls/DeleteAcls and AlterConfigs families ... forwarded to the active controller\") vs ch07 (07-request-processing.html:122)",
+    "issue": "Cross-chapter inconsistency on whether AlterConfigs is forwarded. ch00 lists \"the AlterConfigs families\" among the APIs that are \"wrapped in an Envelope and forwarded to the active controller.\" ch07 explicitly states the opposite: \"The ALTER_CONFIGS family is not bare-forwarded: handleAlterConfigsRequest/handleIncrementalAlterConfigsRequest preprocess some resources locally and forward only the remainder.\" Source confirms ch07 (ALTER_CONFIGS and INCREMENTAL_ALTER_CONFIGS dispatch to local handlers, not forwardToController). Also ch00's \"about fifteen\" undercounts the 18 bare forwardToController cases, though it is hedged with \"about\".",
+    "suggestedFix": "In ch00, drop AlterConfigs from the plainly-forwarded list (or footnote that AlterConfigs is partially handled locally and only forwards the non-local remainder), to align with ch07. Source: KafkaApis.scala:201 (ALTER_CONFIGS => handleAlterConfigsRequest), :215 (INCREMENTAL_ALTER_CONFIGS => handleIncrementalAlterConfigsRequest); those handlers at :2204/:2228 call forwardingManager.forwardRequest only for the remainder. 18 cases dispatch directly to forwardToController."
+   }
+  ],
+  "08-replication": [],
+  "09-fetch-path": [
+   {
+    "severity": "major",
+    "location": "09-fetch-path.html line 230 (config table row) vs 17-consumer-client.html line 270; brief 09 keyFact \"the consumer-side fetch.max.bytes default is 55 MiB (ServerConfigs.java:106)\".",
+    "issue": "Wrong factual detail AND a direct contradiction between two chapters. Ch09 states the consumer `fetch.max.bytes` default is \"55 MiB (57671680)\" cited to `ServerConfigs.java:106`. All three parts are wrong: (a) the value is 50 MiB, not 55; (b) 57671680 = 55 MiB but the real constant is 52428800 = 50 MiB; (c) the constant is not in ServerConfigs.java:106 (ServerConfigs lives in server-common, not server, and does not define this). Ch17 line 270 correctly gives \"52428800 (50 MiB)\". A grep for 57671680 across the entire source tree returns zero matches, confirming no 55 MiB default exists anywhere.",
+    "suggestedFix": "In 09-fetch-path.html line 230, change the consumer fetch.max.bytes value to 50 MiB (52428800) and fix the citation to clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerConfig.java:200 (`public static final int DEFAULT_FETCH_MAX_BYTES = 50 * 1024 * 1024;`). This also brings ch09 into agreement with ch17."
+   }
+  ],
+  "10-kraft-consensus": [],
+  "11-kraft-controller": [
+   {
+    "severity": "critical",
+    "location": "Whole guide (no chapter); touches overview \"Cluster anatomy in KRaft\" (00-overview.html lines 49-66, process.roles table) and ch11/ch12. Only tangential mentions exist: 11-kraft-controller.html:126,291; 12-metadata-propagation.html:366; 04-storage-management.html:67.",
+    "issue": "KRaft CLUSTER FORMATION / BOOTSTRAP is essentially absent. No chapter explains how a brand-new KRaft cluster comes into existence: generating the cluster ID (kafka-storage random-uuid), the MANDATORY `kafka-storage format --cluster-id X --release-version Y` step, what that writes (meta.properties = cluster.id + node.id + per-log-dir directory UUIDs; and the bootstrap.checkpoint / BootstrapMetadata carrying the initial metadata.version FeatureLevelRecord), and the KIP-853 dynamic-quorum formatting options (--standalone / --initial-controllers / --no-initial-controllers vs controller.quorum.voters). This is a genuine completeness gap specifically BECAUSE the guide is KRaft-only: unlike the ZooKeeper era, formatting storage is now a required first step with no equivalent before, and the overview repeatedly frames KRaft cluster anatomy and process.roles as a headline topic without ever telling the reader how the cluster is initialized. The mechanism is fully realized in source: core/src/main/scala/kafka/tools/StorageTool.scala:321-363 (format command: --cluster-id, --release-version, --standalone/--initial-controllers/--no-initial-controllers) and metadata/.../storage/Formatter.java:250-268,384-402 (writes meta.properties via MetaProperties.Builder and calculates BootstrapMetadata) and metadata/.../bootstrap/BootstrapMetadata.java:45-139 (bootstrap.checkpoint = BINARY_BOOTSTRAP_FILENAME, fromVersion/fromRecords).",
+    "suggestedFix": "Add a focused section (best home: ch12 Metadata Propagation & Broker Lifecycle, which already owns registration, or a short subsection in the overview's 'Cluster anatomy in KRaft') covering cluster bootstrap: cluster-ID generation, the mandatory `kafka-storage format` step, the meta.properties contents (cluster.id, node.id, directory.id per log dir) and bootstrap.checkpoint/BootstrapMetadata pinning the initial metadata.version, plus KIP-853 --standalone/--initial-controllers. Ground in core/src/main/scala/kafka/tools/StorageTool.scala:321-363, metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java:250-268,384-402, and metadata/src/main/java/org/apache/kafka/metadata/bootstrap/BootstrapMetadata.java:46 (BINARY_BOOTSTRAP_FILENAME = \"bootstrap.checkpoint\")."
+   }
+  ],
+  "12-metadata-propagation": [
+   {
+    "severity": "critical",
+    "location": "Whole guide (no chapter); touches overview \"Cluster anatomy in KRaft\" (00-overview.html lines 49-66, process.roles table) and ch11/ch12. Only tangential mentions exist: 11-kraft-controller.html:126,291; 12-metadata-propagation.html:366; 04-storage-management.html:67.",
+    "issue": "KRaft CLUSTER FORMATION / BOOTSTRAP is essentially absent. No chapter explains how a brand-new KRaft cluster comes into existence: generating the cluster ID (kafka-storage random-uuid), the MANDATORY `kafka-storage format --cluster-id X --release-version Y` step, what that writes (meta.properties = cluster.id + node.id + per-log-dir directory UUIDs; and the bootstrap.checkpoint / BootstrapMetadata carrying the initial metadata.version FeatureLevelRecord), and the KIP-853 dynamic-quorum formatting options (--standalone / --initial-controllers / --no-initial-controllers vs controller.quorum.voters). This is a genuine completeness gap specifically BECAUSE the guide is KRaft-only: unlike the ZooKeeper era, formatting storage is now a required first step with no equivalent before, and the overview repeatedly frames KRaft cluster anatomy and process.roles as a headline topic without ever telling the reader how the cluster is initialized. The mechanism is fully realized in source: core/src/main/scala/kafka/tools/StorageTool.scala:321-363 (format command: --cluster-id, --release-version, --standalone/--initial-controllers/--no-initial-controllers) and metadata/.../storage/Formatter.java:250-268,384-402 (writes meta.properties via MetaProperties.Builder and calculates BootstrapMetadata) and metadata/.../bootstrap/BootstrapMetadata.java:45-139 (bootstrap.checkpoint = BINARY_BOOTSTRAP_FILENAME, fromVersion/fromRecords).",
+    "suggestedFix": "Add a focused section (best home: ch12 Metadata Propagation & Broker Lifecycle, which already owns registration, or a short subsection in the overview's 'Cluster anatomy in KRaft') covering cluster bootstrap: cluster-ID generation, the mandatory `kafka-storage format` step, the meta.properties contents (cluster.id, node.id, directory.id per log dir) and bootstrap.checkpoint/BootstrapMetadata pinning the initial metadata.version, plus KIP-853 --standalone/--initial-controllers. Ground in core/src/main/scala/kafka/tools/StorageTool.scala:321-363, metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java:250-268,384-402, and metadata/src/main/java/org/apache/kafka/metadata/bootstrap/BootstrapMetadata.java:46 (BINARY_BOOTSTRAP_FILENAME = \"bootstrap.checkpoint\")."
+   }
+  ],
+  "13-group-coordination": [],
+  "14-transactions-eos": [],
+  "15-share-groups": [],
+  "16-producer-client": [],
+  "17-consumer-client": [
+   {
+    "severity": "major",
+    "location": "09-fetch-path.html line 230 (config table row) vs 17-consumer-client.html line 270; brief 09 keyFact \"the consumer-side fetch.max.bytes default is 55 MiB (ServerConfigs.java:106)\".",
+    "issue": "Wrong factual detail AND a direct contradiction between two chapters. Ch09 states the consumer `fetch.max.bytes` default is \"55 MiB (57671680)\" cited to `ServerConfigs.java:106`. All three parts are wrong: (a) the value is 50 MiB, not 55; (b) 57671680 = 55 MiB but the real constant is 52428800 = 50 MiB; (c) the constant is not in ServerConfigs.java:106 (ServerConfigs lives in server-common, not server, and does not define this). Ch17 line 270 correctly gives \"52428800 (50 MiB)\". A grep for 57671680 across the entire source tree returns zero matches, confirming no 55 MiB default exists anywhere.",
+    "suggestedFix": "In 09-fetch-path.html line 230, change the consumer fetch.max.bytes value to 50 MiB (52428800) and fix the citation to clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerConfig.java:200 (`public static final int DEFAULT_FETCH_MAX_BYTES = 50 * 1024 * 1024;`). This also brings ch09 into agreement with ch17."
+   }
+  ],
+  "18-security": [],
+  "19-quotas": [],
+  "20-kafka-streams": [],
+  "21-kafka-connect": [],
+  "glossary": [
+   {
+    "severity": "major",
+    "location": "Part A \u2014 entire glossary has zero occurrences of ACL, Authorizer, principal, SASL, or 'security' (verified by grep over glossary.html)",
+    "issue": "Missing high-value terms: security/authorization vocabulary. Chapter 18 (Security: Authentication & Authorization) is a full chapter, and ACLs are stored as AccessControlEntryRecords in __cluster_metadata (so they are part of the very metadata log the glossary defines), yet no term covers ACL, Authorizer/StandardAuthorizer, KafkaPrincipal, SASL, or the deny-wins evaluation order. The 'Everything is a replicated log' table even lists ACLs as content of __cluster_metadata, but the concept is never defined.",
+    "suggestedFix": "Add at least 'ACL / Authorizer' and 'Principal'. Ground in source: StandardAuthorizer stores ACLs in __cluster_metadata as AccessControlEntryRecords {ResourceType, ResourceName, PatternType, Principal, Host, Operation, PermissionType} (clients/.../message/AccessControlEntryRecord.json; metadata/.../authorizer/StandardAuthorizer.java); precedence super-user > DENY > ALLOW > default (metadata/.../authorizer/StandardAuthorizerData.java:226-249). Principal is KafkaPrincipal 'User:name' (clients/.../security/auth/DefaultKafkaPrincipalBuilder.java:68). Cross-link 18-security.html."
+   },
+   {
+    "severity": "minor",
+    "location": "Glossary (glossary.html) Part B 'Everything is a replicated log', line 147 ('backs five internal logs, each owned by a kind of coordinator or the controller') and the table at lines 149-158 which includes __remote_log_metadata",
+    "issue": "The sentence claims each of the five internal logs is 'owned by a kind of coordinator or the controller', but the table's fifth entry, __remote_log_metadata (tiered storage), is owned by the RemoteLogMetadataManager (RLMM) / default RLMM index \u2014 not a coordinator and not the controller. The summarizing clause slightly over-generalizes its own table.",
+    "suggestedFix": "Soften the clause to 'each owned by the controller, a coordinator, or the tiered-storage RLMM' (or 'owned by a controller/coordinator/metadata-manager'), so it matches the five rows it introduces. No source change to the table needed; this is wording only."
+   }
+  ]
+ },
+ "general": [
+  {
+   "severity": "major",
+   "location": "Part A \u2014 no entry anywhere in the eight domains; cf. Part B 'Everything is a replicated log' table row for __remote_log_metadata, and the 'Log start offset' definition's passing mention of 'tiered storage'/'local log start offset'",
+   "issue": "Missing high-value term: tiered storage / remote log. Part B explicitly lists __remote_log_metadata as ONE OF THE FIVE core replicated logs ('backs five internal logs'), and chapter 05 (Tiered Storage) is a full chapter, yet Part A has no glossary entry for tiered storage, remote log, RSM, RLMM, __remote_log_metadata, or the 'local log start offset' as a standalone concept. The local-log-start-offset is only mentioned mid-sentence inside the 'Log start offset' entry. A reader cannot look up the single most cross-cutting storage feature that the guide itself elevates to one of its five pillars.",
+   "suggestedFix": "Add a 'Tiered storage / remote log' entry (and ideally 'Local log start offset', 'RSM', 'RLMM'). Ground it in source: enabled by remote.log.storage.system.enable and orchestrated by RemoteLogManager; metadata persisted to the internal topic __remote_log_metadata (50 partitions) via RLMM; only FINISHED segments are remote-readable; local deletion guarded by highestOffsetInRemoteStorage. The local log start offset is the lowest offset on local disk; see RemoteLogManager and the brief's chapter-05 keyFacts. Cross-link 05-tiered-storage.html."
+  },
+  {
+   "severity": "minor",
+   "location": "KRaft & metadata domain, 'MetadataImage / MetadataDelta' entry: 'MetadataImage is an immutable record of ten sub-images (features, cluster, topics, configs, quotas, ACLs, \u2026)'",
+   "issue": "Imprecise count that also contradicts the owning chapter. The actual record (metadata/.../image/MetadataImage.java:31-34) has ten COMPONENTS, but one of them is `provenance` (a MetadataProvenance holding offset/epoch), which is NOT a sub-image \u2014 it is the position marker. So there are nine sub-images (features, cluster, topics, configs, clientQuotas, producerIds, acls, scram, delegationTokens), not ten. The owning chapter 12 correctly says 'a record with ten components'; the glossary changes 'components' to 'sub-images', making the count wrong (should be nine sub-images, or ten components).",
+   "suggestedFix": "Change to 'an immutable record of ten components \u2014 provenance plus nine sub-images (features, cluster, topics, configs, quotas, producer-ids, ACLs, SCRAM, delegation-tokens)'. Source: metadata/src/main/java/org/apache/kafka/image/MetadataImage.java:31-45 (record components: provenance, features, cluster, topics, configs, clientQuotas, producerIds, acls, scram, delegationTokens). Aligns with chapter 12's 'ten components' wording."
+  },
+  {
+   "severity": "minor",
+   "location": "The log & offsets domain, 'High watermark (HW)' entry: 'never exceeds the leader's LEO (UnifiedLog.java:563)'",
+   "issue": "Off-by-one source citation. Line 563 is the method signature `public Optional<LogOffsetMetadata> maybeIncrementHighWatermark(...)`; the actual guard that enforces HW never exceeds LEO is `if (newHighWatermark.messageOffset > logEndOffset())` at UnifiedLog.java:564. The citation points one line above the load-bearing check.",
+   "suggestedFix": "Cite UnifiedLog.java:564 (the `newHighWatermark.messageOffset > logEndOffset()` check that throws IllegalArgumentException), or cite the range 563-567. Verified at /Users/user/projects/_playground/apache-kafka-architecture/kafka-source/storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java:564."
+  },
+  {
+   "severity": "minor",
+   "location": "Producers & transactions domain, 'Producer epoch' entry: 'the leader rejects any batch or marker carrying a lower epoch'",
+   "issue": "Under-states marker fencing under Transaction V2 and is slightly inconsistent with the glossary's own Part B fencing table. For batches the rule is reject-if-lower, but for transaction MARKERS under TV_2 the receiving leader rejects unless the epoch is STRICTLY GREATER than current (an equal-epoch marker is also rejected), per chapter 14 and ProducerAppendInfo. The Part A one-liner says only 'lower', whereas Part B's fencing table and chapter 14 correctly describe the strictly-greater rule for TV_2 markers.",
+   "suggestedFix": "Tighten to '... rejects any batch carrying a lower epoch, and (under Transaction V2) any marker whose epoch is not strictly greater than the current one'. Grounded in chapter 14 brief (keyFacts: 'under TV_2, markers whose epoch is not strictly greater than current') and ProducerAppendInfo.java:117-153,246-257 (per chapter-briefs.json n=14)."
+  },
+  {
+   "severity": "minor",
+   "location": "Part A \u2014 no standalone entry; the tokens read_committed / read_uncommitted appear ~6 times across the 'High watermark', 'Last stable offset', 'Index', 'Control record', and 'Transaction marker' definitions",
+   "issue": "Missing term: isolation level (read_committed / read_uncommitted). These are load-bearing in five other definitions and in Part B's delivery-semantics table, but are never themselves defined. A reader hitting 'read_committed consumers may not read past the LSO' has no glossary anchor explaining what the isolation levels are or where they are enforced.",
+   "suggestedFix": "Add an 'Isolation level (read_committed / read_uncommitted)' entry: the consumer FetchRequest isolation that bounds visible data \u2014 read_uncommitted reads up to the high watermark, read_committed up to the last stable offset with aborted-transaction batches filtered via the .txnindex. Ground in FetchIsolation (storage FetchIsolation.java; HIGH_WATERMARK vs TXN_COMMITTED) per chapter-09 brief keyFact. Cross-link 14-transactions-eos.html / 17-consumer-client.html."
+  },
+  {
+   "severity": "major",
+   "location": "Chapter 20 (Kafka Streams) \u00a7New Streams group protocol, line 222 ('the Streams group protocol ships as Early Access in this line') and line 326 ('Early Access in this release') vs. Chapter 00 (Overview) coordination table, line 240 ('Early Access in 4.1')",
+   "issue": "The maturity/availability of the KIP-1071 Streams rebalance protocol is stated three different ways across two chapters: chapter 20 says it is Early Access 'in this line'/'in this release' (i.e. in the current 4.4 build), while the overview pins it to 'Early Access in 4.1'. These cannot both be right \u2014 a feature is not simultaneously EA-in-4.1 (a past release) and EA-in-the-current-4.4-line. This is a genuine same-fact-stated-differently inconsistency about when/where the protocol is available.",
+   "suggestedFix": "Align all three statements and correct them against source: the protocol is NOT Early Access in 4.4. StreamsVersion.SV_1 enables 'streams' groups (KIP-1071) with bootstrap MetadataVersion IBP_4_2_IV1, and the enum explicitly comments 'Mark \"streams\" group as stable in production', with LATEST_PRODUCTION = SV_1 (kafka-source/server-common/src/main/java/org/apache/kafka/server/common/StreamsVersion.java:24-32). This mirrors share groups exactly (preview in 4.1, production in 4.2). Recommended wording for all three sites: 'KIP-1071 was a preview in 4.1 and became a production feature in 4.2 (streams.version SV_1, bootstrap MV IBP_4_2_IV1); the default group.protocol remains classic.'"
+  },
+  {
+   "severity": "major",
+   "location": "Chapter 20 (Kafka Streams), lead para (line 4: 'the newer broker-driven Streams group protocol'), \u00a7KIP-1071 note (line 222), and Design-rationale list (line 326) \u2014 all label KIP-1071 as Early Access; Chapter 00 line 240 likewise",
+   "issue": "Beyond the internal contradiction (previous finding), the 'Early Access' maturity label itself is contradicted by ground truth: the source marks the Streams group protocol as stable/production. Calling it Early Access in the current build is a factually wrong maturity claim, parallel to (and inconsistent with) how the same guide correctly describes share groups as having 'matured through 4.2' (Chapter 15 line 303).",
+   "suggestedFix": "Treat KIP-1071 as production in 4.4, gated by the streams.version feature (SV_1, IBP_4_2_IV1), per kafka-source/server-common/src/main/java/org/apache/kafka/server/common/StreamsVersion.java:24-32 and Feature.java:50 (STREAMS_VERSION ... LATEST_PRODUCTION). Keep the (correct) note that group.protocol defaults to classic (StreamsConfig.java:606), but drop 'Early Access'. For consistency, phrase it like the share-group maturity sentence already used in Chapter 15."
+  },
+  {
+   "severity": "minor",
+   "location": "Chapter 14 (Transactions) \u00a74 Consume-transform-produce (line 215, '(group id, generation, member id) ... fence offset commits by generation') and Design-rationale (line 392, 'fences offset commits by generation') vs. Chapter 13 (Group Coordination) \u00a7Commit path (line 331, transactional commits 'map a stale member epoch to STALE_MEMBER_EPOCH on v6+ (KIP-1319)')",
+   "issue": "Chapter 14 frames KIP-447 transactional-offset fencing exclusively in terms of consumer-group 'generation' (the classic-protocol token), while Chapter 13 describes the modern fencing token for transactional commits as the 'member epoch'. A reader comparing the two chapters sees the same mechanism (fencing TxnOffsetCommit) attributed to two different tokens with no bridge. It is defensible (ConsumerGroupMetadata literally carries a generationId field, and KIP-447 historically used generation), but the terminology drift is worth reconciling.",
+   "suggestedFix": "In Chapter 14, note that the token is the consumer group 'generation/member epoch' carried in ConsumerGroupMetadata (fields groupId, generationId, memberId, groupInstanceId \u2014 kafka-source/clients/.../consumer/ConsumerGroupMetadata.java:29-45) and that under the KIP-848 consumer protocol this manifests as member-epoch fencing (STALE_MEMBER_EPOCH), cross-referencing Chapter 13's commitTransactionalOffset path. One sentence aligning the vocabulary removes the apparent divergence."
+  }
+ ]
+}

@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lifecycle Operations · Kafka Internals</title>
+<meta name="description" content="Rolling upgrades &amp; metadata.version, reassignment &amp; throttling, add/remove brokers, disaster recovery.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="op12-lifecycle">
+<header class="topbar">
+  <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
+</header>
+<div class="scrim"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+    <div class="content-inner">
+      <article>
+<h1>II · 12 · Lifecycle Operations</h1>
+<blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Operational guidance grounded in source code and cited benchmarks.</blockquote>
+
+<p class="lead">A Kafka cluster is never <em>done</em> — it is upgraded, rebalanced, grown, shrunk, and recovered for years while it stays online. This chapter is the playbook for change-while-running. It walks the four lifecycle operations every operator performs and the one they hope never to: <strong>rolling upgrades</strong> (binaries first, then <code>metadata.version</code> via the feature mechanism — and the hard rule that <code>metadata.version</code> generally cannot be downgraded); <strong>partition reassignment</strong> (move replicas through the controller, throttled so it cannot starve live traffic); <strong>adding and removing brokers</strong> (registration, fencing, and the fact that Kafka <em>never</em> auto-rebalances data onto a new broker — you reassign it); <strong>controller-quorum changes</strong> (KIP-853 dynamic voters); and <strong>disaster recovery</strong> (the <code>__cluster_metadata</code> snapshot, MirrorMaker 2, unclean recovery, JBOD disk replacement). The unifying mechanism is the metadata log: every lifecycle change is a record the active controller appends and replicates, so each operation is really a question of <em>what record, in what order, and what waits for what to commit</em>. Every default and limit here is cited to source; every benchmark is marked <em>empirical</em> and directional, not a guarantee.</p>
+
+<div class="callout key"><span class="callout-title">The lifecycle invariant: change is a metadata record, applied in order</span><p>Upgrades, reassignments, broker membership, and quorum changes all flow through the same path — a request to the active controller, which appends one or more records to <code>__cluster_metadata</code>, replicates them to the quorum, and lets every broker apply them via its metadata listener (Part I <a href="12-metadata-propagation.html">Metadata Propagation</a>). This is why almost every lifecycle operation has a "wait until committed / wait until caught up" step: the cluster only acts on what has reached the high-watermark. Internalize this and the rest of the chapter is corollaries.</p></div>
+
+<h2>Rolling upgrades: binaries first, format second</h2>
+
+<p>A Kafka version upgrade has <strong>two independent phases</strong> that must happen in this order: (1) replace the <em>binaries</em> on every node, one at a time, while the cluster stays up; then, once every node runs the new version and is stable, (2) bump the cluster's <strong>feature flags</strong> — chiefly <code>metadata.version</code> — to <em>enable</em> the new on-disk record formats and behaviours the new binaries ship. Phase 1 is reversible (you can roll back the binary). Phase 2 is, for <code>metadata.version</code>, generally <strong>not</strong> reversible. Doing them in the wrong order — bumping the format before all nodes can read it — bricks the laggards.</p>
+
+<h3>Phase 1 — rolling the binaries</h3>
+
+<p>Each broker is upgraded by a controlled restart. The shutdown is <em>controlled</em>: the broker tells the controller it is going down so leadership migrates off it <em>before</em> the process exits, rather than the cluster discovering it dead. The mechanism lives in <code>BrokerLifecycleManager</code>: on shutdown it transitions to <code>PENDING_CONTROLLED_SHUTDOWN</code> and sends its next heartbeat <em>immediately</em> so the controller starts moving leadership right away (<code>server/.../BrokerLifecycleManager.java:341-346</code>). On the controller side the broker passes through the <code>BrokerControlState</code> machine — <code>UNFENCED → CONTROLLED_SHUTDOWN → SHUTDOWN_NOW</code> (<code>metadata/.../controller/BrokerControlState.java:22-25</code>) — and the controller elects new leaders for that broker's partitions from the in-sync followers. Because those followers are already in the ISR, this is a <em>clean</em> election with no data loss (Part I <a href="08-replication.html">Replication</a>).</p>
+
+<figure class="diagram">
+  <div class="dseq" style="--cols:3">
+    <div class="lanes"><span class="actor cat-broker">Broker N</span><span class="actor cat-control">Controller</span><span class="actor cat-storage">Followers</span></div>
+    <div class="body">
+      <div class="lifelines"><i></i><i></i><i></i></div>
+      <div class="m r" style="--from:1;--to:2"><span class="ml">heartbeat: PENDING_CONTROLLED_SHUTDOWN</span><span class="ln"></span></div>
+      <div class="m r" style="--from:2;--to:3"><span class="ml">elect new leaders from ISR (clean)</span><span class="ln"></span></div>
+      <div class="m l dashed" style="--from:2;--to:1"><span class="ml">heartbeat reply: shutdown OK</span><span class="ln"></span></div>
+      <div class="m r" style="--from:1;--to:1"><span class="ml">exit → upgrade binary → restart</span><span class="ln"></span></div>
+      <div class="m r" style="--from:1;--to:2"><span class="ml">register (new incarnationId)</span><span class="ln"></span></div>
+      <div class="m l dashed" style="--from:2;--to:1"><span class="ml">unfence once caught up to metadata</span><span class="ln"></span></div>
+    </div>
+  </div>
+  <figcaption>One step of a rolling upgrade. Leadership moves off the broker before it exits; on restart it re-registers and is unfenced only after catching up.</figcaption>
+  <div class="legend"><span class="sw cat-broker"></span> broker &nbsp; <span class="sw cat-control"></span> controller/metadata &nbsp; <span class="sw cat-storage"></span> follower replicas &nbsp; <span class="arr"></span> request &nbsp; <span class="arr dashed"></span> reply</div>
+</figure>
+
+<p>The "wait" between brokers is the whole game. After a broker restarts it <strong>registers</strong> with the controller quorum (KIP-631) under a fresh random <code>incarnationId</code> (<code>server/.../BrokerLifecycleManager.java:103</code>), and it comes back up <strong>fenced</strong> — it cannot host leaders or serve clients until it has (a) caught up to the latest metadata offset and (b) been explicitly marked ready to unfence (<code>BrokerLifecycleManager.java:109,114,143</code>). Do not restart the next broker until the previous one is fully unfenced and <code>UnderReplicatedPartitions</code> has returned to 0 (<code>core/.../server/ReplicaManager.scala:94</code>); restarting two brokers whose replica sets overlap can drop a partition below <code>min.insync.replicas</code> and reject produces.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config / constant</th><th>Default</th><th>Source</th><th>Why it matters during a roll</th></tr></thead>
+<tbody>
+<tr><td><code>broker.heartbeat.interval.ms</code></td><td><strong>2000</strong></td><td><code>raft/.../KRaftConfigs.java:40</code></td><td>How often the broker proves liveness; the controlled-shutdown handshake rides on it.</td></tr>
+<tr><td><code>broker.session.timeout.ms</code></td><td><strong>9000</strong></td><td><code>raft/.../KRaftConfigs.java:44</code></td><td>Lease length; miss heartbeats for this long and the controller fences the broker. A roll that stalls a broker &gt; 9 s makes it look dead.</td></tr>
+<tr><td><code>initial.broker.registration.timeout.ms</code></td><td><strong>60000</strong></td><td><code>raft/.../KRaftConfigs.java:36</code></td><td>How long a freshly restarted broker waits to register before giving up and exiting. Can't register in 60 s → the node self-terminates; check controller reachability.</td></tr>
+<tr><td><code>replica.lag.time.max.ms</code></td><td><strong>30000</strong></td><td><code>server/.../ReplicationConfigs.java:55</code></td><td>A restarted broker's followers must re-enter the ISR within this window after catching up. Bigger backlogs take longer; watch <code>IsrExpandsPerSec</code>.</td></tr>
+</tbody>
+</table></div>
+
+<div class="callout rationale"><span class="callout-title">Why one broker at a time, never two with overlapping replicas</span><p>With the durability baseline <code>replication.factor=3</code>, <code>min.insync.replicas=2</code> (Part I <a href="08-replication.html">Replication</a>; <a href="op06-durability.html">Durability</a>), a partition tolerates exactly one replica being unavailable while still accepting <code>acks=all</code> writes. Taking a single broker down leaves 2 replicas — still at <code>min.insync.replicas</code>. Take a <em>second</em> broker down that shares a partition and the ISR drops to 1; the partition is now under-min-ISR and producers get <code>NotEnoughReplicas</code>. The restart pacing rule ("URP back to 0 before the next node") is the operational expression of that arithmetic. At scale, replace ≤ 1 broker per maintenance window (Pinterest/Netflix practice — <em>empirical</em>).</p></div>
+
+<h3>Phase 2 — bumping metadata.version (KIP-584)</h3>
+
+<p>New binaries ship new record formats and behaviours <em>dormant</em>. They are switched on cluster-wide by raising the finalized feature level — primarily <code>metadata.version</code>, the master version that gates KRaft record schemas. The flow: the operator runs <code>kafka-features.sh upgrade --metadata &lt;version&gt;</code> (or the equivalent AdminClient <code>updateFeatures</code>), which reaches the active controller's <code>FeatureControlManager.updateFeatures(...)</code> (<code>metadata/.../controller/FeatureControlManager.java:179</code>). The controller does not just take your word for it: before writing the upgrade it calls <code>reasonNotSupported(...)</code>, which verifies that <strong>every registered broker and every controller</strong> advertises support for the target level, and refuses with <code>INVALID_UPDATE_VERSION</code> if any node is behind (<code>FeatureControlManager.java:321-373</code>). This is exactly why the binaries must roll first.</p>
+
+<figure class="diagram">
+  <div class="dflow">
+    <div class="node cat-control"><span class="nt">kafka-features.sh upgrade --metadata 4.3</span></div>
+    <div class="conn" data-label="updateFeatures RPC"></div>
+    <div class="node cat-control decision">all brokers + controllers support target level?</div>
+    <div class="conn"></div>
+    <div class="row">
+      <div class="col">
+        <div class="conn ec-err" data-label="no — a node is behind"></div>
+        <div class="node cat-error">reject: INVALID_UPDATE_VERSION</div>
+      </div>
+      <div class="col">
+        <div class="conn" data-label="yes"></div>
+        <div class="node cat-control decision">is this a downgrade?</div>
+        <div class="conn"></div>
+        <div class="row">
+          <div class="col">
+            <div class="conn ec-err" data-label="yes &amp; metadata changed"></div>
+            <div class="node cat-error">refuse: would delete metadata</div>
+          </div>
+          <div class="col">
+            <div class="conn" data-label="upgrade / harmless"></div>
+            <div class="node cat-storage store">append FeatureLevelRecord → replicate → every broker applies</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <figcaption>metadata.version upgrade gating in FeatureControlManager. The controller verifies cluster-wide support, then refuses any downgrade that would erase metadata.</figcaption>
+  <div class="legend"><span class="sw cat-control"></span> controller/feature control &nbsp; <span class="sw cat-storage"></span> metadata log record &nbsp; <span class="sw cat-error"></span> rejected path &nbsp; <span class="arr"></span> flow &nbsp; <span class="arr dashed"></span> rejection</div>
+</figure>
+
+<p>The <strong>downgrade rule</strong> is the operator trap. <code>updateMetadataVersion(...)</code> (<code>FeatureControlManager.java:385-423</code>) treats a lower target as a downgrade and calls <code>MetadataVersion.checkIfMetadataChanged(current, target)</code>. That method walks the version chain between the two and returns true if <em>any</em> intervening version set a "metadata changed" flag (<code>MetadataVersion.java:398-425</code>; each enum constant carries a <code>didMetadataChange</code> boolean, e.g. <code>IBP_4_3_IV0(30,"4.3","IV0",true)</code> at <code>MetadataVersion.java:125</code>). If the format changed, the controller <strong>refuses</strong>: "Refusing to perform the requested downgrade because it might delete metadata information" (<code>FeatureControlManager.java:410-411</code>). Unsafe (forced) metadata downgrade is <em>not implemented</em> — the code path exists but returns "Unsafe metadata downgrade is not supported in this version" (<code>FeatureControlManager.java:404-406</code>; tracked as KAFKA-13896). The only downgrade the controller will accept is to a version where <em>nothing in the format changed</em>.</p>
+
+<div class="callout warning"><span class="callout-title">metadata.version is a one-way door in practice — plan accordingly</span><p>Treat raising <code>metadata.version</code> as <strong>irreversible</strong>. Validate the new binaries thoroughly while the cluster still runs the <em>old</em> format (you can roll binaries back in this window), and only bump the format once you are committed to the release. The format is forward-only at the storage layer too: <code>kafka-storage format</code> warns that "formatted directories are not forward-compatible — the broker version must be ≥ the kafka-storage tool that formatted the directory" (<code>core/.../tools/StorageTool.scala:339-341</code>). Use <code>kafka-features.sh describe</code> to confirm the new level is finalized cluster-wide before declaring the upgrade complete.</p></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Feature / constant</th><th>Value</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>Feature name</td><td><code>metadata.version</code></td><td><code>MetadataVersion.java:142</code></td></tr>
+<tr><td><code>MINIMUM_VERSION</code> (oldest supported)</td><td><code>IBP_3_3_IV3</code> (level 7)</td><td><code>MetadataVersion.java:147</code></td></tr>
+<tr><td><code>LATEST_PRODUCTION</code> (newest stable, the default)</td><td><code>IBP_4_3_IV0</code> (level 30)</td><td><code>MetadataVersion.java:157</code></td></tr>
+<tr><td>Latest <em>unstable</em> (test-only unless <code>unstable.feature.versions.enable=true</code>)</td><td><code>IBP_4_4_IV0</code> (level 31)</td><td><code>MetadataVersion.java:136</code></td></tr>
+<tr><td>Other finalizable features (independent levels)</td><td><code>kraft.version</code>, <code>group.version</code>, <code>eligible.leader.replicas.version</code>, <code>transaction.version</code>, …</td><td><code>FeatureControlManager.java:243-317</code></td></tr>
+</tbody>
+</table></div>
+
+<p>Two corollaries. First, since the <code>4.0</code> release removed ZooKeeper entirely, the floor for any cluster you operate is KRaft; there is no ZK migration runbook to consider here, only KRaft-native upgrades. Second, features other than <code>metadata.version</code> (e.g. <code>group.version</code> for the new consumer-group protocol of <span class="pill kip">KIP-848</span>, or <code>eligible.leader.replicas.version</code>) have their <em>own</em> levels and dependency rules — the controller validates a feature's declared dependencies against the proposed set before accepting it (<code>FeatureControlManager.java:304-317</code>), and you can preview those with <code>kafka-storage feature-dependencies</code> (<code>StorageTool.scala:209</code>).</p>
+
+<h2>Partition reassignment: moving replicas without dropping packets</h2>
+
+<p>Kafka does not move data on its own. Re-placing a partition's replicas — to drain a broker, relieve a hot broker, change the replication factor, or spread newly added brokers' load — is an explicit <strong>reassignment</strong>. The tool is <code>kafka-reassign-partitions.sh</code> (<code>tools/.../reassign/ReassignPartitionsCommand.java</code>), which sends an <code>AlterPartitionReassignments</code> request to the active controller, landing in <code>ReplicationControlManager.alterPartitionReassignments(...)</code> (<code>metadata/.../controller/ReplicationControlManager.java:2134</code>).</p>
+
+<h3>The three-stage reassignment protocol</h3>
+
+<p>The controller does not swap replica lists atomically — it cannot, because the new replicas hold none of the data yet. <code>changePartitionReassignment(...)</code> drives a three-stage protocol, documented verbatim in the source (<code>ReplicationControlManager.java:2232-2251</code>):</p>
+
+<figure class="diagram">
+  <div class="dflow h">
+    <div class="node cat-storage store"><span class="nt">stage 1</span>add new replicas; set addingReplicas / removingReplicas</div>
+    <div class="conn" data-label="catch-up"></div>
+    <div class="node cat-coord decision"><span class="nt">stage 2</span>wait: ISR contains all new replicas</div>
+    <div class="conn" data-label="caught up"></div>
+    <div class="node cat-storage store"><span class="nt">stage 3</span>drop removingReplicas; clear adding/removing — done</div>
+  </div>
+  <figcaption>The controller-driven reassignment lifecycle. Stage 2 is the long pole: it is the time for the new replicas to fetch the entire partition into the ISR.</figcaption>
+  <div class="legend"><span class="sw cat-storage"></span> metadata record / replica state &nbsp; <span class="sw cat-coord"></span> wait-for-ISR &nbsp; <span class="arr"></span> progression</div>
+</figure>
+
+<ol>
+<li><strong>Stage 1:</strong> issue a <code>PartitionChangeRecord</code> that adds all new replicas to the partition's replica list and records which are <code>addingReplicas</code> and which are <code>removingReplicas</code>. The new followers begin replicating from the leader immediately, like any other follower (Part I <a href="09-fetch-path.html">Fetch Path</a>).</li>
+<li><strong>Stage 2:</strong> wait until the ISR contains every new replica (or, if only removing, until the ISR holds at least one replica that is not being removed). This is where the bytes actually move; for a multi-GB partition it can take minutes to hours, gated by your throttle and the leader's spare egress.</li>
+<li><strong>Stage 3:</strong> issue a second <code>PartitionChangeRecord</code> removing the old replicas and clearing the adding/removing markers. The reassignment is complete.</li>
+</ol>
+
+<p>A reassignment that merely <em>reorders</em> an existing replica list (e.g. to change the preferred leader) skips stages 1–2 and completes immediately, because the ISR is already suitable (<code>ReplicationControlManager.java:2248-2251</code>). While a partition is mid-reassignment it shows up in <code>ReassigningPartitions</code> (<code>core/.../server/ReplicaManager.scala:97</code>) and in <code>kafka-reassign-partitions.sh --verify</code> / the <code>ListPartitionReassignments</code> API (<code>ReplicationControlManager.java:2298</code>). Crucially, replicas being <em>added</em> by a reassignment are <strong>not</strong> counted as under-replicated — <code>UnderReplicatedPartitions</code> excludes them — so a healthy reassignment does not page you.</p>
+
+<div class="callout gotcha"><span class="callout-title">Cancelling a reassignment can require an unclean election — and may be blocked</span><p>You can abort an in-flight reassignment (resubmit with no target replicas → <code>cancelPartitionReassignment</code>, <code>ReplicationControlManager.java:2197</code>). The controller reverts to the original replica set — but if that revert would require electing a leader no longer in sync, it is treated as <em>unclean</em> and is <strong>refused unless</strong> <code>unclean.leader.election.enable=true</code> for the topic (<code>ReplicationControlManager.java:2204-2209</code>). Translation: do not assume "cancel" is always free. If you started a reassignment that moved the only in-sync replicas, cancelling may be blocked exactly when you most want it.</p></div>
+
+<h3>Throttling: the dial that keeps the move from starving live traffic</h3>
+
+<p>An unthrottled reassignment lets followers fetch as fast as the leader can serve — competing directly with live consumer fetches and replication, and able to saturate the leader's NIC. The fix is the <strong>replication throttle</strong>, enforced by <code>ReplicationQuotaManager</code> (<code>server/.../quota/ReplicationQuotaManager.java</code>). It is two coordinated parts:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Config key</th><th>Scope</th><th>Default</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>leader.replication.throttled.rate</code></td><td>per-broker (dynamic only)</td><td><code>Long.MAX_VALUE</code> (unlimited)</td><td><code>server-common/.../config/QuotaConfig.java:75</code>, default <code>:87</code></td></tr>
+<tr><td><code>follower.replication.throttled.rate</code></td><td>per-broker (dynamic only)</td><td><code>Long.MAX_VALUE</code> (unlimited)</td><td><code>QuotaConfig.java:80</code></td></tr>
+<tr><td><code>leader.replication.throttled.replicas</code></td><td>per-topic (list of <code>part:broker</code> or <code>*</code>)</td><td><code>[]</code> (none)</td><td><code>QuotaConfig.java:60,65</code></td></tr>
+<tr><td><code>follower.replication.throttled.replicas</code></td><td>per-topic</td><td><code>[]</code></td><td><code>QuotaConfig.java:67,72</code></td></tr>
+<tr><td><code>replica.alter.log.dirs.io.max.bytes.per.second</code></td><td>per-broker (intra-broker JBOD moves)</td><td>unlimited</td><td><code>QuotaConfig.java:84,87</code></td></tr>
+</tbody>
+</table></div>
+
+<p>The two work together: the <code>.rate</code> configs set a bytes/sec ceiling on a broker's <em>throttled</em> replication traffic, and the <code>.replicas</code> configs mark <em>which</em> replicas count against it (<code>ReplicationQuotaManager.isThrottled(...)</code>, <code>:96-99</code>; <code>markThrottled(...)</code>, <code>:114-123</code>). A replica's bytes are metered only if its topic-partition is in the throttled set — so the throttle hits the reassignment's moving replicas and leaves normal traffic alone. The rate is enforced as a sliding-window byte-rate sensor that raises <code>QuotaViolationException</code> when exceeded (<code>:80-90</code>). <code>kafka-reassign-partitions.sh</code> wires all four keys for you: pass <code>--throttle &lt;bytes/sec&gt;</code> on execute, and it sets the broker <code>.rate</code> configs and the topic <code>.replicas</code> configs; on a successful <code>--verify</code> it <em>clears</em> them automatically (<code>ReassignPartitionsCommand.java:112-119, 226-231, 494-537</code>).</p>
+
+<div class="callout key"><span class="callout-title">Throttle rule of thumb</span><p>Set the throttle to the leader broker's <strong>spare egress</strong>, not its total — leave headroom for live consumers and ongoing replication. A conservative starting point caps the move at the bandwidth that keeps client-facing <code>TotalTimeMs</code> p99 and <code>UnderReplicatedPartitions</code> flat (<a href="op08-metrics-signals.html">Metrics &amp; Signals</a>). You can raise the throttle mid-flight by resubmitting with a higher <code>--throttle</code> (<code>ReassignPartitionsCommand.java:124-125</code>). The source itself advises keeping the limit <strong>above 1 MB/s for accurate behaviour</strong> — below that the sampling is too coarse (<code>QuotaConfig.java:76-78</code>). Set the rate too low and the move never reaches stage 2: the reassignment hangs forever. Watch <code>ReassigningPartitions</code> for progress.</p></div>
+
+<div class="callout warning"><span class="callout-title">Always run --verify to completion — orphaned throttles silently cap replication</span><p>If you set a throttle and never run a successful <code>--verify</code>, the <code>.rate</code> / <code>.replicas</code> configs persist. A leftover <code>leader.replication.throttled.replicas=*</code> with a low rate will <strong>throttle all future replication on that topic</strong> — including recovery after a broker failure — turning a finished migration into a latent outage. The first thing to check when a topic mysteriously can't catch up is <code>kafka-configs.sh --describe</code> for stale throttle entries. The intra-broker JBOD case has its own ceiling (<code>replica.alter.log.dirs.io.max.bytes.per.second</code>) because that traffic is local disk-to-disk, not network.</p></div>
+
+<h2>Adding and removing brokers: there is no autopilot for data</h2>
+
+<p>The single most surprising fact for operators new to Kafka: <strong>adding a broker moves no data onto it</strong>. A new broker registers, is unfenced, and sits there hosting <em>nothing</em> until you explicitly reassign partitions to it. Kafka has no built-in data balancer; the partition placement of <em>existing</em> topics is frozen until you change it. (External tools — Cruise Control, Confluent Self-Balancing Clusters, MSK auto-rebalancing — exist precisely to automate the reassignment plan; open-source Kafka ships only the mechanism, <code>kafka-reassign-partitions.sh</code>, not the policy. LinkedIn runs Cruise Control across its fleet for exactly this — <em>empirical</em>.)</p>
+
+<h3>Adding a broker</h3>
+
+<figure class="diagram">
+  <div class="dstate">
+    <span class="term"></span>
+    <span class="tr"><span class="tl">format dirs, start</span><span class="ta"></span></span>
+    <span class="st">STARTING</span>
+    <span class="tr"><span class="tl">register (KIP-631)</span><span class="ta"></span></span>
+    <span class="st warn">FENCED</span>
+    <span class="tr"><span class="tl">caught up + ready</span><span class="ta"></span></span>
+    <span class="st">UNFENCED / RUNNING</span>
+    <span class="tr"><span class="tl">you reassign partitions onto it</span><span class="ta"></span></span>
+    <span class="st">hosting replicas</span>
+    <span class="term end"></span>
+  </div>
+  <figcaption>A new broker's path to usefulness. It is RUNNING but empty until an explicit reassignment places replicas on it.</figcaption>
+  <div class="legend"><span class="mono">FENCED</span> cannot host leaders / serve clients &nbsp; <span class="mono">UNFENCED</span> eligible for placement &nbsp; the final transition is operator-driven, not automatic</div>
+</figure>
+
+<ol>
+<li><strong>Format its storage</strong> with the cluster's existing cluster ID: <code>kafka-storage format --cluster-id &lt;id&gt; --config &lt;props&gt;</code> (<code>StorageTool.scala:116</code>). The cluster ID <em>must</em> match the running cluster (<code>--cluster-id</code> is required, <code>StorageTool.scala:321-324</code>); a mismatched ID is rejected by <code>kafka-storage info</code> with "Mismatched cluster IDs" (<code>StorageTool.scala:438-439</code>). A broker-only node does not write a bootstrap snapshot — only nodes with the controller role do (<code>StorageTool.scala:128</code>).</li>
+<li><strong>Start it.</strong> It registers under a fresh <code>incarnationId</code>, comes up <code>FENCED</code>, catches up on metadata, and unfences (the registration/heartbeat machinery of <code>BrokerLifecycleManager</code> above). Confirm with <code>kafka-broker-api-versions.sh</code> or the controller's broker list.</li>
+<li><strong>Reassign partitions onto it.</strong> Generate a plan (<code>kafka-reassign-partitions.sh --generate</code>) that includes the new broker ID, then execute it <em>throttled</em>. This is the step that actually uses the new capacity.</li>
+</ol>
+
+<h3>Removing a broker (decommission)</h3>
+
+<p>Decommissioning is the inverse and must be done <em>before</em> the broker stops, while it can still serve its replicas:</p>
+
+<ol>
+<li><strong>Reassign every partition off the broker.</strong> Build a reassignment whose target replica lists exclude the departing broker ID, covering all its partitions, and execute it throttled. Until this finishes, the broker still holds the only copy of some replicas.</li>
+<li><strong>Confirm it hosts nothing.</strong> Wait until <code>ReassigningPartitions</code> is 0 and the broker's <code>PartitionCount</code> / <code>LeaderCount</code> (<code>ReplicaManager.scala:91-92</code>) drop to 0.</li>
+<li><strong>Shut it down</strong> (controlled). With no replicas left, there is nothing to migrate; the broker simply leaves.</li>
+</ol>
+
+<div class="callout gotcha"><span class="callout-title">Decommissioning the wrong way drops you below min.insync.replicas</span><p>Stopping a broker before draining its replicas is just an uncontrolled failure — for every partition where it was a replica, the ISR shrinks by one. If a partition was at RF=3 and you pull a broker without reassigning, it falls to 2 in-sync, then any further hiccup pushes it under <code>min.insync.replicas=2</code> and produces are rejected. With degraded or flapping machines, even reassignment can be insufficient (the broker can't serve its data fast enough); the documented mitigation is rate-limited <strong>single-broker-per-window replacement</strong> (Pinterest's Jan-2018 incident — <em>empirical</em>). Never decommission two brokers concurrently unless you have proven no partition shares both.</p></div>
+
+<h3>Preferred-leader election: rebalancing <em>leadership</em>, not data</h3>
+
+<p>Reassignment moves replicas; it does not, by itself, balance <em>who is leader</em>. After a roll or a failure, leadership often piles onto whichever brokers came back first, leaving some brokers carrying most of the produce/fetch load. Each partition has a <strong>preferred leader</strong> — the first replica in its assignment list — and Kafka can restore leadership to it. By default the controller does this automatically: <code>auto.leader.rebalance.enable=true</code> (<code>server/.../ReplicationConfigs.java:148</code>) runs a background imbalance check every <code>leader.imbalance.check.interval.seconds=300</code> (<code>:119</code>) and, if leaders are skewed, elects each partition's preferred replica.</p>
+
+<p>You can also trigger it on demand with <code>kafka-leader-election.sh --election-type PREFERRED</code> (<code>tools/.../LeaderElectionCommand.java</code>) — useful immediately after a planned roll to re-seat leadership without waiting for the 5-minute timer. Preferred election is a <em>clean</em> election (the preferred replica must be in the ISR), so it is safe; it is distinct from the dangerous <code>UNCLEAN</code> election type discussed under disaster recovery.</p>
+
+<div class="callout note"><span class="callout-title">KRaft dropped the per-broker imbalance percentage knob</span><p>The ZooKeeper-era <code>leader.imbalance.per.broker.percentage</code> threshold is no longer a public configuration in KRaft; auto-rebalance is governed by <code>auto.leader.rebalance.enable</code> and the check interval. If you want tight control over <em>when</em> leadership re-seats (e.g. to avoid a leadership storm mid-incident), disable auto-rebalance and run preferred election manually as a deliberate step. Separately, periodic <em>unclean</em> election retries are paced by <code>unclean.leader.election.interval.ms</code> (default 5 minutes, <code>ReplicationConfigs.java</code>).</p></div>
+
+<h2>Cluster formation and dynamic controller membership</h2>
+
+<p>A cluster is born from <code>kafka-storage format</code>, which writes <code>meta.properties</code> (the cluster ID, node ID, and directory ID) into each log directory and, for controller nodes, a <strong>bootstrap snapshot</strong> seeding the initial <code>metadata.version</code> and feature levels (<code>StorageTool.runFormatCommand</code>, <code>StorageTool.scala:116-177</code>; Part I <a href="11-kraft-controller.html">KRaft Controller</a>). The <code>--release-version</code> flag picks the initial format level — default <code>LATEST_PRODUCTION</code>, minimum <code>MINIMUM_VERSION</code> (<code>StorageTool.scala:336-341</code>). For the controller quorum you choose, at format time, between a <strong>static</strong> voter set (<code>controller.quorum.voters</code>) and a <strong>dynamic</strong> one (<code>--standalone</code>, <code>--initial-controllers</code>, or <code>--no-initial-controllers</code> with <code>controller.quorum.bootstrap.servers</code>); the two are mutually exclusive and the tool enforces it (<code>StorageTool.scala:148-172</code>).</p>
+
+<h3>KIP-853: adding and removing controller voters at runtime</h3>
+
+<p>A <em>dynamic</em> quorum can change its voter membership while running — grow a 1-node controller quorum to 3, or replace a failed controller, without reformatting. This is <span class="pill kip">KIP-853</span>, enabled by <code>kraft.version=1</code>. The add path, <code>AddVoterHandler.handleAddVoterRequest(...)</code> (<code>raft/.../internals/AddVoterHandler.java:86</code>), runs a careful 10-step protocol (documented at <code>AddVoterHandler.java:45-64</code>); the gating checks that matter operationally are:</p>
+
+<figure class="diagram">
+  <div class="dflow">
+    <div class="node cat-control"><span class="nt">kafka-metadata-quorum add-controller</span></div>
+    <div class="conn"></div>
+    <div class="node cat-control decision">leader HWM known? (prior leaders fenced)</div>
+    <div class="conn" data-label="yes"></div>
+    <div class="node cat-control decision">cluster kraft.version ≥ 1?</div>
+    <div class="conn" data-label="yes"></div>
+    <div class="node cat-control decision">no uncommitted voter change?</div>
+    <div class="conn" data-label="yes"></div>
+    <div class="node cat-coord decision">new voter caught up to leader LEO?</div>
+    <div class="conn" data-label="yes"></div>
+    <div class="node cat-storage store">append VotersRecord → commit on NEW majority</div>
+  </div>
+  <figcaption>AddVoter gating. Every "no" returns an error (REQUEST_TIMED_OUT / UNSUPPORTED_VERSION / INVALID_REQUEST); the new voter must be caught up before it can join.</figcaption>
+  <div class="legend"><span class="sw cat-control"></span> controller/quorum check &nbsp; <span class="sw cat-coord"></span> catch-up wait &nbsp; <span class="sw cat-storage"></span> VotersRecord &nbsp; <span class="arr"></span> pass</div>
+</figure>
+
+<ul>
+<li><strong>kraft.version ≥ 1 required.</strong> If the cluster hasn't enabled reconfiguration, AddVoter returns <code>UNSUPPORTED_VERSION</code> (<code>AddVoterHandler.java:114-127</code>). Upgrade <code>kraft.version</code> via the same feature mechanism first.</li>
+<li><strong>New voter must be caught up.</strong> The leader checks <code>isReplicaCaughtUp(...)</code> and aborts with a timeout if the joiner lags (<code>AddVoterHandler.java:282-301</code>) — so a fresh controller must replay the metadata log close to the LEO before it can be admitted, avoiding a quorum that can't make progress.</li>
+<li><strong>One change at a time.</strong> If a previous voter change hasn't committed, the request times out (<code>AddVoterHandler.java:129-142</code>). Add or remove voters sequentially, never in parallel.</li>
+</ul>
+
+<p>Removal (<code>RemoveVoterHandler</code>, <code>raft/.../internals/RemoveVoterHandler.java:40-52</code>) is a 7-step mirror: same HWM and <code>kraft.version</code> and no-uncommitted-change gates, append the new <code>VotersRecord</code>, commit on the new majority, and — if the leader removed <em>itself</em> — resign leadership so a remaining voter takes over (<code>RemoveVoterHandler.java:46-51</code>). The operator commands are <code>kafka-metadata-quorum.sh add-controller</code> / <code>remove-controller</code>. Always keep the quorum at an odd size (1, 3, 5) so a clean majority exists; grow 1→3 by adding voters one at a time, each caught up before the next. See Part I <a href="10-kraft-consensus.html">KRaft Consensus</a> for the replication protocol underneath.</p>
+
+<h2>Disaster recovery</h2>
+
+<p>Lifecycle operations are planned. DR is for when the plan failed. Four mechanisms matter, in roughly increasing severity.</p>
+
+<h3>The metadata snapshot — your control plane's backup</h3>
+
+<p>KRaft's entire cluster state — topics, partitions, configs, ACLs, broker registrations, feature levels — lives in the <code>__cluster_metadata</code> log. To bound recovery time and log size, the controller periodically snapshots it (KIP-630). A snapshot is written when either of two thresholds is hit:</p>
+
+<dl class="kv">
+<dt><code>metadata.log.max.snapshot.interval.ms</code></dt><dd>default <strong>1 hour</strong> — time-based snapshotting (<code>raft/.../MetadataLogConfig.java:39</code>).</dd>
+<dt><code>metadata.log.max.record.bytes.between.snapshots</code></dt><dd><strong>20 MiB</strong> of new records since the last snapshot (<code>MetadataLogConfig.java:41</code>).</dd>
+<dt><code>metadata.max.idle.interval.ms</code></dt><dd><strong>500 ms</strong> — even when idle, the controller appends a no-op so the log keeps advancing and snapshots stay current (<code>MetadataLogConfig.java:76</code>).</dd>
+</dl>
+
+<p>Why this matters for DR: when a broker (or a new controller voter) starts, it loads the latest snapshot and replays only the log <em>after</em> it — that is why catch-up is fast and why a freshly added controller can be admitted quickly. For backup, the snapshot files plus the metadata log <em>are</em> the cluster's control-plane state; protect the controllers' metadata directory accordingly. These snapshots cover <em>metadata</em>, not your topic <em>data</em> — topic data durability is the replication/RF story, and cross-cluster data backup is MirrorMaker's job.</p>
+
+<h3>MirrorMaker 2 — cross-cluster backup and DR</h3>
+
+<p>MirrorMaker 2 (<code>connect/mirror/.../MirrorMaker.java</code>) replicates topics, consumer-group offsets, and topic configs from a source cluster to a target cluster, running as Kafka Connect connectors (Part I <a href="21-kafka-connect.html">Kafka Connect</a>): <code>MirrorSourceConnector</code> (data + configs), <code>MirrorCheckpointConnector</code> (consumer offsets, so consumers can fail over and resume near where they left off), and <code>MirrorHeartbeatConnector</code> (liveness/lag of the replication flow). For DR you run MM2 from primary → standby cluster; on a primary loss, applications repoint to the standby and resume from the checkpointed offsets. Failover to a standby cluster in <strong>under 5 minutes</strong> is a documented target at scale (Netflix Keystone — <em>empirical</em>).</p>
+
+<div class="callout gotcha"><span class="callout-title">MM2 is asynchronous — expect a small replication lag, and don't mirror throttle configs</span><p>MM2 replication is asynchronous, so a hard primary failure can lose the few records not yet mirrored; it is RPO-near-zero, not RPO-zero. Also, MM2 deliberately <em>excludes</em> the replication-throttle configs from what it copies — <code>follower.replication.throttled.replicas</code>, <code>leader.replication.throttled.replicas</code> (and the matching rate keys) are in the default config-exclude list (<code>connect/mirror/.../DefaultConfigPropertyFilter.java:38-39</code>) — precisely so a throttle set on the source does not silently throttle the target. Historically, naïve MirrorMaker (v1) suffered rebalance storms that stalled replication for 5–10 minutes and, after repeated failed rebalances, stuck permanently (Uber — <em>empirical</em>), which is why MM2's Connect-based, incrementally-rebalancing design replaced it.</p></div>
+
+<h3>Unclean recovery — trading data for availability</h3>
+
+<p>If <em>every</em> in-sync replica of a partition is lost, the partition has no leader and is offline (<code>OfflinePartitionsCount &gt; 0</code>). The safe default is to <strong>wait</strong>: <code>unclean.leader.election.enable=false</code> (<code>storage/.../log/LogConfig.java:139</code>) keeps the partition unavailable until an in-sync replica returns, preserving every committed record. The escape hatch is an <strong>unclean leader election</strong>: promote an out-of-sync replica to leader, restoring availability but <em>discarding</em> every record that replica was missing. When this happens, the controller resets the ISR to that lone replica and sets <code>LeaderRecoveryState=RECOVERING</code> (<code>metadata/.../LeaderRecoveryState.java:33</code>) until the partition re-stabilises.</p>
+
+<div class="callout warning"><span class="callout-title">Unclean election is data loss — make it a conscious choice, monitored</span><p>Any non-zero <code>UncleanLeaderElectionsPerSec</code> means committed messages were lost (Conduktor — <em>empirical</em>). Because the modern default is <code>false</code>, an offline partition simply stays offline until you either (a) recover the original in-sync replica's broker, or (b) deliberately run <code>kafka-leader-election.sh --election-type UNCLEAN</code> to choose availability over the missing data. A standby cluster fed by MM2 is the better answer for genuinely critical data — Datadog recovered from a pre-0.11 unclean-election data-loss event <em>only</em> because they dual-wrote to a second cluster (<em>empirical</em>). Note the default flipped: <code>unclean.leader.election.enable</code> was <strong>true</strong> before 0.11.0, <strong>false</strong> after — verify on legacy clusters. Decide this policy per topic before an incident, not during one.</p></div>
+
+<h3>JBOD disk replacement</h3>
+
+<p>With multiple log directories per broker (JBOD), Kafka tolerates losing a single disk without losing the broker. On the first I/O error a broker marks that log directory <em>offline</em>: it stops serving the replicas on that disk (they go under-replicated and re-lead elsewhere) while the broker keeps serving its other disks. Only when <em>all</em> log directories are bad does the broker go fully offline. The replacement procedure:</p>
+
+<ol>
+<li>Physically replace the failed disk and recreate the empty log-directory mount.</li>
+<li>Restart the broker. It registers (fenced) and reconciles its on-disk directories against the controller's expectation. In KRaft, the broker advertises its directory assignments and the controller reconciles replica-to-directory placement via the <code>AssignReplicasToDirs</code> mechanism (<span class="pill kip">KIP-858</span>); the empty disk is repopulated by normal follower replication from the leaders.</li>
+<li>Optionally throttle the catch-up with <code>follower.replication.throttled.rate</code> if the re-replication competes with live traffic, and watch <code>UnderReplicatedPartitions</code> drain to 0.</li>
+</ol>
+
+<div class="callout gotcha"><span class="callout-title">A full disk is not a clean JBOD failure</span><p>Running a log directory out of space is more abrupt than a disk fault: the broker can crash on <code>No space left on device</code> without a graceful shutdown. It is recoverable if RF ≥ 2 (another replica leads). The emergency move is to free space safely — lower retention via <code>kafka-configs.sh</code> (which lets the cleaner delete <em>old</em> segments) rather than hand-deleting files, and <strong>never</strong> delete the newest active <code>.log</code>/<code>.index</code>/<code>.timeindex</code> of a partition (that corrupts it). Restart at 10–20% free and verify <code>UnderReplicatedPartitions</code> returns to empty (Conduktor — <em>empirical</em>). Alert at 70% / 85% disk well before this point (<a href="op08-metrics-signals.html">Metrics &amp; Signals</a>).</p></div>
+
+<h2>Putting it together: the lifecycle decision map</h2>
+
+<figure class="diagram">
+  <div class="dflow">
+    <div class="node cat-broker decision">what changed / what's the goal?</div>
+    <div class="conn"></div>
+    <div class="row">
+      <div class="col">
+        <div class="conn" data-label="new release"></div>
+        <div class="node cat-control">roll binaries 1×, URP→0 between; then bump metadata.version (one-way)</div>
+      </div>
+      <div class="col">
+        <div class="conn" data-label="rebalance data"></div>
+        <div class="node cat-storage">reassign partitions, throttled; --verify to clear throttle</div>
+      </div>
+      <div class="col">
+        <div class="conn" data-label="capacity change"></div>
+        <div class="node cat-broker">add/remove broker → then reassign (no autopilot)</div>
+      </div>
+      <div class="col">
+        <div class="conn ec-err" data-label="disaster"></div>
+        <div class="node cat-error">offline? wait for ISR, or MM2 failover; unclean = last resort</div>
+      </div>
+    </div>
+  </div>
+  <figcaption>The four lifecycle paths and their first move. Three are planned and reversible-ish; the red path trades data for availability and should be a pre-decided policy.</figcaption>
+  <div class="legend"><span class="sw cat-control"></span> upgrade/feature &nbsp; <span class="sw cat-storage"></span> reassignment &nbsp; <span class="sw cat-broker"></span> membership &nbsp; <span class="sw cat-error"></span> DR / data-loss path &nbsp; <span class="arr"></span> path</div>
+</figure>
+
+<div class="callout invariant"><span class="callout-title">Five rules that never change</span><p><strong>(1)</strong> Roll binaries before bumping <code>metadata.version</code> — the controller rejects the bump until every node supports it, and the bump is effectively one-way (<code>FeatureControlManager.java:321,399</code>). <strong>(2)</strong> One broker (or one voter) at a time; wait for <code>UnderReplicatedPartitions=0</code> and full unfence before the next. <strong>(3)</strong> Every data move is an explicit, throttled reassignment — Kafka never balances data for you, and an orphaned throttle is a latent outage. <strong>(4)</strong> Decommission by draining replicas <em>before</em> stopping the broker, never after. <strong>(5)</strong> Unclean leader election and forced metadata downgrade are data-destroying last resorts — decide the policy per topic in advance, and keep a MirrorMaker-2 standby for anything you cannot afford to lose.</p></div>
+      </article>
+      <footer class="footer-meta">
+        <p>Part of <strong>Apache Kafka — The Complete Field Guide</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </div>
+  </main>
+  <aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/manifest.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

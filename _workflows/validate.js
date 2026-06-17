@@ -8,14 +8,8 @@ const path = require("path");
 const ROOT = path.resolve(__dirname, "..");
 const FRAG = path.join(ROOT, "_fragments");
 
-const EXPECT = [
-  "00-overview","01-record-format","02-wire-protocol","03-storage-log-engine",
-  "04-storage-management","05-tiered-storage","06-network-and-threading","07-request-processing",
-  "08-replication","09-fetch-path","10-kraft-consensus","11-kraft-controller",
-  "12-metadata-propagation","13-group-coordination","14-transactions-eos","15-share-groups",
-  "16-producer-client","17-consumer-client","18-security","19-quotas","20-kafka-streams",
-  "21-kafka-connect","glossary"
-];
+// every page in the manifest (Part I/II/III) — so all fragments get balance-checked
+const EXPECT = Object.keys(require(path.join(ROOT, "assets", "manifest.js")).PAGES);
 
 // tags whose "<" legitimately appears inside <pre> blocks
 const INLINE_OK = ["code","span","b","strong","em","i","a","sub","sup","mark"];

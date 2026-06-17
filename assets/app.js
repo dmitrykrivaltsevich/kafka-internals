@@ -70,6 +70,13 @@
       });
     });
 
+    // center the active item in the sidebar on load so navigating doesn't leave it scrolled off-screen
+    var act = sb.querySelector("a.active");
+    if (act) requestAnimationFrame(function () {
+      var sr = sb.getBoundingClientRect(), ar = act.getBoundingClientRect();
+      sb.scrollTop += (ar.top - sr.top) - (sb.clientHeight - act.offsetHeight) / 2;
+    });
+
     filter.addEventListener("input", function () {
       var q = filter.value.trim().toLowerCase();
       var kids = Array.prototype.slice.call(sb.children);

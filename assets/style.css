@@ -184,7 +184,7 @@ a:hover { text-decoration: underline; }
 }
 .nav-group a .num {
   font-family: var(--font-mono); font-size: 0.72rem; color: var(--fg-faint);
-  min-width: 1.25rem; font-weight: 600;
+  flex: none; min-width: 1.25rem; font-weight: 600;
 }
 .nav-group a:hover { background: var(--bg-sunken); color: var(--fg); text-decoration: none; }
 .nav-group a.active {
@@ -366,8 +366,8 @@ table code { font-size: 0.82em; }
 .callout.key .callout-title { color: var(--c-key); }
 
 /* key/value definition grid */
-dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 1rem 0; }
-dl.kv dt { font-family: var(--font-mono); font-size: 0.83rem; color: var(--accent-fg); font-weight: 600; }
+dl.kv { display: grid; grid-template-columns: minmax(7rem, 22rem) 1fr; gap: 0.4rem 1.2rem; margin: 1rem 0; align-items: baseline; }
+dl.kv dt { font-family: var(--font-mono); font-size: 0.83rem; color: var(--accent-fg); font-weight: 600; overflow-wrap: break-word; min-width: 0; }
 dl.kv dd { margin: 0; color: var(--fg-soft); }
 
 /* pill / badge */

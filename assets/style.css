@@ -780,11 +780,20 @@ figure.diagram .mermaid .node circle, figure.diagram .mermaid .node path { filte
   src: url("fonts/cmuntt.woff") format("woff"); font-display: swap; }
 @font-face { font-family: "CMU Typewriter"; font-style: normal; font-weight: 700;
   src: url("fonts/cmuntb.woff") format("woff"); font-display: swap; }
+/* Source Serif 4: a screen-readable book serif for the running prose. */
+@font-face { font-family: "Source Serif 4"; font-style: normal; font-weight: 400;
+  src: url("fonts/source-serif-4-400-normal.woff2") format("woff2"); font-display: swap; }
+@font-face { font-family: "Source Serif 4"; font-style: italic; font-weight: 400;
+  src: url("fonts/source-serif-4-400-italic.woff2") format("woff2"); font-display: swap; }
+@font-face { font-family: "Source Serif 4"; font-style: normal; font-weight: 600;
+  src: url("fonts/source-serif-4-600-normal.woff2") format("woff2"); font-display: swap; }
+@font-face { font-family: "Source Serif 4"; font-style: normal; font-weight: 700;
+  src: url("fonts/source-serif-4-700-normal.woff2") format("woff2"); font-display: swap; }
 
 /* (b)+(c) ---- Re-point font tokens & monochrome the chrome/prose tokens -----*/
 :root {
-  /* type: serif body+headings, CM typewriter for code/mono */
-  --font-sans: "CMU Serif", "Latin Modern Roman", Georgia, "Times New Roman", serif;
+  /* prose: screen-readable serif; headings: Computer Modern; diagrams: base sans */
+  --font-serif: "Source Serif 4", "CMU Serif", Georgia, "Times New Roman", serif;
   --font-mono: "CMU Typewriter", "Latin Modern Mono", "SF Mono", "Consolas", ui-monospace, monospace;
 
   /* paper-white surfaces (light) */
@@ -901,10 +910,10 @@ body {
 /* (e) ---- Typographic fidelity: scale, leading, measure --------------------*/
 /* CM runs small & light at a given px; nudge the base up and open the leading
    so prose reads like the personal site (its body is ~1.28rem / 1.62). */
-body { font-size: 17.5px; line-height: 1.66; }
+body { font-family: var(--font-serif); font-size: 17px; line-height: 1.6; }
 
-/* Restrained, classical heading scale. Body face throughout; no -apple-system.
-   Bold via CMU-bx, italic subheads via CMU-ti — matching the personal theme. */
+/* Headings stay Computer Modern (display); running prose is the readable serif. */
+article h1, article h2, article h3, article h4 { font-family: "CMU Serif", Georgia, serif; }
 article h1 { font-weight: 700; letter-spacing: -0.01em; font-size: 2.15rem; line-height: 1.16; }
 article h2 { font-weight: 700; letter-spacing: 0;        font-size: 1.5rem;  }
 article h3 { font-weight: 400; font-style: italic;       font-size: 1.2rem;  color: var(--fg); }
@@ -988,5 +997,11 @@ figure.diagram { box-shadow: none; border-color: var(--border); }
 .callout.invariant::before, .callout.warning::before, .callout.key::before { color: var(--fg-muted); }
 .callout.note .callout-title, .callout.rationale .callout-title, .callout.gotcha .callout-title,
 .callout.invariant .callout-title, .callout.warning .callout-title, .callout.key .callout-title { color: var(--fg); }
+
+/* Diagrams are figures: keep their original sans at the designed sizes, so the
+   serif body cannot widen the fixed node boxes (which overflowed). The caption
+   stays in the reading serif. ------------------------------------------------ */
+figure.diagram { font-family: var(--font-sans); }
+figure.diagram figcaption { font-family: var(--font-serif); }
 
 /* end Computer Modern re-skin ============================================== */

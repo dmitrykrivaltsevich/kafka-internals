@@ -10,6 +10,7 @@
 <body data-page="op07-failure-modes">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -350,7 +351,7 @@
 <div class="callout invariant"><span class="callout-title">The invariant that makes most of this recoverable</span><p>With <strong><code>replication.factor=3</code>, <code>min.insync.replicas=2</code>, <code>acks=all</code>, <code>unclean.leader.election.enable=false</code></strong>, every <em>single</em> failure in this chapter, one broker, one disk, one slow follower, one AZ network split, costs <em>zero acknowledged data</em> and, for most, zero write availability. Data loss requires either ≥2 simultaneous independent failures, or a deliberate choice (enabling unclean election, lowering min-ISR under pressure, or carrying a silent <code>min.insync.replicas &gt; replication.factor</code> mismatch). The runbook's deepest rule: do not, under incident pressure, edit a config that converts an <em>availability</em> incident into a <em>durability</em> incident. Restore the failed component; let the invariant hold. The full derivation is in <a href="op06-durability.html">II · 06 Durability</a>; the signals to watch are in <a href="op08-metrics-signals.html">II · 08</a>; what changes at scale is in <a href="op11-scaling-scenarios.html">II · 11</a>.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

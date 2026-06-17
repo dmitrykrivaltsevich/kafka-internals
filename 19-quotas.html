@@ -10,6 +10,7 @@
 <body data-page="19-quotas">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -408,7 +409,7 @@
 <div class="callout note"><span class="callout-title">Note</span><p>Setting <code>client.quota.callback.class</code> flips the manager to <code>CUSTOM_QUOTAS</code>, disabling the single-level fast paths in <code>quotaMetricTags</code> / <code>updateQuotaMetricConfigs</code> and routing every lookup through your callback. A callback that returns <code>quotaResetRequired=true</code> forces a full metric-config sweep on every sensor creation (<code>getOrCreateQuotaSensors</code>, line 464), correct, but more expensive.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

@@ -25,6 +25,7 @@ function skeleton(slug, m, fragment) {
 <body data-page="${slug}">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -38,7 +39,7 @@ function skeleton(slug, m, fragment) {
 ${fragment}
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
@@ -76,7 +77,7 @@ function indexPage() {
       for (const slug of g.items) {
         const m = META[slug];
         if (!m) continue;
-        const num = m.num === ", " ? "REF" : m.num;
+        const num = m.num;
         body += `        <a class="card" href="${slug}.html"><div class="card-num">${esc(num)}</div><div class="card-title">${esc(m.title)}</div><div class="card-desc">${esc(m.desc)}</div></a>\n`;
       }
       body += `      </div>\n`;

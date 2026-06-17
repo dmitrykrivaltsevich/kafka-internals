@@ -719,7 +719,7 @@ figure.diagram .mermaid .node circle, figure.diagram .mermaid .node path { filte
 .dstate .tr .tl { font-size: 0.68rem; white-space: nowrap; margin-bottom: 1px; }
 .dstate .tr .ta { width: 100%; min-width: 1.8rem; height: 0; border-top: 2px solid var(--fg-faint); position: relative; }
 .dstate .tr .ta::after { content: ""; position: absolute; right: -1px; top: -4px; border: 4px solid transparent; border-left-color: var(--fg-faint); }
-.dstate.v .tr { flex-direction: row; min-width: 0; }
+.dstate.v .tr { flex-direction: column; min-width: 0; }
 .dstate.v .tr .ta { width: 0; min-width: 0; height: 1.4rem; border-top: none; border-left: 2px solid var(--fg-faint); }
 .dstate.v .tr .ta::after { right: auto; left: -4px; top: auto; bottom: -1px; border: 4px solid transparent; border-top-color: var(--fg-faint); }
 

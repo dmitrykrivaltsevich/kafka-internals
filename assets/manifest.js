@@ -26,7 +26,7 @@
     "19-quotas":               { num: "19", title: "Quotas & Throttling",              desc: "ClientQuotaManager, token buckets, quota entities, throttle responses, client metrics (KIP-714)." },
     "20-kafka-streams":        { num: "20", title: "Kafka Streams",                    desc: "Topologies, tasks, StreamThread, state stores & changelogs, the partition assignor, EOS." },
     "21-kafka-connect":        { num: "21", title: "Kafka Connect",                    desc: "Workers, connectors & tasks, the distributed herder, backing stores, MirrorMaker 2." },
-    "glossary":                { num: ", ",  title: "Glossary & Concepts",              desc: "Cross-cutting terminology and a quick reference of Kafka's core abstractions." },
+    "glossary":                { num: "§",   title: "Glossary & Concepts",              desc: "Cross-cutting terminology and a quick reference of Kafka's core abstractions." },
 
     // ---- Part II, Operations Manual ----
     "op00-operator-model":     { num: "II·00", title: "The Operator's Mental Model",   desc: "What you run in KRaft, what fails independently, the control loops, and the SLIs/SLOs of a healthy cluster." },

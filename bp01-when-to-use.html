@@ -10,6 +10,7 @@
 <body data-page="bp01-when-to-use">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -309,7 +310,7 @@
 <div class="callout key"><span class="callout-title">Carry-away</span><p>The log is a specialist optimized for ordered, replayable, high-throughput, fanned-out streams that you decouple producers and consumers around. Its strengths and its absences are the <em>same</em> design decision. Reach for it when the seven forces light up; route off it the moment an early gate (store, RPC, classic-queue-with-priority/routing) trips, because those gates guard <em>inherent</em> limits no tuning will move. And when in doubt, apply the litmus question: structural, feature-mitigated, or config-tunable. Next, <a href="bp02-design-decisions.html">bp02</a> opens the design-decision space <em>inside</em> the "use the log" branch, partition count, keys, RF, ordering, and the rest, where the interesting tradeoffs begin.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

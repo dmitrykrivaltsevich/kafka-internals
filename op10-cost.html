@@ -10,6 +10,7 @@
 <body data-page="op10-cost">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -306,7 +307,7 @@
 <div class="callout note"><span class="callout-title">Where this connects in Part II</span><p>This chapter is the economics layer over the rest of the operations manual. <a href="op04-capacity-planning.html">Capacity Planning</a> sizes the fleet whose compute you are pricing here; <a href="op03-partitioning.html">Partitioning</a> governs the per-partition counts that drive replica placement and therefore cross-AZ flows; <a href="op05-performance-tuning.html">Performance Tuning</a> owns the batching/compression dials Lever 1 depends on; <a href="op06-durability.html">Durability Engineering</a> owns the RF/<code>min.insync.replicas</code>/<code>acks</code> choices behind Lever 3; <a href="op09-topologies.html">Topologies</a> decides the AZ/cluster layout that sets the cross-AZ baseline; and <a href="op08-metrics-signals.html">Metrics &amp; Signals</a> gives the byte-rate gauges that turn this model from estimate into measurement. Cost is not a separate concern, it is the shadow every architectural choice casts on the invoice.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

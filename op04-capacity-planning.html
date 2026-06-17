@@ -10,6 +10,7 @@
 <body data-page="op04-capacity-planning">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -236,7 +237,7 @@
 <div class="callout note"><span class="callout-title">Benchmarks are directional, mechanisms are not</span><p>The headline numbers, 2M writes/s (<a href="https://engineering.linkedin.com/kafka/benchmarking-apache-kafka-2-million-writes-second-three-cheap-machines">LinkedIn</a>, three producers + async), 605 MB/s peak (<a href="https://www.confluent.io/blog/kafka-fastest-messaging-system/">Confluent OMB</a>, 1 KB msgs, fsync off), are <em>specific tests on specific hardware</em>, not SLAs. A single durable producer at <code>acks=all</code> in that same LinkedIn run did ~422k rec/s (40 MB/s), sync replication roughly halved throughput (<em>empirical</em>). Use benchmarks to bound expectations; use the <em>equations</em> in this chapter, grounded in the replication and zero-copy mechanisms in source, to actually size. When the two disagree, trust the math and the mechanism, then verify on your hardware. Next: turn this capacity into the right partition count (<a href="op03-partitioning.html">op03</a>) and the tuning that realizes the per-broker ceiling (<a href="op05-performance-tuning.html">op05</a>).</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

@@ -10,6 +10,7 @@
 <body data-page="op06-durability">
 <header class="topbar">
   <button id="menu-toggle" class="icon menu-toggle" aria-label="Open navigation">☰</button>
+  <a class="home-up" href="/" aria-label="Back to krivaltsevich.com">krivaltsevich.com</a>
   <a class="brand" href="index.html"><span class="logo">K</span><span>Kafka Internals</span><small>4.4</small></a>
   <span class="spacer"></span>
   <button id="theme-toggle" class="icon" aria-label="Toggle theme">☽</button>
@@ -279,7 +280,7 @@ if (inSyncSize &lt; minIsr &amp;&amp; requiredAcks == -1) {
 <div class="callout key"><span class="callout-title">Operator's durability checklist</span><p><strong>Set and verify, per topic:</strong> <code>replication.factor ≥ 3</code> for anything you cannot lose; <code>min.insync.replicas = 2</code> (and always <code>≤ RF</code>, the <code>effectiveMinIsr</code> cap will silently weaken it otherwise); producers on <code>acks=all</code> (the default) <em>with</em> <code>enable.idempotence=true</code> for ordering. Leave <code>unclean.leader.election.enable=false</code> (the default) unless a specific topic explicitly prefers availability over its own data. <strong>Make independence real:</strong> set <code>broker.rack</code> on every broker, keep AZs balanced in broker count, and confirm the placer spread one replica per AZ. <strong>Watch:</strong> <code>UnderMinIsrPartitionCount</code> and <code>OfflinePartitionsCount</code> (alert &gt; 0), <code>UncleanLeaderElectionsPerSec</code> (alert &gt; 0 = data loss), <code>IsrShrinks/ExpandsPerSec</code> (steady-state 0). <strong>Know your CAP position</strong> and that it is a config, not a fixed property. The failure-mode runbooks for each of these symptoms are in <a href="op07-failure-modes.html">II · 07 Failure Modes</a>.</p></div>
       </article>
       <footer class="footer-meta">
-        <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
+        <p><a href="/">krivaltsevich.com</a> · Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
         <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>

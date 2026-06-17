@@ -215,6 +215,14 @@
 
   /* ---- Mobile menu ------------------------------------------------------- */
   function wireChrome() {
+    // Back to the homepage (the guide is published under krivaltsevich.com/kafka-internals/).
+    var tb = document.querySelector(".topbar"), brand = tb && tb.querySelector(".brand");
+    if (tb && brand && !tb.querySelector(".home-up")) {
+      var home = document.createElement("a");
+      home.className = "home-up"; home.href = "/"; home.textContent = "krivaltsevich.com";
+      home.setAttribute("aria-label", "Back to krivaltsevich.com");
+      tb.insertBefore(home, brand);
+    }
     var toggle = document.getElementById("theme-toggle");
     if (toggle) toggle.addEventListener("click", function () {
       var t = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";

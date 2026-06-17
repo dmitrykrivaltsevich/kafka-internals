@@ -986,6 +986,10 @@ figure.diagram { box-shadow: none; border-color: var(--border); }
 
 /* Topbar: plain hairline, no saturate (monochrome) ------------------------- */
 .topbar { backdrop-filter: blur(8px); }
+/* "back to homepage" link injected into the guide topbar by app.js */
+.topbar .home-up { font-size: 0.82rem; color: var(--fg-muted); text-decoration: none;
+  white-space: nowrap; padding-right: 0.7rem; border-right: 1px solid var(--border); }
+.topbar .home-up:hover { color: var(--fg); text-decoration: none; }
 
 /* Callouts → monochrome. Colour belongs to diagrams, not chrome; the icon and
    label (ℹ ✦ ⚠ ✓ ✕ ★ + title) carry the type, so no colour is needed. ------- */

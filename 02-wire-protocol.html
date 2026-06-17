@@ -23,7 +23,7 @@
 <h1>02 · The Wire Protocol &amp; RPC Framework</h1>
 <blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
 
-<p class="lead">Every byte that crosses a Kafka connection — producer to broker, broker to broker, broker to controller, controller-quorum peer to peer — is a request/response pair framed and encoded by one small, uniform machine: a 4-byte length-prefixed frame, a versioned header, and a body whose schema is described in JSON and compiled to Java by a bespoke code generator. This chapter dissects that machine: the <code>ApiKeys</code> registry, the <code>Readable</code>/<code>Writable</code> abstraction, the message generator, the <em>flexible</em> (compact + tagged-field) encoding from KIP-482, version negotiation via <code>ApiVersions</code> (KIP-35), and the <code>Errors</code> code space — ending with a worked byte-by-byte layout of a real request.</p>
+<p class="lead">Every byte that crosses a Kafka connection, producer to broker, broker to broker, broker to controller, controller-quorum peer to peer, is a request/response pair framed and encoded by one small, uniform machine: a 4-byte length-prefixed frame, a versioned header, and a body whose schema is described in JSON and compiled to Java by a bespoke code generator. This chapter dissects that machine: the <code>ApiKeys</code> registry, the <code>Readable</code>/<code>Writable</code> abstraction, the message generator, the <em>flexible</em> (compact + tagged-field) encoding from <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-482:+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields">KIP-482</a>, version negotiation via <code>ApiVersions</code> (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-35+-+Retrieving+protocol+version">KIP-35</a>), and the <code>Errors</code> code space, ending with a worked byte-by-byte layout of a real request.</p>
 
 <h2>Role &amp; Responsibilities</h2>
 
@@ -33,7 +33,7 @@
   <li><strong>Framing.</strong> Delimit one logical message on a byte stream using a 4-byte big-endian size prefix, so a reader knows exactly how many bytes constitute the next request or response.</li>
   <li><strong>Addressing &amp; versioning.</strong> A <em>request header</em> carries the API key (which RPC), the API version (which schema variant), a client-chosen correlation id (to match responses to requests), and a client id. The <em>response header</em> echoes the correlation id.</li>
   <li><strong>(De)serialization.</strong> Turn a typed, generated message object into bytes and back, in a version-specific way, with zero-copy handling for record sets.</li>
-  <li><strong>Evolution.</strong> Allow every RPC to gain fields over time without breaking old peers — both by bumping versions and, in <em>flexible</em> versions, by adding optional <em>tagged fields</em> that unknown readers skip cleanly.</li>
+  <li><strong>Evolution.</strong> Allow every RPC to gain fields over time without breaking old peers, both by bumping versions and, in <em>flexible</em> versions, by adding optional <em>tagged fields</em> that unknown readers skip cleanly.</li>
 </ul>
 
 <p>This layer is deliberately <em>policy-free</em>: it knows how to read and write a <code>ProduceRequest</code>, but nothing about logs, ISRs, or quotas. Those live one layer up in <a href="07-request-processing.html">Request Processing (KafkaApis)</a>, fed by the <a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a> that owns the sockets.</p>
@@ -81,31 +81,31 @@
 <p><code>ApiKeys</code> is an enum where each constant wraps a generated <code>ApiMessageType</code> (the per-RPC metadata object produced by <code>ApiMessageTypeGenerator</code>). As of this build the enum spans ids 0 through 93 and ends at <code>STREAMS_GROUP_TOPOLOGY_DESCRIPTION_UPDATE</code> (<code>protocol/ApiKeys.java:48-141</code>). Each constant records:</p>
 
 <ul>
-  <li><code>id</code> — the immutable <code>int16</code> from <code>messageType.apiKey()</code> (<code>ApiKeys.java:162,191</code>).</li>
-  <li><code>name</code> — used for metrics and debugging (<code>ApiKeys.java:165</code>).</li>
-  <li><code>clusterAction</code> — true if the RPC is broker/controller-internal only (e.g. <code>VOTE</code>, <code>BEGIN_QUORUM_EPOCH</code>, <code>WRITE_TXN_MARKERS</code>, <code>BROKER_REGISTRATION</code>). Used by authorization to require <code>CLUSTER_ACTION</code>; see <a href="18-security.html">Security</a>.</li>
-  <li><code>forwardable</code> — true if a broker may forward this admin RPC to the controller through an <code>ENVELOPE</code> (<code>ApiKeys.java:171</code>); see <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>.</li>
-  <li><code>requiresDelayedAllocation</code> — true if any version's schema contains a <code>bytes</code> or <code>records</code> type, meaning the request retains a reference into the receive buffer and the buffer cannot be recycled early (<code>ApiKeys.java:194,198-207,343-360</code>).</li>
+  <li><code>id</code>, the immutable <code>int16</code> from <code>messageType.apiKey()</code> (<code>ApiKeys.java:162,191</code>).</li>
+  <li><code>name</code>, used for metrics and debugging (<code>ApiKeys.java:165</code>).</li>
+  <li><code>clusterAction</code>, true if the RPC is broker/controller-internal only (e.g. <code>VOTE</code>, <code>BEGIN_QUORUM_EPOCH</code>, <code>WRITE_TXN_MARKERS</code>, <code>BROKER_REGISTRATION</code>). Used by authorization to require <code>CLUSTER_ACTION</code>; see <a href="18-security.html">Security</a>.</li>
+  <li><code>forwardable</code>, true if a broker may forward this admin RPC to the controller through an <code>ENVELOPE</code> (<code>ApiKeys.java:171</code>); see <a href="12-metadata-propagation.html">Metadata Propagation &amp; Broker Lifecycle</a>.</li>
+  <li><code>requiresDelayedAllocation</code>, true if any version's schema contains a <code>bytes</code> or <code>records</code> type, meaning the request retains a reference into the receive buffer and the buffer cannot be recycled early (<code>ApiKeys.java:194,198-207,343-360</code>).</li>
 </ul>
 
 <p>Version range is delegated to the message type: <code>oldestVersion()</code> = <code>messageType.lowestSupportedVersion()</code> and <code>latestVersion()</code> = <code>messageType.highestSupportedVersion(...)</code> (<code>ApiKeys.java:221-231</code>). An RPC may be <em>removed</em> while keeping its id reserved: <code>hasValidVersion()</code> returns false when <code>oldestVersion &gt; latestVersion</code>, so the slot is never reused for a different API (<code>ApiKeys.java:263-265</code>).</p>
 
-<p>Each listener type (BROKER, CONTROLLER) exposes a different subset. The <code>APIS_BY_LISTENER</code> map is built once at class-load by filtering on <code>messageType.listeners()</code> (<code>ApiKeys.java:143-150, 374-383</code>), driven by the <code>"listeners"</code> array in each request schema — e.g. <code>FetchRequest.json</code> declares <code>"listeners": ["broker","controller"]</code> while <code>ProduceRequest.json</code> is broker-only.</p>
+<p>Each listener type (BROKER, CONTROLLER) exposes a different subset. The <code>APIS_BY_LISTENER</code> map is built once at class-load by filtering on <code>messageType.listeners()</code> (<code>ApiKeys.java:143-150, 374-383</code>), driven by the <code>"listeners"</code> array in each request schema, e.g. <code>FetchRequest.json</code> declares <code>"listeners": ["broker","controller"]</code> while <code>ProduceRequest.json</code> is broker-only.</p>
 
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Versions 0–2 of <code>PRODUCE</code> (and 0–3 of <code>FETCH</code>) were removed in Kafka 4.0; v3/v4 are the new baselines. But a librdkafka bug (KAFKA-18659) requires the broker to <em>advertise</em> produce min-version 0 in its <code>ApiVersionsResponse</code> even though it rejects those versions. The constant <code>PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION = 0</code> and the special-case in <code>toApiVersion(...)</code> (<code>ApiKeys.java:159,286-302</code>) implement exactly this lie-to-the-client, scoped to the BROKER listener.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Versions 0–2 of <code>PRODUCE</code> (and 0–3 of <code>FETCH</code>) were removed in Kafka 4.0; v3/v4 are the new baselines. But a librdkafka bug (<a href="https://issues.apache.org/jira/browse/KAFKA-18659">KAFKA-18659</a>) requires the broker to <em>advertise</em> produce min-version 0 in its <code>ApiVersionsResponse</code> even though it rejects those versions. The constant <code>PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION = 0</code> and the special-case in <code>toApiVersion(...)</code> (<code>ApiKeys.java:159,286-302</code>) implement exactly this lie-to-the-client, scoped to the BROKER listener.</p></div>
 
 <h2>The Frame and the Headers</h2>
 
 <h3>The 4-byte frame</h3>
 
-<p>On the wire a message is <code>size(int32) ‖ header ‖ body</code>. The size counts header+body only, never itself. On send, <code>SendBuilder.buildSend</code> accumulates the combined size of header and body in a single sizing phase — two <code>addSize</code> calls (header then body) into a shared <code>MessageSizeAccumulator</code> — then writes the size as the first 4 bytes (<code>protocol/SendBuilder.java:208-226</code>): <code>builder.writeInt(messageSize.totalSize())</code>. On receive, <code>NetworkReceive</code> first reads 4 bytes into a fixed <code>size</code> buffer, rejects negative or over-limit values, then allocates a payload buffer of exactly that many bytes (<code>network/NetworkReceive.java:84-101</code>). The <code>maxSize</code> guard is the broker's <code>socket.request.max.bytes</code>.</p>
+<p>On the wire a message is <code>size(int32) ‖ header ‖ body</code>. The size counts header+body only, never itself. On send, <code>SendBuilder.buildSend</code> accumulates the combined size of header and body in a single sizing phase, two <code>addSize</code> calls (header then body) into a shared <code>MessageSizeAccumulator</code>, then writes the size as the first 4 bytes (<code>protocol/SendBuilder.java:208-226</code>): <code>builder.writeInt(messageSize.totalSize())</code>. On receive, <code>NetworkReceive</code> first reads 4 bytes into a fixed <code>size</code> buffer, rejects negative or over-limit values, then allocates a payload buffer of exactly that many bytes (<code>network/NetworkReceive.java:84-101</code>). The <code>maxSize</code> guard is the broker's <code>socket.request.max.bytes</code>.</p>
 
 <figure class="diagram"><div class="bytemap">
   <div class="bf" style="--w:4"><span class="bf-name">size</span><span class="bf-meta">int32 BE · @0 · = N</span></div>
   <div class="bf" style="--w:7"><span class="bf-name">RequestHeader</span><span class="bf-meta">variable · @4</span></div>
   <div class="bf" style="--w:12"><span class="bf-name">Request body (ApiMessage)</span><span class="bf-meta">variable</span></div>
 </div>
-<figcaption>Length-prefixed framing. The 4-byte size counts the N bytes of header+body only — it never includes itself.</figcaption>
+<figcaption>Length-prefixed framing. The 4-byte size counts the N bytes of header+body only, it never includes itself.</figcaption>
 <div class="legend">
   <span class="lgi"><span class="sw"></span>wire field</span>
   <span class="lgi"><span class="mono">--w</span> = relative byte width</span>
@@ -124,8 +124,8 @@
 <tr><td>RequestApiKey</td><td>int16</td><td>0+</td><td>which RPC</td></tr>
 <tr><td>RequestApiVersion</td><td>int16</td><td>0+</td><td>which schema variant</td></tr>
 <tr><td>CorrelationId</td><td>int32</td><td>0+</td><td>echoed in response</td></tr>
-<tr><td>ClientId</td><td>string (nullable)</td><td>1+</td><td><code>"flexibleVersions": "none"</code> — always old-style 2-byte length, even in header v2</td></tr>
-<tr><td><em>tagged fields</em></td><td>—</td><td>2+ only</td><td>empty section (a single <code>0x00</code>) in practice</td></tr>
+<tr><td>ClientId</td><td>string (nullable)</td><td>1+</td><td><code>"flexibleVersions": "none"</code>, always old-style 2-byte length, even in header v2</td></tr>
+<tr><td><em>tagged fields</em></td><td>, </td><td>2+ only</td><td>empty section (a single <code>0x00</code>) in practice</td></tr>
 </tbody>
 </table>
 </div>
@@ -136,7 +136,7 @@
 
 <p>The header version is never on the wire; it is computed from the API key and API version. The generator emits a <code>requestHeaderVersion(short)</code> / <code>responseHeaderVersion(short)</code> switch per API (<code>generator/.../ApiMessageTypeGenerator.java:346-389</code>): for a given API version, the request header is <strong>v2</strong> if that version is flexible else <strong>v1</strong>; the response header is <strong>v1</strong> if flexible else <strong>v0</strong>. <code>RequestHeader.parse</code> exploits this: it peeks the first two int16s (api key, api version), looks up the header version via <code>apiKey.requestHeaderVersion(apiVersion)</code>, rewinds, then parses the header with the correct version (<code>requests/RequestHeader.java:123-152</code>).</p>
 
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The one exception: the <em>response</em> header of <code>ApiVersions</code> (api key 18) is <strong>always v0</strong> (no tagged-field section), hard-coded in the generator (<code>ApiMessageTypeGenerator.java:362-368</code>, "See KIP-511"). The response <em>body</em> is flexible from v3, but the header length must stay constant so that a client which guessed the wrong version can still locate the body. <code>ApiVersionsResponse.json</code> states the same constraint at lines 24-26.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The one exception: the <em>response</em> header of <code>ApiVersions</code> (api key 18) is <strong>always v0</strong> (no tagged-field section), hard-coded in the generator (<code>ApiMessageTypeGenerator.java:362-368</code>, "See <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-511:+Collect+and+Expose+Client's+Name+and+Version+in+the+Brokers">KIP-511</a>"). The response <em>body</em> is flexible from v3, but the header length must stay constant so that a client which guessed the wrong version can still locate the body. <code>ApiVersionsResponse.json</code> states the same constraint at lines 24-26.</p></div>
 
 <h3>Response header</h3>
 
@@ -146,7 +146,7 @@
 
 <p>All (de)serialization funnels through two interfaces. <code>Writable</code> declares <code>writeByte/Short/Int/Long/Double</code>, <code>writeByteArray</code>, <code>writeByteBuffer</code>, <code>writeUnsignedVarint</code>, <code>writeVarint</code>, <code>writeVarlong</code>, plus default helpers <code>writeUuid</code> (two big-endian longs, MSB first) and <code>writeRecords</code> (<code>protocol/Writable.java:27-65</code>). <code>Readable</code> is the mirror image, with default helpers <code>readString(len)</code> (UTF-8), <code>readUuid</code>, <code>readRecords(len)</code> (returns null for length &lt; 0), and <code>readUnknownTaggedField</code> which appends a <code>RawTaggedField</code> (<code>protocol/Readable.java:29-89</code>).</p>
 
-<p><code>ByteBufferAccessor</code> is the production implementation of both, wrapping a single <code>java.nio.ByteBuffer</code> (<code>protocol/ByteBufferAccessor.java:24-160</code>). Fixed-width primitives go straight to the buffer's big-endian accessors (<code>getInt</code>, <code>putLong</code>, …). Variable-length integers delegate to <code>ByteUtils</code>. Notably <code>readByteBuffer(len)</code> returns a <em>slice</em> over the underlying buffer and advances the position — no copy — which is how records and bytes fields are read zero-copy.</p>
+<p><code>ByteBufferAccessor</code> is the production implementation of both, wrapping a single <code>java.nio.ByteBuffer</code> (<code>protocol/ByteBufferAccessor.java:24-160</code>). Fixed-width primitives go straight to the buffer's big-endian accessors (<code>getInt</code>, <code>putLong</code>, …). Variable-length integers delegate to <code>ByteUtils</code>. Notably <code>readByteBuffer(len)</code> returns a <em>slice</em> over the underlying buffer and advances the position, no copy, which is how records and bytes fields are read zero-copy.</p>
 
 <h3>Varints and zig-zag</h3>
 
@@ -154,7 +154,7 @@
 
 <h3>Two-pass serialization</h3>
 
-<p>Writing is a strict two passes over the object graph, sharing an <code>ObjectSerializationCache</code> (an <code>IdentityHashMap</code>). Pass 1 (<code>addSize</code>) accumulates the total byte count into a <code>MessageSizeAccumulator</code> and stashes derived values — UTF-8 bytes of strings, computed array sizes — in the cache so they are not recomputed (<code>protocol/ObjectSerializationCache.java:32-55</code>, <code>protocol/Message.java:49-62</code>). Pass 2 (<code>write</code>) emits bytes, reusing the cached values (e.g. the generator writes a string via <code>_cache.getSerializedValue(name)</code>, <code>MessageDataGenerator.java:962-964</code>). <code>RequestUtils.serialize</code> shows the canonical flow: size header, size body, allocate exactly <code>headerSize + messageSize</code> bytes, write header then body, flip (<code>requests/RequestUtils.java:69-86</code>).</p>
+<p>Writing is a strict two passes over the object graph, sharing an <code>ObjectSerializationCache</code> (an <code>IdentityHashMap</code>). Pass 1 (<code>addSize</code>) accumulates the total byte count into a <code>MessageSizeAccumulator</code> and stashes derived values, UTF-8 bytes of strings, computed array sizes, in the cache so they are not recomputed (<code>protocol/ObjectSerializationCache.java:32-55</code>, <code>protocol/Message.java:49-62</code>). Pass 2 (<code>write</code>) emits bytes, reusing the cached values (e.g. the generator writes a string via <code>_cache.getSerializedValue(name)</code>, <code>MessageDataGenerator.java:962-964</code>). <code>RequestUtils.serialize</code> shows the canonical flow: size header, size body, allocate exactly <code>headerSize + messageSize</code> bytes, write header then body, flip (<code>requests/RequestUtils.java:69-86</code>).</p>
 
 <figure class="diagram"><div class="dflow">
   <div class="node cat-broker"><span class="nt">toSend(header)</span><span class="nd">AbstractRequest</span></div>
@@ -183,7 +183,7 @@
 <figure class="diagram"><div class="dflow">
   <div class="node cat-broker"><span class="nt">parseRequest(apiKey, ver, readable)</span><span class="nd">AbstractRequest</span></div>
   <div class="conn"></div>
-  <div class="node cat-broker decision">doParseRequest — big switch</div>
+  <div class="node cat-broker decision">doParseRequest, big switch</div>
   <div class="conn"></div>
   <div class="row">
     <div class="col"><div class="conn" data-label="case PRODUCE"></div><div class="node cat-broker"><span class="nt">ProduceRequest.parse</span></div></div>
@@ -207,7 +207,7 @@
 
 <h2>The Message Generator</h2>
 
-<p>Each RPC has a JSON schema under <code>clients/src/main/resources/common/message/</code>. At build time the <code>generator</code> module reads these and emits a Java class per message (e.g. <code>ProduceRequestData</code>) implementing <code>ApiMessage</code>, plus the <code>ApiMessageType</code> registry. The generated class is a plain mutable data holder with fluent setters and version-aware <code>read</code>/<code>write</code>/<code>addSize</code> methods — there is no hand-written serializer for any RPC.</p>
+<p>Each RPC has a JSON schema under <code>clients/src/main/resources/common/message/</code>. At build time the <code>generator</code> module reads these and emits a Java class per message (e.g. <code>ProduceRequestData</code>) implementing <code>ApiMessage</code>, plus the <code>ApiMessageType</code> registry. The generated class is a plain mutable data holder with fluent setters and version-aware <code>read</code>/<code>write</code>/<code>addSize</code> methods, there is no hand-written serializer for any RPC.</p>
 
 <h3>Schema anatomy</h3>
 
@@ -229,7 +229,7 @@
 </table>
 </div>
 
-<p>For <code>ProduceRequest</code> the field tree is <code>TransactionalId, Acks(int16), TimeoutMs(int32), TopicData[]{ Name|TopicId, PartitionData[]{ Index, Records } }</code>, valid versions 3–13, flexible at 9+ (<code>ProduceRequest.json:50-72</code>). Note how v13 swaps the topic <code>Name(string, 0-12)</code> for <code>TopicId(uuid, 13+)</code> (KIP-516) — a pure schema change, no serializer edits.</p>
+<p>For <code>ProduceRequest</code> the field tree is <code>TransactionalId, Acks(int16), TimeoutMs(int32), TopicData[]{ Name|TopicId, PartitionData[]{ Index, Records } }</code>, valid versions 3–13, flexible at 9+ (<code>ProduceRequest.json:50-72</code>). Note how v13 swaps the topic <code>Name(string, 0-12)</code> for <code>TopicId(uuid, 13+)</code> (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-516:+Topic+Identifiers">KIP-516</a>), a pure schema change, no serializer edits.</p>
 
 <h3>What the generator emits</h3>
 
@@ -264,7 +264,7 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 
 <h3>The tagged-field section</h3>
 
-<p>In a flexible version, every struct ends with: an unsigned varint <code>numTaggedFields</code>, then that many entries, each <code>tag(uvarint) ‖ size(uvarint) ‖ value(size bytes)</code>. The write side counts how many tagged fields are actually present (those differing from default) plus any preserved unknowns, writes the count, then writes each in ascending tag order (<code>MessageDataGenerator.java:794-879</code>). Crucially, tagged values are <em>always</em> serialized using the flexible/compact form regardless of the field's own declared encoding — the read code comments confirm "All tagged fields are serialized using the new-style flexible versions serialization" (<code>MessageDataGenerator.java:506-508</code>).</p>
+<p>In a flexible version, every struct ends with: an unsigned varint <code>numTaggedFields</code>, then that many entries, each <code>tag(uvarint) ‖ size(uvarint) ‖ value(size bytes)</code>. The write side counts how many tagged fields are actually present (those differing from default) plus any preserved unknowns, writes the count, then writes each in ascending tag order (<code>MessageDataGenerator.java:794-879</code>). Crucially, tagged values are <em>always</em> serialized using the flexible/compact form regardless of the field's own declared encoding, the read code comments confirm "All tagged fields are serialized using the new-style flexible versions serialization" (<code>MessageDataGenerator.java:506-508</code>).</p>
 
 <p>The read side is the forward-compatibility linchpin (<code>MessageDataGenerator.java:489-541</code>): read <code>numTaggedFields</code>, loop reading <code>tag</code> and <code>size</code>, <code>switch</code> on known tags; the <code>default</code> case calls <code>readUnknownTaggedField</code> to stash the raw <code>(tag, bytes)</code> for re-emission (<code>MessageDataGenerator.java:533-536</code>). A known tag at an out-of-range version throws (the tag is reserved). Because unknown tags carry their own length, a reader can skip them precisely even though it has no schema for them.</p>
 
@@ -276,13 +276,13 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 
 <h3>The bootstrap quirk</h3>
 
-<p>The chicken-and-egg problem — you must agree on a version to discover supported versions — is solved by making <code>ApiVersions</code> uniquely tolerant. <code>ApiKeys.isVersionEnabled</code> short-circuits to <code>true</code> for <code>API_VERSIONS</code> regardless of the requested version (<code>ApiKeys.java:245-252</code>). If a client sends a version the broker does not support, the broker treats the request as v0 and replies using the v0 response schema with <code>UNSUPPORTED_VERSION</code>; the response still enumerates the broker's supported version of <code>ApiVersions</code> so the client can retry correctly. <code>ApiVersionsRequest.getErrorResponse</code> implements exactly that: on <code>UNSUPPORTED_VERSION</code> it populates the <code>ApiKeys</code> collection with just <code>ApiKeys.API_VERSIONS</code>'s range (<code>requests/ApiVersionsRequest.java:88-98,126-143</code>, "KIP-511"). This is also why the v0 response header must stay headerless of tagged fields (above).</p>
+<p>The chicken-and-egg problem, you must agree on a version to discover supported versions, is solved by making <code>ApiVersions</code> uniquely tolerant. <code>ApiKeys.isVersionEnabled</code> short-circuits to <code>true</code> for <code>API_VERSIONS</code> regardless of the requested version (<code>ApiKeys.java:245-252</code>). If a client sends a version the broker does not support, the broker treats the request as v0 and replies using the v0 response schema with <code>UNSUPPORTED_VERSION</code>; the response still enumerates the broker's supported version of <code>ApiVersions</code> so the client can retry correctly. <code>ApiVersionsRequest.getErrorResponse</code> implements exactly that: on <code>UNSUPPORTED_VERSION</code> it populates the <code>ApiKeys</code> collection with just <code>ApiKeys.API_VERSIONS</code>'s range (<code>requests/ApiVersionsRequest.java:88-98,126-143</code>, "KIP-511"). This is also why the v0 response header must stay headerless of tagged fields (above).</p>
 
 <h3>Intersection for forwarding</h3>
 
 <p>When a broker forwards admin RPCs to the controller (the <code>ENVELOPE</code> path), it must only advertise versions <em>both</em> it and the controller support. <code>ApiVersionsResponse.intersectForwardableApis</code> intersects the broker's range with the controller's per forwardable API (<code>requests/ApiVersionsResponse.java:232-262</code>); the core operation is <code>intersect</code> = <code>[max(minA,minB), min(maxA,maxB)]</code>, returning empty when the ranges do not overlap (<code>ApiVersionsResponse.java:311-325</code>). The non-forwardable APIs are simply filtered to those in scope for the listener via <code>filterApis</code> (<code>ApiVersionsResponse.java:195-219</code>). See <a href="11-kraft-controller.html">The KRaft Controller</a> for the forwarding mechanics.</p>
 
-<h3>Newer response fields (v5, KIP-1242)</h3>
+<h3>Newer response fields (v5, <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-1242:+Detection+and+handling+of+misrouted+connections">KIP-1242</a>)</h3>
 
 <p><code>ApiVersionsResponse</code> v5 adds <code>ClusterId</code>/<code>NodeId</code> checking and a <code>REBOOTSTRAP_REQUIRED</code> error so a client with stale bootstrap metadata is told to re-bootstrap (<code>ApiVersionsResponse.json:33-34</code>; <code>ApiVersionsRequest.isValid</code> enforces that cluster id and node id are both set or both absent, <code>ApiVersionsRequest.java:104-111</code>).</p>
 
@@ -291,12 +291,12 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 <p><code>Errors</code> is an enum mapping a stable <code>int16</code> code to an <code>ApiException</code> factory. As of this build it defines 137 entries from <code>UNKNOWN_SERVER_ERROR(-1)</code> and <code>NONE(0)</code> up to <code>STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED(135)</code> (<code>protocol/Errors.java:181-425</code>). Each constant carries <code>code</code>, a default message, and a constructor reference for the exception (<code>Errors.java:443-451</code>). Two static maps are built at load: <code>CODE_TO_ERROR</code> and <code>CLASS_TO_ERROR</code>.</p>
 
 <ul>
-  <li><code>forCode(short)</code> — wire code → enum; an <em>unknown</em> code logs a warning and falls back to <code>UNKNOWN_SERVER_ERROR</code> (<code>Errors.java:511-519</code>). This is how an old client tolerates an error code added in a newer broker.</li>
-  <li><code>forException(Throwable)</code> — walks the exception's superclass chain, returning the first matching mapped error, so subclasses inherit their parent's code (<code>Errors.java:525-532</code>).</li>
-  <li><code>code()</code>, <code>exception()</code>, <code>exception(message)</code>, <code>maybeThrow()</code> — translate between the two worlds (<code>Errors.java:456-496</code>).</li>
+  <li><code>forCode(short)</code>, wire code → enum; an <em>unknown</em> code logs a warning and falls back to <code>UNKNOWN_SERVER_ERROR</code> (<code>Errors.java:511-519</code>). This is how an old client tolerates an error code added in a newer broker.</li>
+  <li><code>forException(Throwable)</code>, walks the exception's superclass chain, returning the first matching mapped error, so subclasses inherit their parent's code (<code>Errors.java:525-532</code>).</li>
+  <li><code>code()</code>, <code>exception()</code>, <code>exception(message)</code>, <code>maybeThrow()</code>, translate between the two worlds (<code>Errors.java:456-496</code>).</li>
 </ul>
 
-<div class="callout invariant"><span class="callout-title">Invariant</span><p>Error <em>codes</em> are immutable forever; only names and messages may change (class doc, <code>Errors.java:167-179</code>). A code is the cross-version contract — a broker and a client built years apart must agree on what code 6 (<code>NOT_LEADER_OR_FOLLOWER</code>) means.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>Error <em>codes</em> are immutable forever; only names and messages may change (class doc, <code>Errors.java:167-179</code>). A code is the cross-version contract, a broker and a client built years apart must agree on what code 6 (<code>NOT_LEADER_OR_FOLLOWER</code>) means.</p></div>
 
 <p>Error codes appear in responses either as a top-level <code>ErrorCode(int16)</code> or per-entity (per topic, per partition). <code>AbstractResponse.errorCounts()</code> aggregates them across the whole response for metrics (<code>requests/AbstractResponse.java:64-91</code>). <code>RequestUtils.isFatalException</code> classifies auth/version errors as fatal (non-retriable) for client-side handling (<code>requests/RequestUtils.java:88-96</code>).</p>
 
@@ -307,21 +307,21 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 <ul>
   <li><code>toSend(header)</code> → <code>SendBuilder.buildRequestSend</code> (zero-copy, size-prefixed) (<code>AbstractRequest.java:109-111</code>).</li>
   <li><code>serializeWithHeader(header)</code> → header+body, <em>no</em> size prefix, via <code>RequestUtils.serialize</code>; it asserts the header's api key and version match the request (<code>AbstractRequest.java:116-124</code>).</li>
-  <li><code>getErrorResponse(throttleMs, e)</code> — abstract; each RPC builds a schema-shaped error response (used when a request fails before normal handling).</li>
-  <li><code>parseRequest(apiKey, version, readable)</code> — the inbound factory. It records the buffer size, then dispatches through a giant <code>switch</code> in <code>doParseRequest</code> to the right <code>XxxRequest.parse</code> (<code>AbstractRequest.java:172-363</code>).</li>
+  <li><code>getErrorResponse(throttleMs, e)</code>, abstract; each RPC builds a schema-shaped error response (used when a request fails before normal handling).</li>
+  <li><code>parseRequest(apiKey, version, readable)</code>, the inbound factory. It records the buffer size, then dispatches through a giant <code>switch</code> in <code>doParseRequest</code> to the right <code>XxxRequest.parse</code> (<code>AbstractRequest.java:172-363</code>).</li>
 </ul>
 
-<p><code>AbstractResponse</code> mirrors this with <code>toSend(header, version)</code>, a parallel parse <code>switch</code> (<code>requests/AbstractResponse.java:113-299</code>), an abstract <code>throttleTimeMs()</code>/<code>maybeSetThrottleTimeMs(int)</code>, and <code>shouldClientThrottle(version)</code> (default false). The throttle plumbing is how quota enforcement surfaces on the wire — see <a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a>.</p>
+<p><code>AbstractResponse</code> mirrors this with <code>toSend(header, version)</code>, a parallel parse <code>switch</code> (<code>requests/AbstractResponse.java:113-299</code>), an abstract <code>throttleTimeMs()</code>/<code>maybeSetThrottleTimeMs(int)</code>, and <code>shouldClientThrottle(version)</code> (default false). The throttle plumbing is how quota enforcement surfaces on the wire, see <a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a>.</p>
 
 <div class="callout note"><span class="callout-title">Note</span><p>The two big <code>switch</code> statements in <code>AbstractRequest</code>/<code>AbstractResponse</code> are the manual bridge between the dynamic <code>ApiKeys</code> id and the static, typed <code>XxxRequest</code>/<code>XxxResponse</code> classes. The <code>default</code> branch throws an <code>AssertionError</code> reminding maintainers to wire up any newly added API (<code>AbstractRequest.java:359-362</code>).</p></div>
 
 <h2>Throttling Fields on the Wire</h2>
 
-<p>Most responses carry a <code>ThrottleTimeMs(int32)</code> field telling the client how long the broker delayed (or wants the client to delay) due to a quota violation. In <code>ApiVersionsResponse</code> it is v1+ and <code>ignorable</code> (<code>ApiVersionsResponse.json:48-49</code>). The contract evolved across versions: in early versions the broker held the response then sent it (server-side throttle); from a later version the broker sends immediately and expects the client to self-throttle — encoded per RPC by overriding <code>shouldClientThrottle(version)</code>. The base returns false (<code>AbstractResponse.java:306-308</code>); a comment there explains client-side throttling is needed "when communicating with a newer version of broker which, on quota violation, sends out responses before throttling."</p>
+<p>Most responses carry a <code>ThrottleTimeMs(int32)</code> field telling the client how long the broker delayed (or wants the client to delay) due to a quota violation. In <code>ApiVersionsResponse</code> it is v1+ and <code>ignorable</code> (<code>ApiVersionsResponse.json:48-49</code>). The contract evolved across versions: in early versions the broker held the response then sent it (server-side throttle); from a later version the broker sends immediately and expects the client to self-throttle, encoded per RPC by overriding <code>shouldClientThrottle(version)</code>. The base returns false (<code>AbstractResponse.java:306-308</code>); a comment there explains client-side throttling is needed "when communicating with a newer version of broker which, on quota violation, sends out responses before throttling."</p>
 
 <h2>Worked Example: a Minimal <code>ApiVersionsRequest</code> on the Wire</h2>
 
-<p>Consider a Java client opening a connection and sending an <code>ApiVersionsRequest</code> at version 3 (flexible) with client id <code>"c1"</code>, correlation id <code>7</code>, software name <code>"apache-kafka-java"</code> and some version string. Because v3 is flexible, the request header is v2 (flexible) — but recall ClientId stays old-style two-byte-length. The bytes:</p>
+<p>Consider a Java client opening a connection and sending an <code>ApiVersionsRequest</code> at version 3 (flexible) with client id <code>"c1"</code>, correlation id <code>7</code>, software name <code>"apache-kafka-java"</code> and some version string. Because v3 is flexible, the request header is v2 (flexible), but recall ClientId stays old-style two-byte-length. The bytes:</p>
 
 <figure class="diagram"><div class="bytemap">
   <div class="bf" style="--w:4"><span class="bf-name">size = NN</span><span class="bf-meta">int32 BE · @0 · frame</span></div>
@@ -350,7 +350,7 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 
 <h2>Concurrency &amp; Threading</h2>
 
-<p>The protocol classes are intentionally simple regarding threads — the heavy lifting of which thread reads which socket lives in the <a href="06-network-and-threading.html">Network Layer</a>. The relevant facts here:</p>
+<p>The protocol classes are intentionally simple regarding threads, the heavy lifting of which thread reads which socket lives in the <a href="06-network-and-threading.html">Network Layer</a>. The relevant facts here:</p>
 
 <ul>
   <li><strong>Generated <code>*Data</code> objects are mutable and not thread-safe.</strong> They are owned by a single thread for the duration of a request/response. A request is parsed on a network/processor thread and handed off; a response is built on a request-handler thread.</li>
@@ -372,7 +372,7 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 <tr><td>Unsupported version (normal RPC)</td><td>Server returns <code>UNSUPPORTED_VERSION(35)</code>; on the request side <code>AbstractRequest</code> constructor throws <code>UnsupportedVersionException</code> if asked to build an out-of-range version.</td></tr>
 <tr><td>Unsupported version (ApiVersions)</td><td>Special-cased: broker answers as v0 with the supported range, never drops the connection (<code>ApiVersionsRequest.java:92-98</code>).</td></tr>
 <tr><td>Null client id</td><td>Treated as empty string at parse time (<code>RequestHeader.java:141-145</code>).</td></tr>
-<tr><td>Correlation id mismatch</td><td><code>CorrelationIdMismatchException</code> on the client (<code>AbstractResponse.java:103-108</code>) — usually indicates a protocol desync; the client closes the connection.</td></tr>
+<tr><td>Correlation id mismatch</td><td><code>CorrelationIdMismatchException</code> on the client (<code>AbstractResponse.java:103-108</code>), usually indicates a protocol desync; the client closes the connection.</td></tr>
 <tr><td>Unknown tagged field</td><td>Preserved as <code>RawTaggedField</code> and re-emitted; never an error (<code>MessageDataGenerator.java:533-536</code>).</td></tr>
 <tr><td>Unknown error code</td><td>Mapped to <code>UNKNOWN_SERVER_ERROR</code> with a warning (<code>Errors.java:516-518</code>); treated as non-retriable.</td></tr>
 <tr><td>Buffer underrun on read</td><td><code>ByteBufferAccessor.readArray</code> throws a <code>RuntimeException</code> reporting requested vs available bytes (<code>ByteBufferAccessor.java:58-61</code>).</td></tr>
@@ -382,7 +382,7 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 
 <h2>Invariants &amp; Guarantees</h2>
 
-<div class="callout invariant"><span class="callout-title">Invariant</span><p>An API key id and an error code, once assigned, are permanent. Schemas may add fields and versions but must never change the on-wire meaning of an existing <code>(apiKey, apiVersion)</code> pairing — that is what lets a v4-era client talk to a v4.4 broker and vice-versa.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>An API key id and an error code, once assigned, are permanent. Schemas may add fields and versions but must never change the on-wire meaning of an existing <code>(apiKey, apiVersion)</code> pairing, that is what lets a v4-era client talk to a v4.4 broker and vice-versa.</p></div>
 
 <ul>
   <li><strong>Round-trip fidelity:</strong> a flexible message decoded by software that does not know some tags, then re-encoded, preserves those tags byte-for-byte (via <code>_unknownTaggedFields</code>).</li>
@@ -394,13 +394,13 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 <h2>Interactions with Other Subsystems</h2>
 
 <ul>
-  <li><a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a> — owns sockets, reads frames into <code>NetworkReceive</code>, and gathers <code>Send</code>s produced by <code>SendBuilder</code>.</li>
-  <li><a href="07-request-processing.html">Request Processing (KafkaApis)</a> — consumes the parsed typed requests this layer produces and dispatches by <code>ApiKeys</code>.</li>
-  <li><a href="01-record-format.html">Record Format &amp; Batches</a> — the <code>records</code> field type embeds record batches; this layer carries them zero-copy but does not interpret them.</li>
-  <li><a href="10-kraft-consensus.html">KRaft Consensus</a> and <a href="11-kraft-controller.html">The KRaft Controller</a> — the Raft RPCs (<code>VOTE</code>, <code>BEGIN_QUORUM_EPOCH</code>, <code>FETCH</code>, <code>FETCH_SNAPSHOT</code>) and the <code>ENVELOPE</code>/forwarding mechanism all ride this exact framing.</li>
-  <li><a href="18-security.html">Security</a> — the <code>clusterAction</code> flag and SASL handshake/authenticate RPCs (which themselves use plain framing) are defined here.</li>
-  <li><a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a> — <code>ThrottleTimeMs</code> and <code>shouldClientThrottle</code> are the protocol surface of quota enforcement.</li>
-  <li><a href="16-producer-client.html">The Producer Client</a> and <a href="17-consumer-client.html">The Consumer Client</a> — both perform the <code>ApiVersions</code> handshake and pick per-RPC versions from the negotiated ranges.</li>
+  <li><a href="06-network-and-threading.html">Network Layer &amp; Threading Model</a>, owns sockets, reads frames into <code>NetworkReceive</code>, and gathers <code>Send</code>s produced by <code>SendBuilder</code>.</li>
+  <li><a href="07-request-processing.html">Request Processing (KafkaApis)</a>, consumes the parsed typed requests this layer produces and dispatches by <code>ApiKeys</code>.</li>
+  <li><a href="01-record-format.html">Record Format &amp; Batches</a>, the <code>records</code> field type embeds record batches; this layer carries them zero-copy but does not interpret them.</li>
+  <li><a href="10-kraft-consensus.html">KRaft Consensus</a> and <a href="11-kraft-controller.html">The KRaft Controller</a>, the Raft RPCs (<code>VOTE</code>, <code>BEGIN_QUORUM_EPOCH</code>, <code>FETCH</code>, <code>FETCH_SNAPSHOT</code>) and the <code>ENVELOPE</code>/forwarding mechanism all ride this exact framing.</li>
+  <li><a href="18-security.html">Security</a>, the <code>clusterAction</code> flag and SASL handshake/authenticate RPCs (which themselves use plain framing) are defined here.</li>
+  <li><a href="19-quotas.html">Quotas, Throttling &amp; Client Metrics</a>, <code>ThrottleTimeMs</code> and <code>shouldClientThrottle</code> are the protocol surface of quota enforcement.</li>
+  <li><a href="16-producer-client.html">The Producer Client</a> and <a href="17-consumer-client.html">The Consumer Client</a>, both perform the <code>ApiVersions</code> handshake and pick per-RPC versions from the negotiated ranges.</li>
 </ul>
 
 <h2>Design Rationale &amp; Evolution</h2>
@@ -408,10 +408,10 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
 <p>Kafka's protocol was originally a set of hand-written, hand-versioned serializers, which were error-prone and made adding fields painful. The pivotal evolutions:</p>
 
 <dl class="kv">
-<dt><span class="pill kip">KIP-35</span></dt><dd>Versioned <code>ApiVersions</code> handshake, so clients discover broker capabilities instead of assuming them — the foundation of independent client/broker upgrades.</dd>
+<dt><span class="pill kip">KIP-35</span></dt><dd>Versioned <code>ApiVersions</code> handshake, so clients discover broker capabilities instead of assuming them, the foundation of independent client/broker upgrades.</dd>
 <dt><span class="pill kip">KIP-482</span></dt><dd>Flexible versions: compact varint length prefixes and tagged optional fields, letting RPCs add fields without a version bump and making messages smaller. This is what the generator implements at <code>MessageDataGenerator.java:489-541,794-879,985-994</code>.</dd>
 <dt><span class="pill kip">KIP-511</span></dt><dd>Client software name/version reporting in <code>ApiVersionsRequest</code>, and the rule that <code>ApiVersionsResponse</code> keeps a v0-shaped header (<code>ApiMessageTypeGenerator.java:362-368</code>).</dd>
-<dt><span class="pill kip">KIP-516</span></dt><dd>Topic IDs replacing topic names in hot-path RPCs (<code>ProduceRequest</code> v13, <code>FetchRequest</code> v13) — a schema-only change thanks to the generator.</dd>
+<dt><span class="pill kip">KIP-516</span></dt><dd>Topic IDs replacing topic names in hot-path RPCs (<code>ProduceRequest</code> v13, <code>FetchRequest</code> v13), a schema-only change thanks to the generator.</dd>
 <dt><span class="pill kip">KIP-1242</span></dt><dd><code>ApiVersionsResponse</code> v5 cluster/node-id checking and <code>REBOOTSTRAP_REQUIRED</code>.</dd>
 </dl>
 
@@ -430,7 +430,7 @@ _writable.writeShort((short) len);   // or writeInt(len)</code></pre>
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>

@@ -29,8 +29,8 @@
           <span class="pill">3 parts · 46 chapters</span>
         </div>
       </div>
-      <p class="lead">New here? Start with the <a href="00-overview.html">Architecture Overview</a>. Operating a cluster? Jump to <a href="op00-operator-model.html">Part II — Operations</a>. Designing a system? See <a href="bp00-log-pattern.html">Part III — The Log as a Blueprint</a>.</p>
-      <div class="part-head"><h2>Part I · Architecture Internals</h2><p>How Kafka actually works inside — from the on-disk byte layout of a record batch up to the KRaft controller quorum, the coordinators, and the client runtimes.</p></div>
+      <p class="lead">New here? Start with the <a href="00-overview.html">Architecture Overview</a>. Operating a cluster? Jump to <a href="op00-operator-model.html">Part II, Operations</a>. Designing a system? See <a href="bp00-log-pattern.html">Part III, The Log as a Blueprint</a>.</p>
+      <div class="part-head"><h2>Part I · Architecture Internals</h2><p>How Kafka actually works inside, from the on-disk byte layout of a record batch up to the KRaft controller quorum, the coordinators, and the client runtimes.</p></div>
       <div class="section-label">Getting Started</div>
       <div class="card-grid">
         <a class="card" href="00-overview.html"><div class="card-num">00</div><div class="card-title">Architecture Overview</div><div class="card-desc">The distributed commit log, broker &amp; cluster anatomy, and the end-to-end data path.</div></a>
@@ -91,7 +91,7 @@
       <div class="section-label">Foundations</div>
       <div class="card-grid">
         <a class="card" href="op00-operator-model.html"><div class="card-num">II·00</div><div class="card-title">The Operator's Mental Model</div><div class="card-desc">What you run in KRaft, what fails independently, the control loops, and the SLIs/SLOs of a healthy cluster.</div></a>
-        <a class="card" href="op01-configuration.html"><div class="card-num">II·01</div><div class="card-title">Configuration: The Tuning Surface</div><div class="card-desc">Static vs dynamic vs per-topic configs, precedence, and the knobs that actually matter — with interactions.</div></a>
+        <a class="card" href="op01-configuration.html"><div class="card-num">II·01</div><div class="card-title">Configuration: The Tuning Surface</div><div class="card-desc">Static vs dynamic vs per-topic configs, precedence, and the knobs that actually matter, with interactions.</div></a>
         <a class="card" href="op02-limits.html"><div class="card-num">II·02</div><div class="card-title">Limits &amp; Boundaries</div><div class="card-desc">Hard, soft, and emergent limits: partitions, request/message size, the 1 GiB/s-per-topic question, FDs, 2 GB ceilings.</div></a>
       </div>
       <div class="section-label">Sizing &amp; Performance</div>
@@ -103,7 +103,7 @@
       </div>
       <div class="section-label">Running in Production</div>
       <div class="card-grid">
-        <a class="card" href="op07-failure-modes.html"><div class="card-num">II·07</div><div class="card-title">Failure Modes &amp; The Runbook</div><div class="card-desc">URP, offline partitions, disk/quorum failure, ISR thrash, rebalance storms, hanging txns — cause→symptom→fix.</div></a>
+        <a class="card" href="op07-failure-modes.html"><div class="card-num">II·07</div><div class="card-title">Failure Modes &amp; The Runbook</div><div class="card-desc">URP, offline partitions, disk/quorum failure, ISR thrash, rebalance storms, hanging txns, cause→symptom→fix.</div></a>
         <a class="card" href="op08-metrics-signals.html"><div class="card-num">II·08</div><div class="card-title">Metrics, Signals &amp; Observability</div><div class="card-desc">The golden signals, where each is emitted in source, alert thresholds, and a dashboard blueprint.</div></a>
         <a class="card" href="op09-topologies.html"><div class="card-num">II·09</div><div class="card-title">Topologies &amp; Deployment</div><div class="card-desc">Rack/multi-AZ, dedicated vs combined KRaft, multi-region replication, tiered-storage topology, tenancy.</div></a>
       </div>
@@ -115,32 +115,32 @@
       </div>
       <div class="section-label">Advanced Operations</div>
       <div class="card-grid">
-        <a class="card" href="op13-multitenancy.html"><div class="card-num">II·13</div><div class="card-title">Multitenancy &amp; Isolation</div><div class="card-desc">What is shared vs isolated in a broker, and how different tenants raise each other's latency &amp; error rates — the noisy-neighbour problem.</div></a>
-        <a class="card" href="op14-proactive-monitoring.html"><div class="card-num">II·14</div><div class="card-title">Proactive Monitoring: Leading Indicators</div><div class="card-desc">The leading indicators, trends and capacity-runway metrics that warn you a cluster will suffer — with lead time — before the lagging alerts fire. Includes client-team-side signals.</div></a>
+        <a class="card" href="op13-multitenancy.html"><div class="card-num">II·13</div><div class="card-title">Multitenancy &amp; Isolation</div><div class="card-desc">What is shared vs isolated in a broker, and how different tenants raise each other's latency &amp; error rates, the noisy-neighbour problem.</div></a>
+        <a class="card" href="op14-proactive-monitoring.html"><div class="card-num">II·14</div><div class="card-title">Proactive Monitoring: Leading Indicators</div><div class="card-desc">The leading indicators, trends and capacity-runway metrics that warn you a cluster will suffer, with lead time, before the lagging alerts fire. Includes client-team-side signals.</div></a>
       </div>
-      <div class="part-head"><h2>Part III · The Log as a Blueprint</h2><p>Kafka as one implementation of the distributed-log pattern — when to choose it, its inherent tradeoffs, the reusable engineering tactics, and the design space.</p></div>
+      <div class="part-head"><h2>Part III · The Log as a Blueprint</h2><p>Kafka as one implementation of the distributed-log pattern, when to choose it, its inherent tradeoffs, the reusable engineering tactics, and the design space.</p></div>
       <div class="section-label">The Pattern</div>
       <div class="card-grid">
-        <a class="card" href="bp00-log-pattern.html"><div class="card-num">III·00</div><div class="card-title">The Distributed Log as a Pattern</div><div class="card-desc">The pattern abstracted from Kafka — its invariants and the universal problems a replicated log solves.</div></a>
-        <a class="card" href="bp01-when-to-use.html"><div class="card-num">III·01</div><div class="card-title">When to Use the Log — and When Not To</div><div class="card-desc">A decision framework: the forces for and against, and the anti-patterns (log-as-DB / -as-RPC / -as-queue).</div></a>
+        <a class="card" href="bp00-log-pattern.html"><div class="card-num">III·00</div><div class="card-title">The Distributed Log as a Pattern</div><div class="card-desc">The pattern abstracted from Kafka, its invariants and the universal problems a replicated log solves.</div></a>
+        <a class="card" href="bp01-when-to-use.html"><div class="card-num">III·01</div><div class="card-title">When to Use the Log, and When Not To</div><div class="card-desc">A decision framework: the forces for and against, and the anti-patterns (log-as-DB / -as-RPC / -as-queue).</div></a>
       </div>
       <div class="section-label">Design &amp; Tradeoffs</div>
       <div class="card-grid">
         <a class="card" href="bp02-design-decisions.html"><div class="card-num">III·02</div><div class="card-title">Design Decisions &amp; Alternatives</div><div class="card-desc">Each Kafka choice as a tradeoff: pull vs push, ISR vs quorum (and why both), page cache vs managed memory, segments vs LSM.</div></a>
-        <a class="card" href="bp03-inherent-limits.html"><div class="card-num">III·03</div><div class="card-title">Inherent Limitations</div><div class="card-desc">Where the pattern structurally falls short — ordering, the partition ceiling, no per-message routing/TTL, the latency floor.</div></a>
+        <a class="card" href="bp03-inherent-limits.html"><div class="card-num">III·03</div><div class="card-title">Inherent Limitations</div><div class="card-desc">Where the pattern structurally falls short, ordering, the partition ceiling, no per-message routing/TTL, the latency floor.</div></a>
       </div>
       <div class="section-label">For the Architect</div>
       <div class="card-grid">
         <a class="card" href="bp04-tactics-toolkit.html"><div class="card-num">III·04</div><div class="card-title">The Tactics Toolkit</div><div class="card-desc">Reusable engineering tactics generalized: mechanical sympathy, epoch fencing, everything-is-a-log, timing wheels, MVCC timelines.</div></a>
-        <a class="card" href="bp05-evolution.html"><div class="card-num">III·05</div><div class="card-title">Evolution as Case Studies</div><div class="card-desc">ZooKeeper→KRaft, the message format, EOS, rebalancing, tiered storage, queues — lessons in evolving a distributed system.</div></a>
-        <a class="card" href="bp06-comparative.html"><div class="card-num">III·06</div><div class="card-title">Comparative Architecture</div><div class="card-desc">Kafka vs Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and diskless designs — what each tradeoff teaches.</div></a>
+        <a class="card" href="bp05-evolution.html"><div class="card-num">III·05</div><div class="card-title">Evolution as Case Studies</div><div class="card-desc">ZooKeeper→KRaft, the message format, EOS, rebalancing, tiered storage, queues, lessons in evolving a distributed system.</div></a>
+        <a class="card" href="bp06-comparative.html"><div class="card-num">III·06</div><div class="card-title">Comparative Architecture</div><div class="card-desc">Kafka vs Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and diskless designs, what each tradeoff teaches.</div></a>
         <a class="card" href="bp07-architect-cheatsheet.html"><div class="card-num">III·07</div><div class="card-title">The Architect's Cheat Sheet</div><div class="card-desc">Consolidated design dials, decision trees, and heuristics for choosing and tuning a log-based architecture.</div></a>
       </div>
 
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>

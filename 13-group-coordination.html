@@ -24,20 +24,20 @@
 
 <blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
 
-<p class="lead">The group coordinator is the broker-resident subsystem that decides <em>who consumes what</em> and remembers <em>how far each consumer has read</em>. In modern Kafka it is a pure-Java replicated state machine: each of the <code>__consumer_offsets</code> partitions hosts one coordinator shard, group and offset mutations are written as records to that partition's log and replayed to rebuild in-memory state, and a request's response is withheld until the record that produced it has been replicated past the partition high watermark. This chapter dissects the runtime (<code>CoordinatorRuntime</code>), the shard (<code>GroupCoordinatorShard</code>) and its two managers (<code>GroupMetadataManager</code>, <code>OffsetMetadataManager</code>), and then the two membership protocols they implement: the legacy <em>classic</em> protocol (JoinGroup/SyncGroup, generations, client-side assignors, eager vs cooperative rebalancing) and the modern <em>consumer group</em> protocol of <span class="pill kip">KIP-848</span> (incremental server-side heartbeat reconciliation driven by epochs).</p>
+<p class="lead">The group coordinator is the broker-resident subsystem that decides <em>who consumes what</em> and remembers <em>how far each consumer has read</em>. In modern Kafka it is a pure-Java replicated state machine: each of the <code>__consumer_offsets</code> partitions hosts one coordinator shard, group and offset mutations are written as records to that partition's log and replayed to rebuild in-memory state, and a request's response is withheld until the record that produced it has been replicated past the partition high watermark. This chapter dissects the runtime (<code>CoordinatorRuntime</code>), the shard (<code>GroupCoordinatorShard</code>) and its two managers (<code>GroupMetadataManager</code>, <code>OffsetMetadataManager</code>), and then the two membership protocols they implement: the legacy <em>classic</em> protocol (JoinGroup/SyncGroup, generations, client-side assignors, eager vs cooperative rebalancing) and the modern <em>consumer group</em> protocol of <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-848:+The+Next+Generation+of+the+Consumer+Rebalance+Protocol">KIP-848</a></span> (incremental server-side heartbeat reconciliation driven by epochs).</p>
 
 <h2>Role &amp; responsibilities</h2>
 
 <p>The group coordinator owns four intertwined concerns, all keyed by a <code>groupId</code> that is hashed to exactly one <code>__consumer_offsets</code> partition (its <em>coordinator</em>):</p>
 
 <ul>
-  <li><strong>Membership</strong> — tracking which consumers belong to a group, detecting their liveness via heartbeats and session timeouts, and admitting/fencing members.</li>
-  <li><strong>Assignment</strong> — deciding which topic-partitions each member should own and driving the group from one assignment to the next without two members ever holding the same partition simultaneously.</li>
-  <li><strong>Committed offsets</strong> — persisting and serving the last-consumed offset per <code>(group, topic, partition)</code>, including transactional offset commits (see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>), and expiring them under a retention policy.</li>
-  <li><strong>Group lifecycle</strong> — creating, listing, describing and deleting groups, and migrating a group between the classic and consumer protocols.</li>
+  <li><strong>Membership</strong>, tracking which consumers belong to a group, detecting their liveness via heartbeats and session timeouts, and admitting/fencing members.</li>
+  <li><strong>Assignment</strong>, deciding which topic-partitions each member should own and driving the group from one assignment to the next without two members ever holding the same partition simultaneously.</li>
+  <li><strong>Committed offsets</strong>, persisting and serving the last-consumed offset per <code>(group, topic, partition)</code>, including transactional offset commits (see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>), and expiring them under a retention policy.</li>
+  <li><strong>Group lifecycle</strong>, creating, listing, describing and deleting groups, and migrating a group between the classic and consumer protocols.</li>
 </ul>
 
-<p>The same machinery also backs <a href="15-share-groups.html">Share Groups (KIP-932)</a> and Streams groups (<span class="pill kip">KIP-1071</span>); this chapter focuses on consumer groups and references the others where the shared code makes that natural.</p>
+<p>The same machinery also backs <a href="15-share-groups.html">Share Groups (KIP-932)</a> and Streams groups (<span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-1071:+Streams+Rebalance+Protocol">KIP-1071</a></span>); this chapter focuses on consumer groups and references the others where the shared code makes that natural.</p>
 
 <div class="callout key"><span class="callout-title">Key idea</span><p>There is no separate coordinator database. The coordinator's durable state <em>is</em> the <code>__consumer_offsets</code> log. Every mutation is a record; in-memory state is a deterministic replay of those records; failover is "load the partition and replay". The runtime guarantees a response is only released once its records are committed (replicated), so a client that sees success can rely on it surviving coordinator failover.</p></div>
 
@@ -79,7 +79,7 @@
 <ul>
   <li>a <code>ReentrantLock</code> guarding all mutable fields of the context;</li>
   <li>a <code>SnapshotRegistry</code> and the <code>GroupCoordinatorShard</code> built on top of it (all hard state lives in <code>timeline</code> data structures backed by this registry, so reads can be served at an arbitrary committed offset);</li>
-  <li>a <code>CoordinatorState</code> — <code>INITIAL → LOADING → ACTIVE</code>, with <code>FAILED</code>/<code>CLOSED</code> as escape states; legal transitions are encoded per-enum-constant in <code>canTransitionFrom</code> (<code>CoordinatorRuntime.java:265</code>);</li>
+  <li>a <code>CoordinatorState</code>, <code>INITIAL → LOADING → ACTIVE</code>, with <code>FAILED</code>/<code>CLOSED</code> as escape states; legal transitions are encoded per-enum-constant in <code>canTransitionFrom</code> (<code>CoordinatorRuntime.java:265</code>);</li>
   <li>a <code>DeferredEventQueue</code> ordering pending responses by the log offset they depend on;</li>
   <li>a <code>HighWatermarkListener</code> registered on the <code>PartitionWriter</code> for that partition.</li>
 </ul>
@@ -89,7 +89,7 @@
 <figure class="diagram"><div class="dflow">
   <div class="node cat-broker"><span class="nt">KafkaApis</span><span class="nd">consumerGroupHeartbeat()</span></div>
   <div class="conn" data-label="dispatch"></div>
-  <div class="node cat-broker"><span class="nt">GroupCoordinatorService</span><span class="nd">validate request — cheap, no state</span></div>
+  <div class="node cat-broker"><span class="nt">GroupCoordinatorService</span><span class="nd">validate request, cheap, no state</span></div>
   <div class="conn" data-label="scheduleWriteOperation(tp, op)"></div>
   <div class="node cat-coord"><span class="nt">enqueue CoordinatorWriteEvent</span><span class="nd">onto partition event queue</span></div>
   <div class="conn ec-data" data-label="single thread per partition ↓"></div>
@@ -113,13 +113,13 @@
   <span class="lgi"><span class="sw cat-storage"></span>log / store</span>
   <span class="lgi"><span class="sw cat-coord"></span>coordinator queue / deferral</span>
   <span class="lgi"><span class="arr"></span>synchronous step</span>
-  <span class="lgi"><span class="arr dashed"></span>async — released by replication</span>
+  <span class="lgi"><span class="arr dashed"></span>async, released by replication</span>
   <span class="lgi"><span class="mono">cylinder</span> = the <code>__consumer_offsets</code> log</span>
 </div></figure>
 
 <p>The single-threaded-per-partition discipline is what makes the handlers lock-free. A write handler is a pure function of current state to <code>(records, response)</code>; it never blocks and never appends directly. The runtime applies the records through the same <code>replay</code> method used at load time (so the in-memory state always tracks "what the log will say"), accumulates them into a batch, and appends the batch to the log via the <code>PartitionWriter</code> (<code>CoordinatorRuntime.java:712</code>). The returned offset is checked against the expected next offset; a mismatch means the state machine has diverged from the log, and the runtime force-transitions <code>FAILED → LOADING</code> to reload from scratch (<code>CoordinatorRuntime.java:721</code>).</p>
 
-<div class="callout invariant"><span class="callout-title">Invariant</span><p>A client future is completed only after the high watermark of the coordinator partition reaches the offset of the record that produced its response (<code>HighWatermarkListener.onHighWatermarkUpdated → deferredEventQueue.completeUpTo</code>, <code>CoordinatorRuntime.java:1830</code>). Therefore any acknowledged commit, join, or assignment survives the loss of the coordinator broker — a new coordinator replays the same committed records and reconstructs identical state.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A client future is completed only after the high watermark of the coordinator partition reaches the offset of the record that produced its response (<code>HighWatermarkListener.onHighWatermarkUpdated → deferredEventQueue.completeUpTo</code>, <code>CoordinatorRuntime.java:1830</code>). Therefore any acknowledged commit, join, or assignment survives the loss of the coordinator broker, a new coordinator replays the same committed records and reconstructs identical state.</p></div>
 
 <h3>Read path and snapshots</h3>
 
@@ -127,7 +127,7 @@
 
 <h3>Batching &amp; linger</h3>
 
-<p>Records are accumulated into a <code>currentBatch</code> and flushed either when the batch fills or after an append-linger interval (<code>group.coordinator.append.linger.ms</code>, default <code>-1</code> = adaptive). An adaptive flush is scheduled as a normal event so it serializes with writes (<code>enqueueAdaptiveFlush</code>, <code>CoordinatorRuntime.java:668</code>). Transactional writes are never accumulated — they flush immediately.</p>
+<p>Records are accumulated into a <code>currentBatch</code> and flushed either when the batch fills or after an append-linger interval (<code>group.coordinator.append.linger.ms</code>, default <code>-1</code> = adaptive). An adaptive flush is scheduled as a normal event so it serializes with writes (<code>enqueueAdaptiveFlush</code>, <code>CoordinatorRuntime.java:668</code>). Transactional writes are never accumulated, they flush immediately.</p>
 
 <h2>The shard and its managers</h2>
 
@@ -153,7 +153,7 @@
 
 <h2>Persistent record layouts (field level)</h2>
 
-<h3>OffsetCommit — apiKey 1</h3>
+<h3>OffsetCommit, apiKey 1</h3>
 
 <p>The bread-and-butter record. Key uniquely identifies the slot; value carries the offset and bookkeeping. Schemas from <code>OffsetCommitKey.json</code> / <code>OffsetCommitValue.json</code>:</p>
 
@@ -172,11 +172,11 @@
 </tbody>
 </table></div>
 
-<p>A <code>null</code> value is a <em>tombstone</em> — replaying it deletes the offset (<code>OffsetMetadataManager.replay</code>, <code>OffsetMetadataManager.java:1149</code>). <code>LegacyOffsetCommitKey/Value</code> (an older apiKey) are converted on replay into the modern shapes by <code>convertLegacyOffsetCommitKey/Value</code> (<code>GroupCoordinatorShard.java:1132</code>).</p>
+<p>A <code>null</code> value is a <em>tombstone</em>, replaying it deletes the offset (<code>OffsetMetadataManager.replay</code>, <code>OffsetMetadataManager.java:1149</code>). <code>LegacyOffsetCommitKey/Value</code> (an older apiKey) are converted on replay into the modern shapes by <code>convertLegacyOffsetCommitKey/Value</code> (<code>GroupCoordinatorShard.java:1132</code>).</p>
 
-<h3>GroupMetadata (classic) — apiKey 2</h3>
+<h3>GroupMetadata (classic), apiKey 2</h3>
 
-<p>A single record holds the entire classic group: <code>protocolType</code>, <code>generation</code>, selected <code>protocol</code>, <code>leader</code>, <code>currentStateTimestamp</code>, and an array of <code>MemberMetadata</code> each with <code>memberId</code>, optional <code>groupInstanceId</code> (static membership), <code>clientId</code>/<code>clientHost</code>, <code>rebalanceTimeout</code>, <code>sessionTimeout</code>, and two opaque byte blobs — <code>subscription</code> (the member's <code>Subscription</code> as serialized by the client assignor) and <code>assignment</code> (the partitions the leader gave it). Because the assignment is opaque bytes, the broker does not interpret classic assignments; the client-side assignor does.</p>
+<p>A single record holds the entire classic group: <code>protocolType</code>, <code>generation</code>, selected <code>protocol</code>, <code>leader</code>, <code>currentStateTimestamp</code>, and an array of <code>MemberMetadata</code> each with <code>memberId</code>, optional <code>groupInstanceId</code> (static membership), <code>clientId</code>/<code>clientHost</code>, <code>rebalanceTimeout</code>, <code>sessionTimeout</code>, and two opaque byte blobs, <code>subscription</code> (the member's <code>Subscription</code> as serialized by the client assignor) and <code>assignment</code> (the partitions the leader gave it). Because the assignment is opaque bytes, the broker does not interpret classic assignments; the client-side assignor does.</p>
 
 <h3>Consumer-group records (KIP-848)</h3>
 
@@ -185,11 +185,11 @@
 <div class="table-wrap"><table>
 <thead><tr><th>Record</th><th>Salient fields</th></tr></thead>
 <tbody>
-<tr><td><code>ConsumerGroupMetadataValue</code></td><td><code>Epoch</code> (int32, the group epoch); <code>MetadataHash</code> (int64, a hash of all subscribed topics' metadata — replaces the old subscription-metadata record).</td></tr>
-<tr><td><code>ConsumerGroupMemberMetadataValue</code></td><td><code>InstanceId?</code>, <code>RackId?</code>, <code>ClientId</code>, <code>ClientHost</code>, <code>SubscribedTopicNames[]</code>, <code>SubscribedTopicRegex?</code>, <code>RebalanceTimeoutMs</code>, <code>ServerAssignor?</code>, and a nullable <code>ClassicMemberMetadata</code> (<code>SessionTimeoutMs</code> + <code>SupportedProtocols[]</code>) — non-null only for a classic-protocol member living inside a consumer group.</td></tr>
-<tr><td><code>ConsumerGroupTargetAssignmentMetadataValue</code></td><td><code>AssignmentEpoch</code> (int32); <code>AssignmentTimestamp</code> (int64, tagged) — when the assignor last ran, used to throttle recomputation.</td></tr>
-<tr><td><code>ConsumerGroupTargetAssignmentMemberValue</code></td><td><code>TopicPartitions[]</code> = list of <code>{ TopicId (uuid), Partitions (int32[]) }</code> — the desired assignment for one member.</td></tr>
-<tr><td><code>ConsumerGroupCurrentMemberAssignmentValue</code></td><td><code>MemberEpoch</code>, <code>PreviousMemberEpoch</code>, <code>State</code> (int8 → <code>MemberState</code>), <code>AssignedPartitions[]</code>, <code>PartitionsPendingRevocation[]</code>; each <code>TopicPartitions</code> additionally carries a tagged <code>AssignmentEpochs[]</code> array — the epoch at which each partition was assigned, used to fence zombie commits.</td></tr>
+<tr><td><code>ConsumerGroupMetadataValue</code></td><td><code>Epoch</code> (int32, the group epoch); <code>MetadataHash</code> (int64, a hash of all subscribed topics' metadata, replaces the old subscription-metadata record).</td></tr>
+<tr><td><code>ConsumerGroupMemberMetadataValue</code></td><td><code>InstanceId?</code>, <code>RackId?</code>, <code>ClientId</code>, <code>ClientHost</code>, <code>SubscribedTopicNames[]</code>, <code>SubscribedTopicRegex?</code>, <code>RebalanceTimeoutMs</code>, <code>ServerAssignor?</code>, and a nullable <code>ClassicMemberMetadata</code> (<code>SessionTimeoutMs</code> + <code>SupportedProtocols[]</code>), non-null only for a classic-protocol member living inside a consumer group.</td></tr>
+<tr><td><code>ConsumerGroupTargetAssignmentMetadataValue</code></td><td><code>AssignmentEpoch</code> (int32); <code>AssignmentTimestamp</code> (int64, tagged), when the assignor last ran, used to throttle recomputation.</td></tr>
+<tr><td><code>ConsumerGroupTargetAssignmentMemberValue</code></td><td><code>TopicPartitions[]</code> = list of <code>{ TopicId (uuid), Partitions (int32[]) }</code>, the desired assignment for one member.</td></tr>
+<tr><td><code>ConsumerGroupCurrentMemberAssignmentValue</code></td><td><code>MemberEpoch</code>, <code>PreviousMemberEpoch</code>, <code>State</code> (int8 → <code>MemberState</code>), <code>AssignedPartitions[]</code>, <code>PartitionsPendingRevocation[]</code>; each <code>TopicPartitions</code> additionally carries a tagged <code>AssignmentEpochs[]</code> array, the epoch at which each partition was assigned, used to fence zombie commits.</td></tr>
 </tbody>
 </table></div>
 
@@ -238,7 +238,7 @@
     <div class="m r dashed" style="--from:2;--to:3"><span class="ml">JoinResp gen=G, leader=A, members=[]</span><span class="ln"></span></div>
     <div class="note">leader A runs the client-side assignor locally</div>
     <div class="m r" style="--from:1;--to:2"><span class="ml">SyncGroup(gen=G, assignments {A,B})</span><span class="ln"></span></div>
-    <div class="m l" style="--from:3;--to:2"><span class="ml">SyncGroup(gen=G) — parked</span><span class="ln"></span></div>
+    <div class="m l" style="--from:3;--to:2"><span class="ml">SyncGroup(gen=G), parked</span><span class="ln"></span></div>
     <div class="note">persist GroupMetadata(gen=G), then release both SyncGroups ⇒ STABLE</div>
     <div class="m l dashed" style="--from:2;--to:1"><span class="ml">SyncResp(assignmentA)</span><span class="ln"></span></div>
     <div class="m r dashed" style="--from:2;--to:3"><span class="ml">SyncResp(assignmentB)</span><span class="ln"></span></div>
@@ -266,11 +266,11 @@
 
 <p>Within the classic protocol the <em>assignor</em> chosen by the group dictates revocation behaviour:</p>
 <ul>
-  <li><strong>Eager</strong> (e.g. <code>RangeAssignor</code>, <code>RoundRobinAssignor</code>): on every rebalance each consumer revokes <em>all</em> partitions before re-joining — a global stop-the-world. <code>RangeAssignor</code> assigns contiguous partition ranges so co-subscribed topics co-partition (<code>clients/.../RangeAssignor.java</code>).</li>
-  <li><strong>Cooperative incremental</strong> (<span class="pill kip">KIP-429</span>, <code>CooperativeStickyAssignor</code>): the consumer keeps partitions it will retain and only revokes the ones being moved away, across two rebalances. It advertises both protocols — <code>supportedProtocols()</code> returns <code>[COOPERATIVE, EAGER]</code> — and stitches the previous generation into its user-data so the assignor can be sticky (<code>clients/src/main/java/org/apache/kafka/clients/consumer/CooperativeStickyAssignor.java:52</code>, <code>:67</code>).</li>
+  <li><strong>Eager</strong> (e.g. <code>RangeAssignor</code>, <code>RoundRobinAssignor</code>): on every rebalance each consumer revokes <em>all</em> partitions before re-joining, a global stop-the-world. <code>RangeAssignor</code> assigns contiguous partition ranges so co-subscribed topics co-partition (<code>clients/.../RangeAssignor.java</code>).</li>
+  <li><strong>Cooperative incremental</strong> (<span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-429:+Kafka+Consumer+Incremental+Rebalance+Protocol">KIP-429</a></span>, <code>CooperativeStickyAssignor</code>): the consumer keeps partitions it will retain and only revokes the ones being moved away, across two rebalances. It advertises both protocols, <code>supportedProtocols()</code> returns <code>[COOPERATIVE, EAGER]</code>, and stitches the previous generation into its user-data so the assignor can be sticky (<code>clients/src/main/java/org/apache/kafka/clients/consumer/CooperativeStickyAssignor.java:52</code>, <code>:67</code>).</li>
 </ul>
 
-<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Cooperative rebalancing (<span class="pill kip">KIP-429</span>) was the first attack on stop-the-world rebalances: only moved partitions pause. KIP-848 finishes the job by removing the global synchronization barrier altogether and moving assignment to the broker — confirmed GA in 4.0 with server-side assignors selected via <code>group.consumer.assignors</code> (default <code>uniform</code>, also <code>range</code>).</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Cooperative rebalancing (<span class="pill kip">KIP-429</span>) was the first attack on stop-the-world rebalances: only moved partitions pause. KIP-848 finishes the job by removing the global synchronization barrier altogether and moving assignment to the broker, confirmed GA in 4.0 with server-side assignors selected via <code>group.consumer.assignors</code> (default <code>uniform</code>, also <code>range</code>).</p></div>
 
 <h2>The consumer group protocol (KIP-848)</h2>
 
@@ -279,12 +279,12 @@
 <h3>Three epochs</h3>
 
 <dl class="kv">
-<dt>Group epoch</dt><dd>Bumped whenever the group's inputs change — a member joins/leaves, a subscription changes, a server-assignor preference changes, or topic metadata (the metadata hash) changes. Persisted in <code>ConsumerGroupMetadataValue.Epoch</code>.</dd>
+<dt>Group epoch</dt><dd>Bumped whenever the group's inputs change, a member joins/leaves, a subscription changes, a server-assignor preference changes, or topic metadata (the metadata hash) changes. Persisted in <code>ConsumerGroupMetadataValue.Epoch</code>.</dd>
 <dt>Target-assignment epoch</dt><dd>The group epoch for which the current target assignment was computed. When it lags the group epoch, the assignor must run again. Persisted in <code>ConsumerGroupTargetAssignmentMetadataValue</code>.</dd>
 <dt>Member epoch</dt><dd>How far an individual member has reconciled. A member is "fully reconciled" when its epoch equals the target-assignment epoch. Persisted in <code>ConsumerGroupCurrentMemberAssignmentValue.MemberEpoch</code>.</dd>
 </dl>
 
-<h3>Heartbeat handler — the three steps</h3>
+<h3>Heartbeat handler, the three steps</h3>
 
 <p><code>GroupMetadataManager.consumerGroupHeartbeat</code> (the dispatcher at <code>GroupMetadataManager.java:5290</code>, then the worker at <code>:2441</code>) executes a fixed pipeline for every non-leave heartbeat:</p>
 
@@ -294,7 +294,7 @@
   <li><strong>Reconcile this member.</strong> <code>maybeReconcile</code> (<code>:3796</code>) short-circuits if the member is already reconciled to the target epoch and its subscription is unchanged; otherwise it runs the <code>CurrentAssignmentBuilder</code> state machine (below) and, if the member changed, writes a <code>ConsumerGroupCurrentMemberAssignmentValue</code> record.</li>
 </ol>
 
-<p>Finally the handler reschedules the session timer (<code>:2583</code>) and builds the response: <code>memberId</code>, <code>memberEpoch</code>, <code>heartbeatIntervalMs</code>, and — only when the member is new, sent a full request, or its assigned partitions changed — the new assignment (<code>:2597</code>).</p>
+<p>Finally the handler reschedules the session timer (<code>:2583</code>) and builds the response: <code>memberId</code>, <code>memberEpoch</code>, <code>heartbeatIntervalMs</code>, and, only when the member is new, sent a full request, or its assigned partitions changed, the new assignment (<code>:2597</code>).</p>
 
 <h3>The reconciliation engine: member state machine</h3>
 
@@ -364,8 +364,8 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <p>The target assignment is produced by a <code>ConsumerGroupPartitionAssignor</code>. Two are built in (<code>GroupCoordinatorConfig.java:215</code>); the first listed is the default when a member does not request one:</p>
 <ul>
-  <li><code>UniformAssignor</code> (name <code>"uniform"</code>, the default) — balances partitions evenly and can be rack-aware. It picks a <em>homogeneous</em> builder when all members share the same subscription, else a <em>heterogeneous</em> one (<code>UniformAssignor.java:78</code>).</li>
-  <li><code>RangeAssignor</code> (name <code>"range"</code>) — contiguous ranges with co-partitioning, the server-side analogue of the classic range assignor (<code>RangeAssignor.java:85</code>).</li>
+  <li><code>UniformAssignor</code> (name <code>"uniform"</code>, the default), balances partitions evenly and can be rack-aware. It picks a <em>homogeneous</em> builder when all members share the same subscription, else a <em>heterogeneous</em> one (<code>UniformAssignor.java:78</code>).</li>
+  <li><code>RangeAssignor</code> (name <code>"range"</code>), contiguous ranges with co-partitioning, the server-side analogue of the classic range assignor (<code>RangeAssignor.java:85</code>).</li>
 </ul>
 <p>A member names its preferred assignor in <code>ConsumerGroupHeartbeatRequest.serverAssignor</code>; the service validates it against the configured set and rejects unknowns with <code>UnsupportedAssignorException</code> (<code>GroupCoordinatorService.java:473</code>). The effective group assignor is recomputed when the preference changes (<code>computePreferredServerAssignor</code>, used at <code>GroupMetadataManager.java:4115</code>), and changing the default does not force a rebalance of existing groups.</p>
 
@@ -377,9 +377,9 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <p>Each heartbeat (re)arms a per-member session timer keyed by <code>group + memberId</code> (<code>scheduleConsumerGroupSessionTimeout</code>, <code>GroupMetadataManager.java:5067</code>). On expiry the timer runs <code>consumerGroupFenceMemberOperation</code>. A rebalance timer is armed only while a member sits in <code>UNREVOKED_PARTITIONS</code> (it must finish revoking within its rebalance timeout) and fires only if the member is still on the same epoch (<code>:5122</code>). Fencing (<code>consumerGroupFenceMembers</code>, <code>:4605</code>) writes tombstones for the member's metadata/current/target records, recomputes the metadata hash without the member, and bumps the group epoch; if every member is gone it also advances the target-assignment epoch with a timestamp of 0 so the next assignment is not throttled (<code>:4665</code>). A member leaves by heartbeating with epoch <code>-1</code> (dynamic) or <code>-2</code> (static), constants <code>LEAVE_GROUP_MEMBER_EPOCH</code> / <code>LEAVE_GROUP_STATIC_MEMBER_EPOCH</code> (<code>clients/src/main/java/org/apache/kafka/common/requests/ConsumerGroupHeartbeatRequest.java:31</code>); the dispatcher routes these to <code>consumerGroupLeave</code> (<code>GroupMetadataManager.java:5294</code>).</p>
 
-<div class="callout invariant"><span class="callout-title">Invariant</span><p>A consumer-group member that fails to advance from epoch <code>e</code> within its rebalance timeout, or stops heartbeating within its session timeout, is fenced — its partitions are released and reassigned. Conversely, a fenced or zombie member that resumes is rejected with <code>FencedMemberEpochException</code>/<code>UNKNOWN_MEMBER_ID</code> and must rejoin from epoch 0.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p>A consumer-group member that fails to advance from epoch <code>e</code> within its rebalance timeout, or stops heartbeating within its session timeout, is fenced, its partitions are released and reassigned. Conversely, a fenced or zombie member that resumes is rejected with <code>FencedMemberEpochException</code>/<code>UNKNOWN_MEMBER_ID</code> and must rejoin from epoch 0.</p></div>
 
-<h3>Static membership (KIP-345)</h3>
+<h3>Static membership (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-345:+Introduce+static+membership+protocol+to+reduce+consumer+rebalances">KIP-345</a>)</h3>
 
 <p>A member that supplies <code>group.instance.id</code> is <em>static</em>: its identity survives a restart. In the classic protocol this lives in <code>MemberMetadata.groupInstanceId</code>; in the consumer protocol the coordinator maps <code>instanceId → memberId</code> (<code>ConsumerGroup.staticMembers</code>, <code>ConsumerGroup.java:123</code>) so a returning instance reclaims its assignment instead of triggering a full rebalance. When a new <code>memberId</code> claims an existing <code>instanceId</code>, the previous member is removed from the target-assignment computation (<code>GroupMetadataManager.java:4134</code>). The validation path treats a missing instance id on a static-leave as an error (<code>GroupCoordinatorService.java:467</code>).</p>
 
@@ -387,7 +387,7 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <h2>Offset management</h2>
 
-<p>Offsets are handled entirely by <code>OffsetMetadataManager</code> and are independent of which membership protocol a group uses (even a "simple" group that never joins can commit — replaying an <code>OffsetCommit</code> for an unknown group auto-creates an empty classic group, <code>OffsetMetadataManager.java:1166</code>).</p>
+<p>Offsets are handled entirely by <code>OffsetMetadataManager</code> and are independent of which membership protocol a group uses (even a "simple" group that never joins can commit, replaying an <code>OffsetCommit</code> for an unknown group auto-creates an empty classic group, <code>OffsetMetadataManager.java:1166</code>).</p>
 
 <h3>In-memory structure</h3>
 
@@ -395,7 +395,7 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <h3>Commit path</h3>
 
-<p><code>commitOffset</code> (<code>:610</code>) validates the request (group exists, member epoch/generation matches via a <code>CommitPartitionValidator</code>), rejects metadata longer than <code>offset.metadata.max.bytes</code> (default 4096) with <code>OFFSET_METADATA_TOO_LARGE</code>, computes an expiry timestamp from the request retention (or leaves it open to the broker default), and emits one <code>OffsetCommit</code> record per partition. Transactional commits (<code>commitTransactionalOffset</code>, <code>:681</code>) additionally map a stale member epoch to <code>STALE_MEMBER_EPOCH</code> on v6+ (<span class="pill kip">KIP-1319</span>) or to the legacy <code>ILLEGAL_GENERATION</code> on older versions (<code>:710</code>).</p>
+<p><code>commitOffset</code> (<code>:610</code>) validates the request (group exists, member epoch/generation matches via a <code>CommitPartitionValidator</code>), rejects metadata longer than <code>offset.metadata.max.bytes</code> (default 4096) with <code>OFFSET_METADATA_TOO_LARGE</code>, computes an expiry timestamp from the request retention (or leaves it open to the broker default), and emits one <code>OffsetCommit</code> record per partition. Transactional commits (<code>commitTransactionalOffset</code>, <code>:681</code>) additionally map a stale member epoch to <code>STALE_MEMBER_EPOCH</code> on v6+ (<span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-1319:+Align+TxnOffsetCommit+API+with+OffsetCommit+API">KIP-1319</a></span>) or to the legacy <code>ILLEGAL_GENERATION</code> on older versions (<code>:710</code>).</p>
 
 <h3>Fetch path</h3>
 
@@ -426,12 +426,12 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
   <div class="node cat-storage store"><span class="nt">PartitionWriter / Log</span><span class="nd">__consumer_offsets partition</span></div>
   <div class="conn"></div>
   <div class="node cat-broker"><span class="nt">HighWatermarkListener</span><span class="nd">⇒ complete deferred responses</span></div>
-  <div class="conn dashed ec-async" data-label="feedback ↑ — re-enter as write events on the owning partition"></div>
+  <div class="conn dashed ec-async" data-label="feedback ↑, re-enter as write events on the owning partition"></div>
   <div class="row">
     <div class="col"><div class="node cat-broker"><span class="nt">CoordinatorBackgroundThreadPoolExecutor</span><span class="nd">default 2 · regex resolution · offloaded assignor → fold results back</span></div></div>
     <div class="col"><div class="node cat-coord"><span class="nt">server timer thread</span><span class="nd">session / rebalance / expiry TimerTasks → re-enter as writes</span></div></div>
   </div>
-</div><figcaption>Threading. Per-partition serialization removes the need for locks inside handlers; the only lock is the context lock the runtime takes around state transitions and high-watermark application. The background pool and timer thread never mutate state directly — they fold their results back as write events on the owning partition's serialized queue.</figcaption>
+</div><figcaption>Threading. Per-partition serialization removes the need for locks inside handlers; the only lock is the context lock the runtime takes around state transitions and high-watermark application. The background pool and timer thread never mutate state directly, they fold their results back as write events on the owning partition's serialized queue.</figcaption>
 <div class="legend">
   <span class="lgi"><span class="sw cat-broker"></span>broker thread / component</span>
   <span class="lgi"><span class="sw cat-coord"></span>coordinator event queue / timer</span>
@@ -443,8 +443,8 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <ul>
   <li><strong>Event processor.</strong> A <code>MultiThreadedEventProcessor</code> with <code>group.coordinator.threads</code> threads (default 4) runs the per-partition event queues (<code>GroupCoordinatorService.java:257</code>). Events for one partition are processed one at a time and in order, so a handler observing/mutating that shard's state needs no locks.</li>
-  <li><strong>Background pool.</strong> <code>CoordinatorBackgroundThreadPoolExecutor</code> (<code>group.coordinator.background.threads</code>, default 2) runs long tasks — resolving subscription regexes and offloaded assignor computation (<code>group.consumer.assignor.offload.enable</code>, default true) — off the event threads, then folds results back in as write events.</li>
-  <li><strong>Timeline data structures.</strong> All hard state is in <code>TimelineHashMap</code>/<code>TimelineObject</code>/<code>TimelineInteger</code> tied to the context's <code>SnapshotRegistry</code>. Writes advance the live version; reads at a committed offset see the snapshot — concurrent reads on other threads never tear.</li>
+  <li><strong>Background pool.</strong> <code>CoordinatorBackgroundThreadPoolExecutor</code> (<code>group.coordinator.background.threads</code>, default 2) runs long tasks, resolving subscription regexes and offloaded assignor computation (<code>group.consumer.assignor.offload.enable</code>, default true), off the event threads, then folds results back in as write events.</li>
+  <li><strong>Timeline data structures.</strong> All hard state is in <code>TimelineHashMap</code>/<code>TimelineObject</code>/<code>TimelineInteger</code> tied to the context's <code>SnapshotRegistry</code>. Writes advance the live version; reads at a committed offset see the snapshot, concurrent reads on other threads never tear.</li>
   <li><strong>Context lock.</strong> The runtime takes <code>context.lock</code> around state transitions (<code>LOADING/ACTIVE/FAILED</code>) and around applying a new high watermark (<code>CoordinatorRuntime.java:1823</code>). Handlers themselves do not take it.</li>
   <li><strong>Timers.</strong> Session, rebalance, join, sync and expiration timeouts are <code>TimerTask</code>s on the server timer; when they fire they schedule a write operation on the owning partition, so the actual state change still happens on the serialized event thread.</li>
 </ul>
@@ -485,7 +485,7 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 <ul>
   <li><strong>Coordinator failover.</strong> When a broker becomes leader of a <code>__consumer_offsets</code> partition, the runtime transitions that context <code>INITIAL/FAILED → LOADING</code>, builds a fresh shard on a new snapshot registry, and replays every record in the partition through <code>GroupCoordinatorShard.replay</code> before going <code>ACTIVE</code> (<code>CoordinatorRuntime.java:530</code>, <code>:579</code>). Until then, RPCs for that partition are answered <code>COORDINATOR_LOAD_IN_PROGRESS</code> or <code>COORDINATOR_NOT_AVAILABLE</code> (the service checks <code>isActive</code> first, e.g. <code>GroupCoordinatorService.java:488</code>).</li>
   <li><strong>Not the coordinator.</strong> If the broker does not lead the group's partition, handlers surface <code>NOT_COORDINATOR</code>; clients re-issue <code>FindCoordinator</code>.</li>
-  <li><strong>State/log divergence.</strong> If <code>partitionWriter.append</code> returns an unexpected offset, the runtime logs an error and force-reloads the partition (<code>CoordinatorRuntime.java:721</code>) — the in-memory state is treated as untrustworthy and rebuilt from the log.</li>
+  <li><strong>State/log divergence.</strong> If <code>partitionWriter.append</code> returns an unexpected offset, the runtime logs an error and force-reloads the partition (<code>CoordinatorRuntime.java:721</code>), the in-memory state is treated as untrustworthy and rebuilt from the log.</li>
   <li><strong>Lost epoch bump.</strong> A consumer-protocol response that bumps the member epoch but never reaches the client is recovered: the member retries with its previous epoch, matched against <code>PreviousMemberEpoch</code>.</li>
   <li><strong>Zombie commit.</strong> A partition's <code>AssignmentEpochs</code> fence commits from a member that no longer owns the partition; a stale member epoch yields <code>STALE_MEMBER_EPOCH</code>.</li>
   <li><strong>Stuck revocation.</strong> A member parked in <code>UNREVOKED_PARTITIONS</code> that never acknowledges revocation is fenced when its rebalance timer fires (<code>:5129</code>), releasing the partitions to others.</li>
@@ -495,7 +495,7 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <h2>Invariants &amp; guarantees</h2>
 <ul>
-  <li>A group is served by exactly one coordinator at a time — the leader of its hashed <code>__consumer_offsets</code> partition.</li>
+  <li>A group is served by exactly one coordinator at a time, the leader of its hashed <code>__consumer_offsets</code> partition.</li>
   <li>At most one member owns a given topic-partition at any instant within a group; ownership is handed over only after the previous owner relinquishes it (enforced by <code>currentPartitionEpoch</code> + the revoke-before-assign state machine).</li>
   <li>Acknowledged commits, joins and assignments are durable across coordinator failover, because responses are gated on replication past the high watermark.</li>
   <li>In-memory state is a deterministic function of the committed prefix of the partition log; replay during loading and during request handling share one code path, so they cannot diverge.</li>
@@ -513,23 +513,23 @@ pendingAssignment    = target − newAssigned − (partitions still owned by oth
 
 <h2>Design rationale &amp; evolution</h2>
 <ul>
-  <li><span class="pill kip">KIP-848</span> — moved assignment to the broker and replaced JoinGroup/SyncGroup with the incremental <code>ConsumerGroupHeartbeat</code>; no global barrier, server-side assignors, epoch-based reconciliation. GA in 4.0.</li>
-  <li><span class="pill kip">KIP-429</span> — cooperative incremental rebalancing on the client side, the precursor that made classic rebalances non-stop-the-world for the assignor's own moves.</li>
-  <li><span class="pill kip">KIP-345</span> — static membership via <code>group.instance.id</code> so restarts do not reshuffle the group.</li>
-  <li><span class="pill kip">KIP-932</span> — share groups (queue semantics) built on the same coordinator runtime and record machinery.</li>
-  <li><span class="pill kip">KIP-1071</span> — streams groups: server-side task assignment for Kafka Streams, sharing the shard.</li>
+  <li><span class="pill kip">KIP-848</span>, moved assignment to the broker and replaced JoinGroup/SyncGroup with the incremental <code>ConsumerGroupHeartbeat</code>; no global barrier, server-side assignors, epoch-based reconciliation. GA in 4.0.</li>
+  <li><span class="pill kip">KIP-429</span>, cooperative incremental rebalancing on the client side, the precursor that made classic rebalances non-stop-the-world for the assignor's own moves.</li>
+  <li><span class="pill kip">KIP-345</span>, static membership via <code>group.instance.id</code> so restarts do not reshuffle the group.</li>
+  <li><span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-932:+Queues+for+Kafka">KIP-932</a></span>, share groups (queue semantics) built on the same coordinator runtime and record machinery.</li>
+  <li><span class="pill kip">KIP-1071</span>, streams groups: server-side task assignment for Kafka Streams, sharing the shard.</li>
   <li>The post-4.0 rewrite from the Scala ZooKeeper-era coordinator to this Java, log-backed, KRaft-native design is what makes the "coordinator is a replicated state machine over <code>__consumer_offsets</code>" model literal rather than a metaphor.</li>
 </ul>
 
 <h2>Gotchas &amp; operational notes</h2>
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>partitionFor</code> hashes <code>groupId.hashCode()</code> modulo the offsets-topic partition count. Changing the number of <code>__consumer_offsets</code> partitions after groups exist re-maps groups to different coordinators and effectively orphans their state — the partition count is fixed for the life of the cluster.</p></div>
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Consumer-protocol offsets are fenced by member epoch and per-partition assignment epoch. A consumer that pauses long enough to be fenced and then tries to commit will be rejected (<code>STALE_MEMBER_EPOCH</code> / <code>UNKNOWN_MEMBER_ID</code>) and must rejoin — its in-flight commits are lost, which is the intended exactly-once-friendly behaviour, not a bug.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p><code>partitionFor</code> hashes <code>groupId.hashCode()</code> modulo the offsets-topic partition count. Changing the number of <code>__consumer_offsets</code> partitions after groups exist re-maps groups to different coordinators and effectively orphans their state, the partition count is fixed for the life of the cluster.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Consumer-protocol offsets are fenced by member epoch and per-partition assignment epoch. A consumer that pauses long enough to be fenced and then tries to commit will be rejected (<code>STALE_MEMBER_EPOCH</code> / <code>UNKNOWN_MEMBER_ID</code>) and must rejoin, its in-flight commits are lost, which is the intended exactly-once-friendly behaviour, not a bug.</p></div>
 <div class="callout warning"><span class="callout-title">Caution</span><p>Because a write handler mutates in-memory state via <code>replay</code> <em>before</em> the response is released, in-memory state can be momentarily ahead of the committed log. Anything read on the <em>write</em> thread sees that optimistic state, but external reads (<code>OffsetFetch</code>, describes) are served at the committed snapshot. Do not reason about coordinator state from logs of optimistic mutations; only committed records are authoritative.</p></div>
 <div class="callout note"><span class="callout-title">Note</span><p>Subscription metadata was stored per-group before 4.0 (<code>ConsumerGroupPartitionMetadata</code>, apiKey 4) and is now replaced by a 64-bit metadata hash on the group record; the coordinator writes a tombstone for any lingering subscription-metadata record it loads (<code>GroupMetadataManager.java:4039</code>).</p></div>
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>

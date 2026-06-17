@@ -1008,4 +1008,7 @@ figure.diagram { box-shadow: none; border-color: var(--border); }
 figure.diagram { font-family: var(--font-sans); }
 figure.diagram figcaption { font-family: var(--font-serif); }
 
+/* KIP/JIRA badges: monochrome like the rest of the chrome (colour is for diagrams only). */
+.pill.kip { color: var(--fg-soft); border-color: var(--border-strong); background: var(--bg-soft); }
+
 /* end Computer Modern re-skin ============================================== */

@@ -26,18 +26,18 @@
 <p class="lead">Every byte Kafka stores on disk, ships over the wire, or replicates between brokers is framed by the <em>record batch</em> format. This chapter dissects the v2 batch (<code>DefaultRecordBatch</code>) field by field, the variable-length zig-zag encoding of the inner records (<code>DefaultRecord</code>), the legacy v0/v1 formats that v2 superseded, the control records that carry transaction markers and KRaft quorum events, the compression codecs, the CRC-32C checksum, and the builder/reader machinery (<code>MemoryRecordsBuilder</code>, <code>FileLogInputStream</code>) that produces and consumes these bytes. The batch header is also where idempotence and transactions live: the producer id, epoch and base sequence are header fields.</p>
 
 <h2>Role &amp; responsibilities</h2>
-<p>The record format is the lingua franca of Kafka. The same bytes flow unchanged through the producer's accumulator, the <code>Produce</code> RPC, the broker's log segments, the <code>Fetch</code> RPC, the replica fetchers, tiered storage, and the consumer. Keeping one canonical layout — and never re-serializing it on the broker's hot path — is what enables Kafka's zero-copy <code>sendfile</code> transfer from page cache to socket. Concretely the format is responsible for:</p>
+<p>The record format is the lingua franca of Kafka. The same bytes flow unchanged through the producer's accumulator, the <code>Produce</code> RPC, the broker's log segments, the <code>Fetch</code> RPC, the replica fetchers, tiered storage, and the consumer. Keeping one canonical layout, and never re-serializing it on the broker's hot path, is what enables Kafka's zero-copy <code>sendfile</code> transfer from page cache to socket. Concretely the format is responsible for:</p>
 <ul>
-<li><strong>Framing</strong> — delimiting batches so a reader can walk a log file or a network buffer batch-by-batch without parsing record contents.</li>
-<li><strong>Integrity</strong> — a CRC-32C over each batch detects corruption on disk or in flight.</li>
-<li><strong>Compaction</strong> — preserving the first and last offset/sequence of a batch even when its records are removed, so producer state can be rebuilt.</li>
-<li><strong>Idempotence &amp; transactions</strong> — the producer id (PID), epoch and base sequence ride in the batch header (see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>).</li>
-<li><strong>Compression</strong> — the record-payload region (everything after the header) may be compressed as one unit.</li>
-<li><strong>Control signalling</strong> — transaction commit/abort markers and KRaft leader-change / snapshot / voters events travel as <em>control batches</em>.</li>
+<li><strong>Framing</strong>, delimiting batches so a reader can walk a log file or a network buffer batch-by-batch without parsing record contents.</li>
+<li><strong>Integrity</strong>, a CRC-32C over each batch detects corruption on disk or in flight.</li>
+<li><strong>Compaction</strong>, preserving the first and last offset/sequence of a batch even when its records are removed, so producer state can be rebuilt.</li>
+<li><strong>Idempotence &amp; transactions</strong>, the producer id (PID), epoch and base sequence ride in the batch header (see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>).</li>
+<li><strong>Compression</strong>, the record-payload region (everything after the header) may be compressed as one unit.</li>
+<li><strong>Control signalling</strong>, transaction commit/abort markers and KRaft leader-change / snapshot / voters events travel as <em>control batches</em>.</li>
 </ul>
 
 <h2>Where it lives in the code</h2>
-<p>The format lives in the <code>org.apache.kafka.common.record.internal</code> package of the <code>clients</code> module (note the <code>internal</code> sub-package — it was moved there in 4.x). Compression codecs live in <code>org.apache.kafka.common.compress</code>.</p>
+<p>The format lives in the <code>org.apache.kafka.common.record.internal</code> package of the <code>clients</code> module (note the <code>internal</code> sub-package, it was moved there in 4.x). Compression codecs live in <code>org.apache.kafka.common.compress</code>.</p>
 <div class="table-wrap"><table>
 <thead><tr><th>Class / interface</th><th>File</th><th>Responsibility</th></tr></thead>
 <tbody>
@@ -63,7 +63,7 @@
 <dt>Control batch</dt><dd>A batch with the control attribute bit set. Its records carry a typed control key rather than user data; never compacted, never delivered to ordinary consumers.</dd>
 </dl>
 
-<div class="callout key"><span class="callout-title">Key idea</span><p>In v2 the <strong>batch</strong> is the heavyweight, self-describing unit (header, CRC, compression, PID/epoch/sequence), and the <strong>record</strong> is a maximally-compact delta-encoded body. A single produced batch typically holds many records, even when uncompressed — unlike v0/v1 where an uncompressed "batch" was always exactly one record.</p></div>
+<div class="callout key"><span class="callout-title">Key idea</span><p>In v2 the <strong>batch</strong> is the heavyweight, self-describing unit (header, CRC, compression, PID/epoch/sequence), and the <strong>record</strong> is a maximally-compact delta-encoded body. A single produced batch typically holds many records, even when uncompressed, unlike v0/v1 where an uncompressed "batch" was always exactly one record.</p></div>
 
 <h2>Data structure: the v2 record batch (on disk / on wire)</h2>
 <p>The header is a fixed 61-byte structure followed by the records region. Field offsets are compile-time constants at the top of <code>DefaultRecordBatch</code> <span class="cite">DefaultRecordBatch.java:104-131</span>; the value <code>RECORD_BATCH_OVERHEAD = RECORDS_OFFSET = 61</code>. All multi-byte integers are big-endian (Java <code>ByteBuffer</code> default).</p>
@@ -111,10 +111,10 @@
 <tr><td>4</td><td><code>0x10</code> <code>TRANSACTIONAL_FLAG_MASK</code></td><td>Batch is part of a transaction</td><td><code>isTransactional()</code></td></tr>
 <tr><td>5</td><td><code>0x20</code> <code>CONTROL_FLAG_MASK</code></td><td>Control batch (markers / KRaft events)</td><td><code>isControlBatch()</code></td></tr>
 <tr><td>6</td><td><code>0x40</code> <code>DELETE_HORIZON_FLAG_MASK</code></td><td>If set, <code>baseTimestamp</code> is the tombstone delete horizon</td><td><code>deleteHorizonMs()</code></td></tr>
-<tr><td>7–15</td><td>—</td><td>Unused / reserved</td><td>—</td></tr>
+<tr><td>7–15</td><td>, </td><td>Unused / reserved</td><td>, </td></tr>
 </tbody>
 </table></div>
-<p>Attributes are assembled by <code>computeAttributes(...)</code> <span class="cite">DefaultRecordBatch.java:424-440</span>, which insists a timestamp type be supplied for v2 (it throws on <code>NO_TIMESTAMP_TYPE</code>). The delete-horizon bit (KIP-534) lets the cleaner record when tombstones and aborted-txn markers become eligible for removal: when set, <code>deleteHorizonMs()</code> returns <code>baseTimestamp</code> reinterpreted as that horizon <span class="cite">DefaultRecordBatch.java:251-261</span>.</p>
+<p>Attributes are assembled by <code>computeAttributes(...)</code> <span class="cite">DefaultRecordBatch.java:424-440</span>, which insists a timestamp type be supplied for v2 (it throws on <code>NO_TIMESTAMP_TYPE</code>). The delete-horizon bit (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-534:+Retain+tombstones+and+transaction+markers+for+approximately+delete.retention.ms+milliseconds">KIP-534</a>) lets the cleaner record when tombstones and aborted-txn markers become eligible for removal: when set, <code>deleteHorizonMs()</code> returns <code>baseTimestamp</code> reinterpreted as that horizon <span class="cite">DefaultRecordBatch.java:251-261</span>.</p>
 
 <div class="callout invariant"><span class="callout-title">Invariant</span><p><code>lastOffset() == baseOffset + lastOffsetDelta</code> and <code>lastSequence() == incrementSequence(baseSequence, lastOffsetDelta)</code>. These are computed, never stored, so re-stamping <code>baseOffset</code> on append (via <code>setLastOffset</code>, which writes <code>offset − lastOffsetDelta</code> <span class="cite">DefaultRecordBatch.java:367-369</span>) preserves both the offset and sequence ranges atomically.</p></div>
 
@@ -137,7 +137,7 @@
   <figcaption>v2 DefaultRecord wire layout (DefaultRecord.java:36-68, writeTo at 168-223)</figcaption>
   <div class="legend">
     <span class="lgi"><span class="sw"></span>record field (colours cycle to separate adjacent fields)</span>
-    <span class="lgi"><span class="mono">--w</span> = relative byte width (approx — varints are 1–5/1–9 bytes)</span>
+    <span class="lgi"><span class="mono">--w</span> = relative byte width (approx, varints are 1–5/1–9 bytes)</span>
     <span class="lgi"><span class="mono">varint / varlong</span> = zig-zag variable-length integer</span>
     <span class="lgi"><span class="mono">−1</span> length = null / tombstone sentinel</span>
   </div></figure>
@@ -145,7 +145,7 @@
 <p>The fixed overhead of a record excluding key/value/headers is at most 21 bytes: <code>MAX_RECORD_OVERHEAD = 21</code> = 5 (length) + 1 (attributes) + 10 (timestamp varlong) + 5 (offset varint) <span class="cite">DefaultRecord.java:71-72</span>. The actual size is far smaller in practice because deltas are tiny: a record whose offset delta is 0 and whose timestamp delta is 0 encodes those as a single byte each.</p>
 
 <h3>Varint / zig-zag encoding</h3>
-<p>Kafka uses the Protocol-Buffers base-128 varint, with <em>zig-zag</em> mapping so small-magnitude signed numbers (positive or negative) stay short. The mapping is purely arithmetic <span class="cite">ByteUtils.java:474-487, 498-516</span>:</p>
+<p>Kafka uses the <a href="https://protobuf.dev/programming-guides/encoding/">Protocol-Buffers base-128 varint</a>, with <em>zig-zag</em> mapping so small-magnitude signed numbers (positive or negative) stay short. The mapping is purely arithmetic <span class="cite">ByteUtils.java:474-487, 498-516</span>:</p>
 <pre><code>// 32-bit:  zz(n) = (n &lt;&lt; 1) ^ (n &gt;&gt; 31)
 // 64-bit:  zz(n) = (n &lt;&lt; 1) ^ (n &gt;&gt; 63)
 // then emit 7 bits per byte, low byte first, high bit = "more bytes follow"</code></pre>
@@ -154,7 +154,7 @@
 <div class="callout key"><span class="callout-title">Key idea</span><p>Delta encoding plus zig-zag varints is why v2 is dramatically more compact than v0/v1 for batched writes: the 8-byte absolute offset and 8-byte timestamp are stored <em>once per batch</em>; each additional record pays only a byte or two for its deltas, before the whole record region is (optionally) compressed.</p></div>
 
 <h3>Reading a record</h3>
-<p><code>DefaultRecord.readFrom</code> reverses the layout <span class="cite">DefaultRecord.java:306-360</span>: read the body length, then attributes, then reconstruct <code>timestamp = baseTimestamp + timestampDelta</code> (overridden to <code>logAppendTime</code> if the batch is <code>LOG_APPEND_TIME</code>), <code>offset = baseOffset + offsetDelta</code>, and <code>sequence = incrementSequence(baseSequence, offsetDelta)</code> when a base sequence is present. After parsing it asserts the number of consumed bytes equals the declared body length, throwing <code>InvalidRecordException</code> on mismatch — a cheap structural integrity check independent of the batch CRC. A "partial" reader (<code>readPartiallyFrom</code> → <code>PartialDefaultRecord</code>) can skip key/value/header bytes when the caller only needs offsets/sizes (used by the log validator's <code>skipKeyValueIterator</code>) <span class="cite">DefaultRecord.java:362-420</span>.</p>
+<p><code>DefaultRecord.readFrom</code> reverses the layout <span class="cite">DefaultRecord.java:306-360</span>: read the body length, then attributes, then reconstruct <code>timestamp = baseTimestamp + timestampDelta</code> (overridden to <code>logAppendTime</code> if the batch is <code>LOG_APPEND_TIME</code>), <code>offset = baseOffset + offsetDelta</code>, and <code>sequence = incrementSequence(baseSequence, offsetDelta)</code> when a base sequence is present. After parsing it asserts the number of consumed bytes equals the declared body length, throwing <code>InvalidRecordException</code> on mismatch, a cheap structural integrity check independent of the batch CRC. A "partial" reader (<code>readPartiallyFrom</code> → <code>PartialDefaultRecord</code>) can skip key/value/header bytes when the caller only needs offsets/sizes (used by the log validator's <code>skipKeyValueIterator</code>) <span class="cite">DefaultRecord.java:362-420</span>.</p>
 
 <h2>Legacy formats (v0 / v1) and why v2 exists</h2>
 <p>Before v2, the unit was a flat <em>message</em> (<code>LegacyRecord</code>) prefixed by the 12-byte log overhead. The header constants are in <code>LegacyRecord</code> <span class="cite">LegacyRecord.java:45-74</span>.</p>
@@ -172,7 +172,7 @@
     <div class="bf" style="--w:4"><span class="bf-name">valueLength</span><span class="bf-meta">int32</span></div>
     <div class="bf" style="--w:6"><span class="bf-name">value</span><span class="bf-meta">bytes</span></div>
   </div>
-  <div class="bytemap-legend">v1 message shown. v0 omits the 8-byte <code>timestamp</code> field. Per-message CRC, magic and attributes (and timestamp in v1) repeat for every record — the overhead v2 amortizes. HEADER_SIZE_V0 = 6, HEADER_SIZE_V1 = 14.</div>
+  <div class="bytemap-legend">v1 message shown. v0 omits the 8-byte <code>timestamp</code> field. Per-message CRC, magic and attributes (and timestamp in v1) repeat for every record, the overhead v2 amortizes. HEADER_SIZE_V0 = 6, HEADER_SIZE_V1 = 14.</div>
   <figcaption>v0/v1 layout. RECORD_OVERHEAD_V0 = 14, RECORD_OVERHEAD_V1 = 22 (LegacyRecord.java:63-74)</figcaption>
   <div class="legend">
     <span class="lgi"><span class="sw"></span>message field (colours cycle to separate adjacent fields)</span>
@@ -182,11 +182,11 @@
     <span class="lgi"><span class="mono">v1 only</span> = field absent in v0</span>
   </div></figure>
 
-<p>The crucial structural difference: in v0/v1 an <strong>uncompressed</strong> message set is a sequence of standalone messages, one per offset; a <strong>compressed</strong> set is a single "wrapper" message whose value is itself a compressed message set of inner messages. <code>AbstractLegacyRecordBatch</code> models this duality by implementing both <code>RecordBatch</code> and <code>Record</code> — the wrapper is the batch, the inner messages are the records <span class="cite">AbstractLegacyRecordBatch.java:45-56</span>. Iterating a compressed v1 batch requires decompressing the whole wrapper to recover absolute offsets, since inner offsets were stored relative to the wrapper's last offset <span class="cite">AbstractLegacyRecordBatch.java:315-413</span>.</p>
+<p>The crucial structural difference: in v0/v1 an <strong>uncompressed</strong> message set is a sequence of standalone messages, one per offset; a <strong>compressed</strong> set is a single "wrapper" message whose value is itself a compressed message set of inner messages. <code>AbstractLegacyRecordBatch</code> models this duality by implementing both <code>RecordBatch</code> and <code>Record</code>, the wrapper is the batch, the inner messages are the records <span class="cite">AbstractLegacyRecordBatch.java:45-56</span>. Iterating a compressed v1 batch requires decompressing the whole wrapper to recover absolute offsets, since inner offsets were stored relative to the wrapper's last offset <span class="cite">AbstractLegacyRecordBatch.java:315-413</span>.</p>
 
 <p>Legacy weaknesses that v2 fixes:</p>
 <ul>
-<li><strong>Per-message CRC and absolute fields.</strong> Each v0/v1 message carries its own CRC, magic, attributes and full timestamp — large per-record overhead and a CRC that had to be recomputed whenever the broker re-assigned offsets. v2 amortizes one CRC and one timestamp/offset base across the batch.</li>
+<li><strong>Per-message CRC and absolute fields.</strong> Each v0/v1 message carries its own CRC, magic, attributes and full timestamp, large per-record overhead and a CRC that had to be recomputed whenever the broker re-assigned offsets. v2 amortizes one CRC and one timestamp/offset base across the batch.</li>
 <li><strong>No record headers.</strong> v0/v1 have no header support; appending a header to a sub-v2 builder throws <span class="cite">MemoryRecordsBuilder.java:468-469</span>.</li>
 <li><strong>No idempotence/transactions.</strong> There is nowhere to put a PID/epoch/sequence; legacy batches hard-code <code>NO_PRODUCER_ID</code>, <code>NO_SEQUENCE</code>, and <code>isTransactional() == false</code> <span class="cite">AbstractLegacyRecordBatch.java:174-217</span>.</li>
 <li><strong>No efficient count or leader epoch.</strong> <code>countOrNull()</code> returns <code>null</code> for v0/v1 (the count is unknown without deep iteration); <code>partitionLeaderEpoch()</code> is <code>−1</code> and cannot be set <span class="cite">AbstractLegacyRecordBatch.java:159-161, 210-212, 499-501</span>.</li>
@@ -208,7 +208,7 @@
 <tr><td>−1</td><td><code>UNKNOWN</code></td><td>Type the client does not recognize → ignored</td></tr>
 </tbody>
 </table></div>
-<p>Transaction markers are produced by the coordinator via <code>appendEndTxnMarker</code>, which requires a valid PID and the transactional flag <span class="cite">MemoryRecordsBuilder.java:618-625</span>. The marker's <em>value</em> is an <code>EndTransactionMarker</code> carrying the coordinator epoch, version-prefixed and serialized through the generated <code>EndTxnMarker</code> message <span class="cite">EndTransactionMarker.java:41-47, 82-103</span>. The KRaft control types (2–6) are appended by the corresponding <code>append…Message</code> helpers and are how the Raft log records leadership and membership changes — see <a href="10-kraft-consensus.html">KRaft Consensus</a> and <a href="11-kraft-controller.html">The KRaft Controller</a> <span class="cite">MemoryRecordsBuilder.java:627-668</span>.</p>
+<p>Transaction markers are produced by the coordinator via <code>appendEndTxnMarker</code>, which requires a valid PID and the transactional flag <span class="cite">MemoryRecordsBuilder.java:618-625</span>. The marker's <em>value</em> is an <code>EndTransactionMarker</code> carrying the coordinator epoch, version-prefixed and serialized through the generated <code>EndTxnMarker</code> message <span class="cite">EndTransactionMarker.java:41-47, 82-103</span>. The KRaft control types (2–6) are appended by the corresponding <code>append…Message</code> helpers and are how the Raft log records leadership and membership changes, see <a href="10-kraft-consensus.html">KRaft Consensus</a> and <a href="11-kraft-controller.html">The KRaft Controller</a> <span class="cite">MemoryRecordsBuilder.java:627-668</span>.</p>
 <div class="callout note"><span class="callout-title">Note</span><p>Control records are skipped by the log cleaner ("<em>control records are not considered for compaction</em>" <span class="cite">ControlRecordType.java:39</span>) and are filtered out before delivery to ordinary consumers. Ordinary clients may not write them: <code>LogValidator</code> rejects client-written control records <span class="cite">LogValidator.java:476</span>.</p></div>
 
 <h2>Compression</h2>
@@ -216,18 +216,18 @@
 <div class="table-wrap"><table>
 <thead><tr><th>id</th><th>name</th><th>library</th><th>level range (default)</th><th>decompression buffer</th></tr></thead>
 <tbody>
-<tr><td>0</td><td><code>none</code></td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>0</td><td><code>none</code></td><td>, </td><td>, </td><td>, </td></tr>
 <tr><td>1</td><td><code>gzip</code></td><td>JDK <code>Deflater</code></td><td><code>BEST_SPEED</code>…<code>BEST_COMPRESSION</code>, default <code>DEFAULT_COMPRESSION</code></td><td>16 KB</td></tr>
-<tr><td>2</td><td><code>snappy</code></td><td>xerial snappy (native)</td><td>—</td><td>—</td></tr>
-<tr><td>3</td><td><code>lz4</code></td><td>lz4-java</td><td>1…17 (default 9)</td><td>2 KB intermediate</td></tr>
-<tr><td>4</td><td><code>zstd</code></td><td>zstd-jni (native)</td><td>−131072…22 (default 3)</td><td>16 KB</td></tr>
+<tr><td>2</td><td><code>snappy</code></td><td><a href="https://github.com/xerial/snappy-java">xerial snappy</a> (native)</td><td>, </td><td>, </td></tr>
+<tr><td>3</td><td><code>lz4</code></td><td><a href="https://github.com/lz4/lz4-java">lz4-java</a></td><td>1…17 (default 9)</td><td>2 KB intermediate</td></tr>
+<tr><td>4</td><td><code>zstd</code></td><td><a href="https://github.com/luben/zstd-jni">zstd-jni</a> (native)</td><td>−131072…22 (default 3)</td><td>16 KB</td></tr>
 </tbody>
 </table></div>
 <p>Codec classes are loaded lazily so native libraries are only pulled in if the codec is actually used <span class="cite">CompressionType.java:66-70</span>. The <code>Compression</code> factory builds per-codec stream wrappers: <code>wrapForOutput(ByteBufferOutputStream, magic)</code> for the producer side and <code>wrapForInput(ByteBuffer, magic, BufferSupplier)</code> for readers <span class="cite">compress/Compression.java:43-56</span>. Decompression buffer sizes come from <code>decompressionOutputSize()</code> (gzip/zstd 16 KB <span class="cite">compress/GzipCompression.java:80-83</span> <span class="cite">compress/ZstdCompression.java:105-109</span>; LZ4 uses a 2 KB intermediate <span class="cite">compress/Lz4Compression.java:66-72</span>). Kafka's LZ4 uses the LZ4 <em>frame</em> format with magic <code>0x184D2204</code> <span class="cite">compress/Lz4BlockOutputStream.java:39</span>.</p>
 <div class="callout gotcha"><span class="callout-title">Gotcha</span><p>The <code>RecordBatch.streamingIterator</code> javadoc warns that for small batches the per-call cost is dominated by allocating the decompression buffer ("<em>64 KB for LZ4</em>"), which is why a reusable <code>BufferSupplier</code> matters <span class="cite">RecordBatch.java:234-240</span>. That 64 KB refers to the LZ4 block size; the <em>supplier-backed</em> intermediate buffer Kafka requests is 2 KB. Either way: reuse the supplier on hot read paths.</p></div>
 
 <h2>CRC-32C</h2>
-<p>v2 uses CRC-32C (Castagnoli polynomial) via the JDK's <code>java.util.zip.CRC32C</code>, wrapped by <code>Crc32C</code> <span class="cite">utils/internals/Crc32C.java:41-59</span> — on modern CPUs this maps to a hardware instruction. v0/v1 instead used plain CRC-32 (<code>java.util.zip.CRC32</code>) <span class="cite">LegacyRecord.java:508-512</span>. Validation: <code>ensureValid()</code> first checks the batch is at least <code>RECORD_BATCH_OVERHEAD</code> bytes, then compares stored vs. recomputed CRC, throwing <code>CorruptRecordException</code> otherwise <span class="cite">DefaultRecordBatch.java:151-159, 395-401</span>.</p>
+<p>v2 uses CRC-32C (Castagnoli polynomial) via the JDK's <code>java.util.zip.CRC32C</code>, wrapped by <code>Crc32C</code> <span class="cite">utils/internals/Crc32C.java:41-59</span>, on modern CPUs this maps to a hardware instruction. v0/v1 instead used plain CRC-32 (<code>java.util.zip.CRC32</code>) <span class="cite">LegacyRecord.java:508-512</span>. Validation: <code>ensureValid()</code> first checks the batch is at least <code>RECORD_BATCH_OVERHEAD</code> bytes, then compares stored vs. recomputed CRC, throwing <code>CorruptRecordException</code> otherwise <span class="cite">DefaultRecordBatch.java:151-159, 395-401</span>.</p>
 
 <h2>Architecture &amp; control/data flow</h2>
 <figure class="diagram"><div class="dflow">
@@ -255,7 +255,7 @@
     </div>
   </div>
 </div>
-<figcaption>End-to-end path of the record format: the write path (top) builds and validates a batch into a log segment, then the read path forks — full iteration for consumers vs. a zero-copy <code>writeTo</code> straight to the socket. The same bytes are reused; the broker rewrites only the header (offsets, leader epoch, CRC) when needed.</figcaption>
+<figcaption>End-to-end path of the record format: the write path (top) builds and validates a batch into a log segment, then the read path forks, full iteration for consumers vs. a zero-copy <code>writeTo</code> straight to the socket. The same bytes are reused; the broker rewrites only the header (offsets, leader epoch, CRC) when needed.</figcaption>
   <div class="legend">
     <span class="lgi"><span class="sw cat-client"></span>client / producer · consumer path</span>
     <span class="lgi"><span class="sw cat-broker"></span>broker machinery</span>
@@ -283,8 +283,8 @@
 
 <h2>Concurrency &amp; threading</h2>
 <ul>
-<li><strong>Batches are not thread-safe.</strong> <code>DefaultRecordBatch</code> wraps a single <code>ByteBuffer</code> and reads/writes it without locks. Header mutators — <code>setLastOffset</code>, <code>setPartitionLeaderEpoch</code>, <code>setMaxTimestamp</code> — assume single-threaded access (the broker append path is serialized per partition; see <a href="03-storage-log-engine.html">The Log Storage Engine</a>) <span class="cite">DefaultRecordBatch.java:366-393</span>.</li>
-<li><strong>Builder lifecycle.</strong> <code>MemoryRecordsBuilder</code> is owned by one thread at a time. On the producer it is created and appended-to by the application threads under the accumulator's per-batch synchronization, then <code>closeForRecordAppends()</code> is called (releasing potentially large compression buffers) when appends stop but before the header is finalized — important because there can be a gap before the batch is drained and sent <span class="cite">MemoryRecordsBuilder.java:45-47, 332-342</span>. After close, only header fields may change; attempting to set producer state on a closed builder throws, to avoid introducing duplicates on retry <span class="cite">MemoryRecordsBuilder.java:308-320</span>. See <a href="16-producer-client.html">The Producer Client</a>.</li>
+<li><strong>Batches are not thread-safe.</strong> <code>DefaultRecordBatch</code> wraps a single <code>ByteBuffer</code> and reads/writes it without locks. Header mutators, <code>setLastOffset</code>, <code>setPartitionLeaderEpoch</code>, <code>setMaxTimestamp</code>, assume single-threaded access (the broker append path is serialized per partition; see <a href="03-storage-log-engine.html">The Log Storage Engine</a>) <span class="cite">DefaultRecordBatch.java:366-393</span>.</li>
+<li><strong>Builder lifecycle.</strong> <code>MemoryRecordsBuilder</code> is owned by one thread at a time. On the producer it is created and appended-to by the application threads under the accumulator's per-batch synchronization, then <code>closeForRecordAppends()</code> is called (releasing potentially large compression buffers) when appends stop but before the header is finalized, important because there can be a gap before the batch is drained and sent <span class="cite">MemoryRecordsBuilder.java:45-47, 332-342</span>. After close, only header fields may change; attempting to set producer state on a closed builder throws, to avoid introducing duplicates on retry <span class="cite">MemoryRecordsBuilder.java:308-320</span>. See <a href="16-producer-client.html">The Producer Client</a>.</li>
 <li><strong>Iterator buffers.</strong> Decompressing iterators allocate intermediate buffers; the <code>BufferSupplier</code> passed to <code>streamingIterator</code>/<code>skipKeyValueIterator</code> is per-thread (a <code>BufferSupplier</code> is not thread-safe) and reused across batches on the broker's fetch/validation paths to avoid repeated 16 KB/2 KB allocations <span class="cite">DefaultRecordBatch.java:279-364</span>.</li>
 <li><strong>Iterator must be closed.</strong> Compressed iterators hold a decompression stream; the plain <code>iterator()</code> eagerly drains the whole batch into a list precisely because it cannot guarantee the caller will close the stream, whereas <code>streamingIterator</code> defers decompression but obliges the caller to close <span class="cite">DefaultRecordBatch.java:320-364</span>.</li>
 </ul>
@@ -301,7 +301,7 @@
 <tr><td><code>compression.zstd.level</code></td><td><code>3</code></td><td>zstd level −131072…22. <span class="cite">ProducerConfig.java:258; CompressionType.java:99-130</span></td></tr>
 </tbody>
 </table></div>
-<p>Idempotence/transaction header fields are not direct format knobs; they are populated from the producer's PID/epoch and per-partition sequence (<code>enable.idempotence</code>, <code>transactional.id</code>) — see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>.</p>
+<p>Idempotence/transaction header fields are not direct format knobs; they are populated from the producer's PID/epoch and per-partition sequence (<code>enable.idempotence</code>, <code>transactional.id</code>), see <a href="14-transactions-eos.html">Transactions &amp; Exactly-Once Semantics</a>.</p>
 
 <h2>Failure modes, edge cases &amp; recovery</h2>
 <ul>
@@ -310,27 +310,27 @@
 <li><strong>Empty batches after compaction.</strong> The cleaner may retain a header-only batch (recordsCount 0) to preserve the producer's first/last sequence so state can be rebuilt after a leader failover; such a batch persists until the producer writes a new sequence or its PID expires <span class="cite">DefaultRecordBatch.java:73-85</span>. A zero-count batch iterates as empty <span class="cite">DefaultRecordBatch.java:320-323</span>.</li>
 <li><strong>Timestamp semantics under compaction.</strong> <code>baseTimestamp</code> is the first record's timestamp in most cases, <code>−1</code> for an empty batch, or the delete horizon when bit 6 is set. For <code>LOG_APPEND_TIME</code>, <code>maxTimestamp</code> is broker-stamped and survives compaction; an empty batch retains its prior <code>maxTimestamp</code> <span class="cite">DefaultRecordBatch.java:87-95</span>.</li>
 <li><strong>Sequence wraparound.</strong> Sequence numbers are 32-bit and wrap; <code>incrementSequence</code>/<code>decrementSequence</code> implement modular arithmetic around <code>Integer.MAX_VALUE</code> so <code>lastSequence</code> stays correct across the wrap boundary <span class="cite">DefaultRecordBatch.java:558-568</span>.</li>
-<li><strong>Legacy edge cases.</strong> Decoding a compressed v1 wrapper rejects null inner values, inner compression, mismatched magic, and a wrapper offset less than the last inner offset (unless it is 0, tolerated for some librdkafka versions) <span class="cite">AbstractLegacyRecordBatch.java:330-388</span>.</li>
+<li><strong>Legacy edge cases.</strong> Decoding a compressed v1 wrapper rejects null inner values, inner compression, mismatched magic, and a wrapper offset less than the last inner offset (unless it is 0, tolerated for some <a href="https://github.com/confluentinc/librdkafka">librdkafka</a> versions) <span class="cite">AbstractLegacyRecordBatch.java:330-388</span>.</li>
 </ul>
 
 <h2>Invariants &amp; guarantees</h2>
-<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>First/last offsets and sequences are immutable under compaction.</strong> v2 preserves <code>baseOffset</code>, <code>lastOffsetDelta</code>, <code>baseSequence</code> and the derived last sequence even when inner records are removed, so a broker can rebuild producer state from the log and the next expected sequence stays in sync — preventing spurious <code>OutOfOrderSequence</code> errors after failover <span class="cite">DefaultRecordBatch.java:73-80</span>.</p></div>
+<div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>First/last offsets and sequences are immutable under compaction.</strong> v2 preserves <code>baseOffset</code>, <code>lastOffsetDelta</code>, <code>baseSequence</code> and the derived last sequence even when inner records are removed, so a broker can rebuild producer state from the log and the next expected sequence stays in sync, preventing spurious <code>OutOfOrderSequence</code> errors after failover <span class="cite">DefaultRecordBatch.java:73-80</span>.</p></div>
 <div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>The CRC excludes the partition leader epoch.</strong> The broker can write <code>partitionLeaderEpoch</code> into a received batch without recomputing the checksum, because bytes 12–15 lie outside the CRC region <span class="cite">DefaultRecordBatch.java:386-388, 399-401</span>.</p></div>
 <div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Offsets are strictly increasing within a batch.</strong> The builder enforces monotonicity at append time <span class="cite">MemoryRecordsBuilder.java:461-463</span>, and the log validator re-verifies the batch's reported offset range and count on the broker <span class="cite">LogValidator.java:451-469</span>.</p></div>
 <div class="callout invariant"><span class="callout-title">Invariant</span><p><strong>Self-describing magic.</strong> Every batch begins with <code>(offset, size)</code> then a magic byte at a format-independent position (<code>MAGIC_OFFSET = 16</code> <span class="cite">Records.java:51-53</span>), so a reader can always determine the format before interpreting the rest.</p></div>
 
 <h2>Interactions with other subsystems</h2>
 <ul>
-<li><a href="03-storage-log-engine.html">The Log Storage Engine</a> &amp; <a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a> — segments are sequences of these batches on disk; the cleaner manipulates batch headers (delete horizon, retained empty batches) directly.</li>
-<li><a href="08-replication.html">Replication, ISR &amp; High Watermark</a> &amp; <a href="09-fetch-path.html">The Fetch Path</a> — followers fetch and append the identical bytes; the leader stamps <code>partitionLeaderEpoch</code> into each batch.</li>
-<li><a href="14-transactions-eos.html">Transactions &amp; Exactly-Once</a> — PID/epoch/sequence header fields and the <code>ABORT</code>/<code>COMMIT</code> control records are the on-disk substrate of EOS.</li>
-<li><a href="10-kraft-consensus.html">KRaft Consensus</a> / <a href="11-kraft-controller.html">The KRaft Controller</a> — the metadata log is the same batch format; <code>LEADER_CHANGE</code>, <code>SNAPSHOT_*</code>, <code>KRAFT_VERSION</code>, <code>KRAFT_VOTERS</code> control records drive the quorum.</li>
-<li><a href="16-producer-client.html">Producer</a> / <a href="17-consumer-client.html">Consumer</a> — the producer's accumulator builds batches with <code>MemoryRecordsBuilder</code>; the consumer decodes them with the iterators here.</li>
-<li><a href="05-tiered-storage.html">Tiered Storage</a> — remote segments store the same format (see <code>RemoteLogInputStream</code>).</li>
+<li><a href="03-storage-log-engine.html">The Log Storage Engine</a> &amp; <a href="04-storage-management.html">Log Management, Retention &amp; Compaction</a>, segments are sequences of these batches on disk; the cleaner manipulates batch headers (delete horizon, retained empty batches) directly.</li>
+<li><a href="08-replication.html">Replication, ISR &amp; High Watermark</a> &amp; <a href="09-fetch-path.html">The Fetch Path</a>, followers fetch and append the identical bytes; the leader stamps <code>partitionLeaderEpoch</code> into each batch.</li>
+<li><a href="14-transactions-eos.html">Transactions &amp; Exactly-Once</a>, PID/epoch/sequence header fields and the <code>ABORT</code>/<code>COMMIT</code> control records are the on-disk substrate of EOS.</li>
+<li><a href="10-kraft-consensus.html">KRaft Consensus</a> / <a href="11-kraft-controller.html">The KRaft Controller</a>, the metadata log is the same batch format; <code>LEADER_CHANGE</code>, <code>SNAPSHOT_*</code>, <code>KRAFT_VERSION</code>, <code>KRAFT_VOTERS</code> control records drive the quorum.</li>
+<li><a href="16-producer-client.html">Producer</a> / <a href="17-consumer-client.html">Consumer</a>, the producer's accumulator builds batches with <code>MemoryRecordsBuilder</code>; the consumer decodes them with the iterators here.</li>
+<li><a href="05-tiered-storage.html">Tiered Storage</a>, remote segments store the same format (see <code>RemoteLogInputStream</code>).</li>
 </ul>
 
 <h2>Design rationale &amp; evolution</h2>
-<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The v2 batch was introduced by <span class="pill kip">KIP-98</span> (exactly-once / idempotent producer), which needed a place for the PID, producer epoch and base sequence, and by the message-format overhaul that delta-encodes offsets/timestamps and moves the CRC to a per-batch, leader-epoch-excluding position. Record headers came with <span class="pill kip">KIP-82</span>. The delete-horizon attribute bit (so the cleaner can reason about when tombstones/markers expire) is <span class="pill kip">KIP-534</span>. CRC-32C replaced CRC-32 to exploit hardware checksum instructions. The lazy <code>FileChannelRecordBatch</code> and zero-copy <code>RecordsSend</code> exist so the broker never has to deserialize record bodies just to route bytes — the bytes a producer writes are the bytes a consumer reads.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>The v2 batch was introduced by <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging">KIP-98</a></span> (exactly-once / idempotent producer), which needed a place for the PID, producer epoch and base sequence, and by the message-format overhaul that delta-encodes offsets/timestamps and moves the CRC to a per-batch, leader-epoch-excluding position. Record headers came with <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-82+-+Add+Record+Headers">KIP-82</a></span>. The delete-horizon attribute bit (so the cleaner can reason about when tombstones/markers expire) is <span class="pill kip">KIP-534</span>. CRC-32C replaced CRC-32 to exploit hardware checksum instructions. The lazy <code>FileChannelRecordBatch</code> and zero-copy <code>RecordsSend</code> exist so the broker never has to deserialize record bodies just to route bytes, the bytes a producer writes are the bytes a consumer reads.</p></div>
 <p>The trajectory has been toward <em>doing less per record on the broker</em>: amortize integrity and metadata across a batch, keep the header parseable without decompression, and never re-encode payloads in the steady state. v0/v1 remain only as a compatibility/read path.</p>
 
 <h2>Gotchas / operational notes</h2>
@@ -341,7 +341,7 @@
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>

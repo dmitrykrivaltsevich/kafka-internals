@@ -39,7 +39,7 @@ ${fragment}
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>
@@ -62,12 +62,12 @@ function indexPage() {
           <span class="pill">3 parts · ${Object.keys(META).length} chapters</span>
         </div>
       </div>
-      <p class="lead">New here? Start with the <a href="00-overview.html">Architecture Overview</a>. Operating a cluster? Jump to <a href="op00-operator-model.html">Part II — Operations</a>. Designing a system? See <a href="bp00-log-pattern.html">Part III — The Log as a Blueprint</a>.</p>
+      <p class="lead">New here? Start with the <a href="00-overview.html">Architecture Overview</a>. Operating a cluster? Jump to <a href="op00-operator-model.html">Part II, Operations</a>. Designing a system? See <a href="bp00-log-pattern.html">Part III, The Log as a Blueprint</a>.</p>
 `;
   const blurb = {
-    "I": "How Kafka actually works inside — from the on-disk byte layout of a record batch up to the KRaft controller quorum, the coordinators, and the client runtimes.",
+    "I": "How Kafka actually works inside, from the on-disk byte layout of a record batch up to the KRaft controller quorum, the coordinators, and the client runtimes.",
     "II": "How to run it: limits, tuning, capacity & partition sizing, failure runbooks, the signals to watch, cost, and what changes at 1M / 10M / 100M events per second.",
-    "III": "Kafka as one implementation of the distributed-log pattern — when to choose it, its inherent tradeoffs, the reusable engineering tactics, and the design space."
+    "III": "Kafka as one implementation of the distributed-log pattern, when to choose it, its inherent tradeoffs, the reusable engineering tactics, and the design space."
   };
   for (const part of PARTS) {
     body += `      <div class="part-head"><h2>${esc(part.title)}</h2><p>${esc(blurb[part.id] || "")}</p></div>\n`;
@@ -76,7 +76,7 @@ function indexPage() {
       for (const slug of g.items) {
         const m = META[slug];
         if (!m) continue;
-        const num = m.num === "—" ? "REF" : m.num;
+        const num = m.num === ", " ? "REF" : m.num;
         body += `        <a class="card" href="${slug}.html"><div class="card-num">${esc(num)}</div><div class="card-title">${esc(m.title)}</div><div class="card-desc">${esc(m.desc)}</div></a>\n`;
       }
       body += `      </div>\n`;

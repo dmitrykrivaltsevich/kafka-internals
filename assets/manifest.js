@@ -3,7 +3,7 @@
    Node build (module.exports). Keep app.js and build.js free of page lists. */
 (function () {
   var PAGES = {
-    // ---- Part I — Architecture Internals ----
+    // ---- Part I, Architecture Internals ----
     "00-overview":             { num: "00", title: "Architecture Overview",            desc: "The distributed commit log, broker & cluster anatomy, and the end-to-end data path." },
     "01-record-format":        { num: "01", title: "Record Format & Batches",          desc: "The v2 record batch on disk and on the wire: varints, headers, CRC, control records, compression." },
     "02-wire-protocol":        { num: "02", title: "Wire Protocol & RPC",              desc: "Request/response framing, ApiKeys, the schema generator, flexible versions, tagged fields." },
@@ -26,33 +26,33 @@
     "19-quotas":               { num: "19", title: "Quotas & Throttling",              desc: "ClientQuotaManager, token buckets, quota entities, throttle responses, client metrics (KIP-714)." },
     "20-kafka-streams":        { num: "20", title: "Kafka Streams",                    desc: "Topologies, tasks, StreamThread, state stores & changelogs, the partition assignor, EOS." },
     "21-kafka-connect":        { num: "21", title: "Kafka Connect",                    desc: "Workers, connectors & tasks, the distributed herder, backing stores, MirrorMaker 2." },
-    "glossary":                { num: "—",  title: "Glossary & Concepts",              desc: "Cross-cutting terminology and a quick reference of Kafka's core abstractions." },
+    "glossary":                { num: ", ",  title: "Glossary & Concepts",              desc: "Cross-cutting terminology and a quick reference of Kafka's core abstractions." },
 
-    // ---- Part II — Operations Manual ----
+    // ---- Part II, Operations Manual ----
     "op00-operator-model":     { num: "II·00", title: "The Operator's Mental Model",   desc: "What you run in KRaft, what fails independently, the control loops, and the SLIs/SLOs of a healthy cluster." },
-    "op01-configuration":      { num: "II·01", title: "Configuration: The Tuning Surface", desc: "Static vs dynamic vs per-topic configs, precedence, and the knobs that actually matter — with interactions." },
+    "op01-configuration":      { num: "II·01", title: "Configuration: The Tuning Surface", desc: "Static vs dynamic vs per-topic configs, precedence, and the knobs that actually matter, with interactions." },
     "op02-limits":             { num: "II·02", title: "Limits & Boundaries",           desc: "Hard, soft, and emergent limits: partitions, request/message size, the 1 GiB/s-per-topic question, FDs, 2 GB ceilings." },
     "op03-partitioning":       { num: "II·03", title: "Partitioning Strategy",         desc: "How many partitions, per-partition ceilings, the real cost of partitions, when to reshard, the repartitioning trap." },
     "op04-capacity-planning":  { num: "II·04", title: "Capacity Planning & Sizing",    desc: "The throughput, disk, memory, and network formulas; replication amplification; estimating broker count." },
     "op05-performance-tuning": { num: "II·05", title: "Performance Tuning",            desc: "Producer/consumer/broker knobs, the end-to-end latency budget, page cache and zero-copy; throughput ⇄ latency." },
     "op06-durability":         { num: "II·06", title: "Durability, Availability & Consistency", desc: "acks, min.insync.replicas, RF, unclean election, the replication-not-fsync philosophy, ELR." },
-    "op07-failure-modes":      { num: "II·07", title: "Failure Modes & The Runbook",   desc: "URP, offline partitions, disk/quorum failure, ISR thrash, rebalance storms, hanging txns — cause→symptom→fix." },
+    "op07-failure-modes":      { num: "II·07", title: "Failure Modes & The Runbook",   desc: "URP, offline partitions, disk/quorum failure, ISR thrash, rebalance storms, hanging txns, cause→symptom→fix." },
     "op08-metrics-signals":    { num: "II·08", title: "Metrics, Signals & Observability", desc: "The golden signals, where each is emitted in source, alert thresholds, and a dashboard blueprint." },
     "op09-topologies":         { num: "II·09", title: "Topologies & Deployment",       desc: "Rack/multi-AZ, dedicated vs combined KRaft, multi-region replication, tiered-storage topology, tenancy." },
     "op10-cost":               { num: "II·10", title: "Cost Engineering",              desc: "Storage/network/cross-AZ cost drivers and the levers: compression, fetch-from-follower, tiered storage, RF." },
     "op11-scaling-scenarios":  { num: "II·11", title: "Scaling: 1M → 10M → 100M / sec",desc: "Worked capacity tiers, the bottleneck that emerges at each, what to watch, and where Kafka's limits bind." },
     "op12-lifecycle":          { num: "II·12", title: "Lifecycle Operations",          desc: "Rolling upgrades & metadata.version, reassignment & throttling, add/remove brokers, disaster recovery." },
-    "op13-multitenancy":       { num: "II·13", title: "Multitenancy & Isolation",      desc: "What is shared vs isolated in a broker, and how different tenants raise each other's latency & error rates — the noisy-neighbour problem." },
-    "op14-proactive-monitoring": { num: "II·14", title: "Proactive Monitoring: Leading Indicators", desc: "The leading indicators, trends and capacity-runway metrics that warn you a cluster will suffer — with lead time — before the lagging alerts fire. Includes client-team-side signals." },
+    "op13-multitenancy":       { num: "II·13", title: "Multitenancy & Isolation",      desc: "What is shared vs isolated in a broker, and how different tenants raise each other's latency & error rates, the noisy-neighbour problem." },
+    "op14-proactive-monitoring": { num: "II·14", title: "Proactive Monitoring: Leading Indicators", desc: "The leading indicators, trends and capacity-runway metrics that warn you a cluster will suffer, with lead time, before the lagging alerts fire. Includes client-team-side signals." },
 
-    // ---- Part III — The Log as a Blueprint ----
-    "bp00-log-pattern":        { num: "III·00", title: "The Distributed Log as a Pattern", desc: "The pattern abstracted from Kafka — its invariants and the universal problems a replicated log solves." },
-    "bp01-when-to-use":        { num: "III·01", title: "When to Use the Log — and When Not To", desc: "A decision framework: the forces for and against, and the anti-patterns (log-as-DB / -as-RPC / -as-queue)." },
+    // ---- Part III, The Log as a Blueprint ----
+    "bp00-log-pattern":        { num: "III·00", title: "The Distributed Log as a Pattern", desc: "The pattern abstracted from Kafka, its invariants and the universal problems a replicated log solves." },
+    "bp01-when-to-use":        { num: "III·01", title: "When to Use the Log, and When Not To", desc: "A decision framework: the forces for and against, and the anti-patterns (log-as-DB / -as-RPC / -as-queue)." },
     "bp02-design-decisions":   { num: "III·02", title: "Design Decisions & Alternatives", desc: "Each Kafka choice as a tradeoff: pull vs push, ISR vs quorum (and why both), page cache vs managed memory, segments vs LSM." },
-    "bp03-inherent-limits":    { num: "III·03", title: "Inherent Limitations",         desc: "Where the pattern structurally falls short — ordering, the partition ceiling, no per-message routing/TTL, the latency floor." },
+    "bp03-inherent-limits":    { num: "III·03", title: "Inherent Limitations",         desc: "Where the pattern structurally falls short, ordering, the partition ceiling, no per-message routing/TTL, the latency floor." },
     "bp04-tactics-toolkit":    { num: "III·04", title: "The Tactics Toolkit",          desc: "Reusable engineering tactics generalized: mechanical sympathy, epoch fencing, everything-is-a-log, timing wheels, MVCC timelines." },
-    "bp05-evolution":          { num: "III·05", title: "Evolution as Case Studies",    desc: "ZooKeeper→KRaft, the message format, EOS, rebalancing, tiered storage, queues — lessons in evolving a distributed system." },
-    "bp06-comparative":        { num: "III·06", title: "Comparative Architecture",     desc: "Kafka vs Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and diskless designs — what each tradeoff teaches." },
+    "bp05-evolution":          { num: "III·05", title: "Evolution as Case Studies",    desc: "ZooKeeper→KRaft, the message format, EOS, rebalancing, tiered storage, queues, lessons in evolving a distributed system." },
+    "bp06-comparative":        { num: "III·06", title: "Comparative Architecture",     desc: "Kafka vs Pulsar, Redpanda, Kinesis, Pub/Sub, RabbitMQ, and diskless designs, what each tradeoff teaches." },
     "bp07-architect-cheatsheet": { num: "III·07", title: "The Architect's Cheat Sheet", desc: "Consolidated design dials, decision trees, and heuristics for choosing and tuning a log-based architecture." }
   };
 

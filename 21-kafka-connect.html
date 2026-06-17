@@ -24,21 +24,21 @@
 
 <blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
 
-<p class="lead">Kafka Connect is a framework for streaming data between Apache Kafka and external systems without writing bespoke producers and consumers. It defines a small plugin SPI — <code>SourceConnector</code>/<code>SinkConnector</code> plus <code>SourceTask</code>/<code>SinkTask</code> — where a <em>connector</em> splits a job into <em>task configs</em> and <em>tasks</em> perform the actual IO. A <strong>Worker</strong> JVM instantiates these plugins and runs each task in its own thread, wrapping it with a producer (source) or consumer (sink), a <em>converter</em> for serialization, and a chain of <em>Single Message Transforms</em> (SMTs). In distributed mode a <strong>DistributedHerder</strong> forms a cluster of workers over Kafka's group-membership protocol, balances connectors and tasks with the <em>incremental cooperative</em> assignor, and keeps three internal compacted topics — config, offsets, and status — as the source of truth. This chapter reconstructs Connect's class collaboration, data structures, algorithms, threading model and failure handling directly from the runtime code.</p>
+<p class="lead">Kafka Connect is a framework for streaming data between Apache Kafka and external systems without writing bespoke producers and consumers. It defines a small plugin SPI, <code>SourceConnector</code>/<code>SinkConnector</code> plus <code>SourceTask</code>/<code>SinkTask</code>, where a <em>connector</em> splits a job into <em>task configs</em> and <em>tasks</em> perform the actual IO. A <strong>Worker</strong> JVM instantiates these plugins and runs each task in its own thread, wrapping it with a producer (source) or consumer (sink), a <em>converter</em> for serialization, and a chain of <em>Single Message Transforms</em> (SMTs). In distributed mode a <strong>DistributedHerder</strong> forms a cluster of workers over Kafka's group-membership protocol, balances connectors and tasks with the <em>incremental cooperative</em> assignor, and keeps three internal compacted topics, config, offsets, and status, as the source of truth. This chapter reconstructs Connect's class collaboration, data structures, algorithms, threading model and failure handling directly from the runtime code.</p>
 
 <h2>Role &amp; responsibilities</h2>
 
 <p>Connect exists to make data integration a matter of configuration rather than code. A user POSTs a connector config to a REST endpoint; the framework instantiates the connector class, asks it to enumerate the work as a list of task configurations, distributes those tasks across a cluster of worker processes, and runs each task in a managed loop that handles serialization, transformation, offset commit, error tolerance, retries, metrics and lifecycle. The responsibilities decompose cleanly:</p>
 
 <ul>
-  <li><strong>Connector plugins</strong> (<code>SourceConnector</code>, <code>SinkConnector</code>) — own no data flow. They divide a job into at most <code>maxTasks</code> task configs via <code>taskConfigs(int)</code>, and monitor the external system for changes that require reconfiguration, notifying the runtime through a <code>ConnectorContext</code> handed to the connector via <code>initialize()</code> (<code>connect/api/src/main/java/org/apache/kafka/connect/connector/Connector.java:40</code>, <code>:56</code>).</li>
-  <li><strong>Task plugins</strong> (<code>SourceTask</code>, <code>SinkTask</code>) — do the IO. A source task <code>poll()</code>s records from upstream; a sink task receives records via <code>put(Collection)</code> and is asked to <code>flush()</code>/<code>preCommit()</code> them downstream.</li>
-  <li><strong>Worker</strong> — the per-JVM container. It instantiates connectors and tasks, manages their class loaders, builds the Kafka clients, owns thread pools, and exposes start/stop primitives. <code>connect/runtime/.../runtime/Worker.java:140</code>.</li>
-  <li><strong>Herder</strong> — the control plane. It owns the desired-state model (which connectors exist, their configs, target states), validates configs, serves the REST API, and decides what each worker should run. <code>StandaloneHerder</code> keeps this in memory; <code>DistributedHerder</code> coordinates a cluster.</li>
-  <li><strong>Backing stores</strong> — durable state. In distributed mode, config, source offsets and status each live in a dedicated compacted Kafka topic.</li>
+  <li><strong>Connector plugins</strong> (<code>SourceConnector</code>, <code>SinkConnector</code>), own no data flow. They divide a job into at most <code>maxTasks</code> task configs via <code>taskConfigs(int)</code>, and monitor the external system for changes that require reconfiguration, notifying the runtime through a <code>ConnectorContext</code> handed to the connector via <code>initialize()</code> (<code>connect/api/src/main/java/org/apache/kafka/connect/connector/Connector.java:40</code>, <code>:56</code>).</li>
+  <li><strong>Task plugins</strong> (<code>SourceTask</code>, <code>SinkTask</code>), do the IO. A source task <code>poll()</code>s records from upstream; a sink task receives records via <code>put(Collection)</code> and is asked to <code>flush()</code>/<code>preCommit()</code> them downstream.</li>
+  <li><strong>Worker</strong>, the per-JVM container. It instantiates connectors and tasks, manages their class loaders, builds the Kafka clients, owns thread pools, and exposes start/stop primitives. <code>connect/runtime/.../runtime/Worker.java:140</code>.</li>
+  <li><strong>Herder</strong>, the control plane. It owns the desired-state model (which connectors exist, their configs, target states), validates configs, serves the REST API, and decides what each worker should run. <code>StandaloneHerder</code> keeps this in memory; <code>DistributedHerder</code> coordinates a cluster.</li>
+  <li><strong>Backing stores</strong>, durable state. In distributed mode, config, source offsets and status each live in a dedicated compacted Kafka topic.</li>
 </ul>
 
-<div class="callout key"><span class="callout-title">Key idea</span><p>The split between <em>connector</em> (plans the work, single instance) and <em>task</em> (does the work, parallel instances) is the central abstraction. A connector is cheap and mostly idle; tasks are where throughput and parallelism live. <code>tasks.max</code> bounds the parallelism, and the connector chooses how to partition work — e.g. tables across tasks, or topic-partitions round-robin (MirrorMaker does the latter at <code>connect/mirror/.../MirrorSourceConnector.java:212</code>).</p></div>
+<div class="callout key"><span class="callout-title">Key idea</span><p>The split between <em>connector</em> (plans the work, single instance) and <em>task</em> (does the work, parallel instances) is the central abstraction. A connector is cheap and mostly idle; tasks are where throughput and parallelism live. <code>tasks.max</code> bounds the parallelism, and the connector chooses how to partition work, e.g. tables across tasks, or topic-partitions round-robin (MirrorMaker does the latter at <code>connect/mirror/.../MirrorSourceConnector.java:212</code>).</p></div>
 
 <h2>Where it lives in the code</h2>
 
@@ -85,7 +85,7 @@
 
 <h3>SourceTask contract</h3>
 
-<p><code>poll()</code> returns a <code>List&lt;SourceRecord&gt;</code> or blocks; it must periodically return (possibly <code>null</code>) so the framework can pause or stop the task (<code>SourceTask.java:105</code>). <code>commit()</code> and <code>commitRecord(record, metadata)</code> are optional callbacks invoked after the framework has durably recorded offsets — useful for connectors that also track positions in the upstream system. <code>stop()</code> may be called from a different thread and only needs to signal <code>poll()</code> to unblock (<code>SourceTask.java:122</code>). Exactly-once introduces the <code>transaction.boundary</code> config with values <code>POLL</code> (default), <code>INTERVAL</code>, or <code>CONNECTOR</code> (<code>SourceTask.java:36</code>).</p>
+<p><code>poll()</code> returns a <code>List&lt;SourceRecord&gt;</code> or blocks; it must periodically return (possibly <code>null</code>) so the framework can pause or stop the task (<code>SourceTask.java:105</code>). <code>commit()</code> and <code>commitRecord(record, metadata)</code> are optional callbacks invoked after the framework has durably recorded offsets, useful for connectors that also track positions in the upstream system. <code>stop()</code> may be called from a different thread and only needs to signal <code>poll()</code> to unblock (<code>SourceTask.java:122</code>). Exactly-once introduces the <code>transaction.boundary</code> config with values <code>POLL</code> (default), <code>INTERVAL</code>, or <code>CONNECTOR</code> (<code>SourceTask.java:36</code>).</p>
 
 <h3>SinkTask contract</h3>
 
@@ -95,13 +95,13 @@
 
 <h3>Converters and transforms</h3>
 
-<p>A <code>Converter</code> implements <code>fromConnectData(topic, headers, schema, value) → byte[]</code> and <code>toConnectData(topic, headers, byte[]) → SchemaAndValue</code> (<code>Converter.java:73</code>, <code>:97</code>). Key and value use independent converters, so a connector can, e.g., emit a string key and a schema-bearing JSON value. A <code>Transformation.apply(record)</code> returns a (possibly new) record or <code>null</code> to <em>drop</em> it; it must be immutable-friendly and thread-safe (<code>Transformation.java:55</code>). A <code>TransformationStage</code> wraps one transform with an optional predicate and a <code>negate</code> flag — the transform runs only when <code>negate ^ predicate.test(record)</code> is true (<code>TransformationStage.java:90</code>). Stages are composed left-to-right into a <code>TransformationChain</code> that the worker applies in the pipeline.</p>
+<p>A <code>Converter</code> implements <code>fromConnectData(topic, headers, schema, value) → byte[]</code> and <code>toConnectData(topic, headers, byte[]) → SchemaAndValue</code> (<code>Converter.java:73</code>, <code>:97</code>). Key and value use independent converters, so a connector can, e.g., emit a string key and a schema-bearing JSON value. A <code>Transformation.apply(record)</code> returns a (possibly new) record or <code>null</code> to <em>drop</em> it; it must be immutable-friendly and thread-safe (<code>Transformation.java:55</code>). A <code>TransformationStage</code> wraps one transform with an optional predicate and a <code>negate</code> flag, the transform runs only when <code>negate ^ predicate.test(record)</code> is true (<code>TransformationStage.java:90</code>). Stages are composed left-to-right into a <code>TransformationChain</code> that the worker applies in the pipeline.</p>
 
 <h2>Data structures</h2>
 
 <h3>SourceRecord and the source-offset model</h3>
 
-<p>A <code>SourceRecord</code> extends <code>ConnectRecord</code> (topic, kafkaPartition, key+schema, value+schema, timestamp, headers) and adds two opaque maps: <code>sourcePartition</code> and <code>sourceOffset</code> (<code>SourceRecord.java:45</code>). These are connector-defined — e.g. <code>{db,table}</code> → <code>{rowTimestamp}</code>. The framework persists <code>sourcePartition → sourceOffset</code> so that, after a crash, the task can resume by reading its last committed offset through the <code>OffsetStorageReader</code> available on its <code>SourceTaskContext</code> (<code>SourceTaskContext.java:41</code>).</p>
+<p>A <code>SourceRecord</code> extends <code>ConnectRecord</code> (topic, kafkaPartition, key+schema, value+schema, timestamp, headers) and adds two opaque maps: <code>sourcePartition</code> and <code>sourceOffset</code> (<code>SourceRecord.java:45</code>). These are connector-defined, e.g. <code>{db,table}</code> → <code>{rowTimestamp}</code>. The framework persists <code>sourcePartition → sourceOffset</code> so that, after a crash, the task can resume by reading its last committed offset through the <code>OffsetStorageReader</code> available on its <code>SourceTaskContext</code> (<code>SourceTaskContext.java:41</code>).</p>
 
 <h3>Internal compacted topics (distributed mode)</h3>
 
@@ -131,20 +131,20 @@
 </tbody>
 </table></div>
 
-<div class="callout key"><span class="callout-title">Key idea — the commit marker</span><p>Connect deliberately does <em>not</em> use Kafka transactions for the config topic. To update a connector's tasks atomically it writes each <code>task-foo-N</code> record, then a single <code>commit-foo</code> with the task count. Readers <strong>buffer</strong> task config records and only apply the whole batch when the commit marker arrives and the buffered task-id set is complete (<code>KafkaConfigBackingStore.java:1107</code>). This prevents a half-written reconfiguration from causing two workers to double-assign the same partitions. Because the topic is compacted, an incomplete set after compaction marks the connector <em>inconsistent</em> rather than applying garbage (<code>KafkaConfigBackingStore.java:1113</code>).</p></div>
+<div class="callout key"><span class="callout-title">Key idea, the commit marker</span><p>Connect deliberately does <em>not</em> use Kafka transactions for the config topic. To update a connector's tasks atomically it writes each <code>task-foo-N</code> record, then a single <code>commit-foo</code> with the task count. Readers <strong>buffer</strong> task config records and only apply the whole batch when the commit marker arrives and the buffered task-id set is complete (<code>KafkaConfigBackingStore.java:1107</code>). This prevents a half-written reconfiguration from causing two workers to double-assign the same partitions. Because the topic is compacted, an incomplete set after compaction marks the connector <em>inconsistent</em> rather than applying garbage (<code>KafkaConfigBackingStore.java:1113</code>).</p></div>
 
 <h3>ConnectProtocol wire format</h3>
 
 <p>Workers join the group with a <em>subscription</em> carrying their state, and the leader replies with an <em>assignment</em>. The V0 (eager) layout (<code>ConnectProtocol.java:114</code>, <code>:170</code>):</p>
 
 <figure class="diagram">
-  <p class="bytemap-title"><strong>Subscription V0</strong> — worker → coordinator on JoinGroup</p>
+  <p class="bytemap-title"><strong>Subscription V0</strong>, worker → coordinator on JoinGroup</p>
   <div class="bytemap">
     <div class="bf" style="--w:2"><span class="bf-name">Version</span><span class="bf-meta">int16</span></div>
     <div class="bf" style="--w:6"><span class="bf-name">Url</span><span class="bf-meta">string · this worker's REST URL</span></div>
     <div class="bf" style="--w:8"><span class="bf-name">ConfigOffset</span><span class="bf-meta">int64 · furthest config-topic offset read</span></div>
   </div>
-  <p class="bytemap-title"><strong>Assignment V0</strong> — leader → each worker on SyncGroup</p>
+  <p class="bytemap-title"><strong>Assignment V0</strong>, leader → each worker on SyncGroup</p>
   <div class="bytemap">
     <div class="bf" style="--w:2"><span class="bf-name">Version</span><span class="bf-meta">int16</span></div>
     <div class="bf" style="--w:2"><span class="bf-name">Error</span><span class="bf-meta">int16 · 0 NO_ERROR, 1 CONFIG_MISMATCH</span></div>
@@ -163,14 +163,14 @@
   </div>
 </figure>
 
-<p>The sentinel task id <code>-1</code> (<code>ConnectProtocol.CONNECTOR_TASK</code>) is how the leader tells a worker to run a connector <em>instance</em> as opposed to a task (<code>ConnectProtocol.java:55</code>, <code>:229</code>). V1/V2 (<code>IncrementalCooperativeConnectProtocol</code>) add a <code>revoked</code> list and a <code>delay</code> field to support cooperative rebalancing; V2 ("sessioned") is schematically identical to V1 and does not embed the session key in the wire format — it merely signifies that internal-request verification and session-key distribution (via the config topic) are enabled (<code>IncrementalCooperativeConnectProtocol.java:73</code>–<code>82</code>).</p>
+<p>The sentinel task id <code>-1</code> (<code>ConnectProtocol.CONNECTOR_TASK</code>) is how the leader tells a worker to run a connector <em>instance</em> as opposed to a task (<code>ConnectProtocol.java:55</code>, <code>:229</code>). V1/V2 (<code>IncrementalCooperativeConnectProtocol</code>) add a <code>revoked</code> list and a <code>delay</code> field to support cooperative rebalancing; V2 ("sessioned") is schematically identical to V1 and does not embed the session key in the wire format, it merely signifies that internal-request verification and session-key distribution (via the config topic) are enabled (<code>IncrementalCooperativeConnectProtocol.java:73</code>–<code>82</code>).</p>
 
 <h2>Architecture &amp; control / data flow</h2>
 
 <figure class="diagram"><div class="dflow">
   <div class="node cat-client"><span class="nt">user / kafka-connect CLI</span></div>
   <div class="conn" data-label="HTTP"></div>
-  <div class="node cat-client"><span class="nt">ConnectorsResource — REST API (Jersey)</span><span class="nd">POST /connectors · PUT /config · /status · /offsets</span></div>
+  <div class="node cat-client"><span class="nt">ConnectorsResource, REST API (Jersey)</span><span class="nd">POST /connectors · PUT /config · /status · /offsets</span></div>
   <div class="conn" data-label="callbacks queued onto tick thread"></div>
   <div class="node cat-broker"><span class="nt">DistributedHerder</span><span class="nd">single tick thread: reconcile · leader writes · start/stop</span></div>
   <div class="row">
@@ -189,7 +189,7 @@
       <div class="node cat-storage store"><span class="nt">status.storage.topic</span></div>
     </div>
   </div>
-  <div class="sep">— Worker JVM (one of N in a cluster) —</div>
+  <div class="sep">, Worker JVM (one of N in a cluster), </div>
   <div class="conn" data-label="start / stop"></div>
   <div class="node cat-broker"><span class="nt">Worker</span><span class="nd">cached thread pool, one per task</span></div>
   <div class="row">
@@ -225,7 +225,7 @@
 <figure class="diagram"><div class="dflow">
   <div class="node cat-broker"><span class="nt">SourceTask.poll()</span><span class="nd">&rArr; List&lt;SourceRecord&gt;</span></div>
   <div class="conn"></div>
-  <div class="node cat-broker decision">transformationChain.apply() — filtered?</div>
+  <div class="node cat-broker decision">transformationChain.apply(), filtered?</div>
   <div class="row">
     <div class="col">
       <div class="conn ec-err" data-label="yes (dropped)"></div>
@@ -254,7 +254,7 @@
       </div>
     </div>
   </div>
-  <div class="sep">— SourceTaskOffsetCommitter · every offset.flush.interval.ms (asynchronous) —</div>
+  <div class="sep">, SourceTaskOffsetCommitter · every offset.flush.interval.ms (asynchronous), </div>
   <div class="node cat-coord"><span class="nt">committableOffsets()</span><span class="nd">&rArr; fully-acked prefixes only</span></div>
   <div class="conn"></div>
   <div class="node cat-broker"><span class="nt">offsetWriter.offset(…)</span><span class="nd">· beginFlush() · doFlush()</span></div>
@@ -277,7 +277,7 @@
 
 <p><code>Worker.startConnector()</code> resolves the connector's class loader, instantiates the connector, builds a <code>SinkConnectorConfig</code> or <code>SourceConnectorConfig</code>, wires up the per-connector offset store (source only), wraps everything in a <code>WorkerConnector</code>, registers it in the <code>connectors</code> map, and submits it to the shared <code>ExecutorService</code> (<code>Worker.java:300</code>). <code>connectorTaskConfigs()</code> later calls <code>connector.taskConfigs(maxTasks)</code> under the connector's class loader, stamps each map with <code>TaskConfig.TASK_CLASS_CONFIG</code>, copies the <code>topics</code>/<code>topics.regex</code> through for sinks, and (since the <code>tasks.max.enforce</code> default is <code>true</code>) throws <code>TooManyTasksException</code> if the connector returns more configs than allowed (<code>Worker.java:412</code>, <code>:438</code>).</p>
 
-<p><code>Worker.startTask()</code> is where a task becomes a thread. It instantiates the <code>Task</code> implementation, resolves key/value/header converters (preferring connector-supplied converters, falling back to worker defaults — <code>Worker.java:703</code>), then uses a <code>TaskBuilder</code> to assemble a <code>WorkerSinkTask</code>, <code>WorkerSourceTask</code> or <code>ExactlyOnceWorkerSourceTask</code> and submits it (<code>Worker.java:726</code>, <code>:748</code>):</p>
+<p><code>Worker.startTask()</code> is where a task becomes a thread. It instantiates the <code>Task</code> implementation, resolves key/value/header converters (preferring connector-supplied converters, falling back to worker defaults, <code>Worker.java:703</code>), then uses a <code>TaskBuilder</code> to assemble a <code>WorkerSinkTask</code>, <code>WorkerSourceTask</code> or <code>ExactlyOnceWorkerSourceTask</code> and submits it (<code>Worker.java:726</code>, <code>:748</code>):</p>
 
 <ul>
   <li><strong>SinkTaskBuilder</strong> creates a <code>KafkaConsumer</code> with <code>client.id = connector-consumer-&lt;taskId&gt;</code> and group id derived from the connector, then the sink task subscribes to <code>topics</code> or <code>topics.regex</code> (<code>Worker.java:1914</code>; <code>WorkerSinkTask.java:324</code>).</li>
@@ -288,7 +288,7 @@
 
 <h3>Source loop, in-flight tracking and offset commit</h3>
 
-<p><code>AbstractWorkerSourceTask.execute()</code> loops while not stopping: handle pause, <code>poll()</code> the task, then <code>sendRecords()</code> (<code>AbstractWorkerSourceTask.java:346</code>). For each polled record it applies the SMT chain, converts to a <code>ProducerRecord</code>, optionally creates the destination topic, and calls <code>producer.send</code> with a callback. Offset durability relies on <code>SubmittedRecords</code>: <code>submit()</code> records each in-flight record in a per-source-partition FIFO deque, and <code>committableOffsets()</code> returns, for each source partition, the offset of the <em>longest fully-acknowledged prefix</em> — so a stalled record never lets a later record's offset be committed prematurely (<code>WorkerSourceTask.java:141</code>, <code>:337</code>).</p>
+<p><code>AbstractWorkerSourceTask.execute()</code> loops while not stopping: handle pause, <code>poll()</code> the task, then <code>sendRecords()</code> (<code>AbstractWorkerSourceTask.java:346</code>). For each polled record it applies the SMT chain, converts to a <code>ProducerRecord</code>, optionally creates the destination topic, and calls <code>producer.send</code> with a callback. Offset durability relies on <code>SubmittedRecords</code>: <code>submit()</code> records each in-flight record in a per-source-partition FIFO deque, and <code>committableOffsets()</code> returns, for each source partition, the offset of the <em>longest fully-acknowledged prefix</em>, so a stalled record never lets a later record's offset be committed prematurely (<code>WorkerSourceTask.java:141</code>, <code>:337</code>).</p>
 
 <p>Because source tasks don't drive a poll loop with predictable wakeups, a dedicated <code>SourceTaskOffsetCommitter</code> single-thread scheduler calls <code>commitOffsets()</code> every <code>offset.flush.interval.ms</code> (default 60 000 ms) for each source task (<code>SourceTaskOffsetCommitter.java:77</code>). <code>commitOffsets()</code> pushes the committable offsets into the <code>OffsetStorageWriter</code>, calls <code>beginFlush()</code> then <code>doFlush()</code> with an <code>offset.flush.timeout.ms</code> budget (default 5 000 ms), and on success calls the task's <code>commit()</code> hook (<code>WorkerSourceTask.java:218</code>). The scheduler is extremely careful to swallow exceptions, because an uncaught throwable in a <code>scheduleWithFixedDelay</code> task silently halts that task's schedule forever (<code>SourceTaskOffsetCommitter.java:115</code>).</p>
 
@@ -296,22 +296,22 @@
 
 <h3>Sink loop, rebalance and offset commit</h3>
 
-<p><code>WorkerSinkTask.execute()</code> runs <code>iteration()</code> until stopping (<code>WorkerSinkTask.java:219</code>). Each iteration: (1) maybe commit offsets if the interval elapsed or a commit was requested; (2) check for a timed-out commit; (3) <code>poll(timeoutMs)</code> the consumer. <code>poll()</code> first <code>rewind()</code>s any seek requested by the task, fetches a batch, runs <code>convertMessages()</code> (key/value/header convert + SMT chain, building <code>SinkRecord</code>s; dropped records advance the offset but are not delivered — <code>WorkerSinkTask.java:525</code>), then <code>deliverMessages()</code> calls <code>task.put(batch)</code> (<code>WorkerSinkTask.java:622</code>).</p>
+<p><code>WorkerSinkTask.execute()</code> runs <code>iteration()</code> until stopping (<code>WorkerSinkTask.java:219</code>). Each iteration: (1) maybe commit offsets if the interval elapsed or a commit was requested; (2) check for a timed-out commit; (3) <code>poll(timeoutMs)</code> the consumer. <code>poll()</code> first <code>rewind()</code>s any seek requested by the task, fetches a batch, runs <code>convertMessages()</code> (key/value/header convert + SMT chain, building <code>SinkRecord</code>s; dropped records advance the offset but are not delivered, <code>WorkerSinkTask.java:525</code>), then <code>deliverMessages()</code> calls <code>task.put(batch)</code> (<code>WorkerSinkTask.java:622</code>).</p>
 
 <p>Offset commit (<code>commitOffsets()</code>, <code>WorkerSinkTask.java:417</code>) calls <code>task.preCommit(currentOffsets)</code>; if the task returns offsets it commits them via the consumer (sync when closing, async otherwise). Because async commits can complete out of order, each commit carries a monotonically increasing <code>commitSeqno</code> and <code>onCommitCompleted()</code> ignores stale callbacks (<code>WorkerSinkTask.java:288</code>). Consumer-group rebalances are handled by an inner <code>HandleRebalance</code> listener: on <code>onPartitionsRevoked</code> it commits offsets and calls <code>task.close()</code>; on <code>onPartitionsAssigned</code> it primes per-partition offsets and calls <code>task.open()</code> (<code>WorkerSinkTask.java:732</code>). A <code>RetriableException</code> from <code>put()</code> pauses all partitions ("pausedForRedelivery") so the same batch can be retried without fetching new data (<code>WorkerSinkTask.java:646</code>).</p>
 
-<div class="callout note"><span class="callout-title">Note</span><p>Sink tasks join an ordinary Kafka consumer group and commit to <code>__consumer_offsets</code> — there is no per-sink offset store. This is why sink connectors reuse the entire <a href="13-group-coordination.html">group coordination</a> machinery and inherit the same delivery semantics as a regular consumer (offset committed after <code>put</code>/<code>flush</code> ⇒ at-least-once).</p></div>
+<div class="callout note"><span class="callout-title">Note</span><p>Sink tasks join an ordinary Kafka consumer group and commit to <code>__consumer_offsets</code>, there is no per-sink offset store. This is why sink connectors reuse the entire <a href="13-group-coordination.html">group coordination</a> machinery and inherit the same delivery semantics as a regular consumer (offset committed after <code>put</code>/<code>flush</code> ⇒ at-least-once).</p></div>
 
 <h3>Connector lifecycle state machine</h3>
 
-<p>A <code>WorkerConnector</code> wraps the connector with a small state machine — <code>INIT</code>, <code>STARTED</code>, <code>PAUSED</code>, <code>STOPPED</code>, <code>FAILED</code> (<code>WorkerConnector.java:60</code>). Like tasks, it runs on the shared executor and reconciles its actual state toward the herder-requested <code>TargetState</code> in <code>doTransitionTo()</code> (<code>WorkerConnector.java:378</code>). The <code>STOPPED</code> target is special: transitioning there fully shuts the connector/task down and releases its Kafka clients and SMTs; the worker treats a task whose target became <code>STOPPED</code> as a shutdown request and will not resume it without a restart (<code>WorkerTask.java:208</code>, <code>:338</code>).</p>
+<p>A <code>WorkerConnector</code> wraps the connector with a small state machine, <code>INIT</code>, <code>STARTED</code>, <code>PAUSED</code>, <code>STOPPED</code>, <code>FAILED</code> (<code>WorkerConnector.java:60</code>). Like tasks, it runs on the shared executor and reconciles its actual state toward the herder-requested <code>TargetState</code> in <code>doTransitionTo()</code> (<code>WorkerConnector.java:378</code>). The <code>STOPPED</code> target is special: transitioning there fully shuts the connector/task down and releases its Kafka clients and SMTs; the worker treats a task whose target became <code>STOPPED</code> as a shutdown request and will not resume it without a restart (<code>WorkerTask.java:208</code>, <code>:338</code>).</p>
 
 <h3>Distributed coordination: the herder tick loop</h3>
 
 <p>The <code>DistributedHerder</code> "uses a single thread for most of its processing… config changes, task rebalances and serving requests" (class doc, <code>DistributedHerder.java:145</code>). That thread runs <code>tick()</code> in a loop (<code>DistributedHerder.java:409</code>):</p>
 
 <ol>
-  <li>If a previous attempt failed to read the config log to the end, retry first (<code>readConfigToEnd</code>) — joining and immediately leaving would be impolite to the group.</li>
+  <li>If a previous attempt failed to read the config log to the end, retry first (<code>readConfigToEnd</code>), joining and immediately leaving would be impolite to the group.</li>
   <li><code>member.ensureActive()</code> drives JoinGroup/SyncGroup; <code>handleRebalanceCompleted()</code> finishes any pending assignment.</li>
   <li>If leader and the session key is due for rotation, generate and write a new <code>SessionKey</code> to the config topic.</li>
   <li>Drain queued external requests (REST callbacks) whose scheduled time has arrived, then process restart requests.</li>
@@ -323,11 +323,11 @@
 
 <h3>Leadership, config writes and request forwarding</h3>
 
-<p>The group's leader (chosen by the assignor, surfaced in the assignment) is the <em>only</em> writer permitted to mutate the config topic for important records — connector configs, session keys, task-count records. On becoming leader it calls <code>configBackingStore.claimWritePrivileges()</code> (<code>DistributedHerder.java:2677</code>); a non-leader worker that receives a config-change REST request <strong>forwards</strong> it to the leader's URL via the internal REST client (using the leader URL carried in the assignment). This is the single-writer discipline that <code>KafkaConfigBackingStore</code> assumes (<code>KafkaConfigBackingStore.java:181</code>). Internal REST calls are HMAC-signed with the rotating session key when the protocol is <code>sessioned</code> (V2), per <span class="pill kip">KIP-507</span> (<code>DistributedHerder.java:354</code>).</p>
+<p>The group's leader (chosen by the assignor, surfaced in the assignment) is the <em>only</em> writer permitted to mutate the config topic for important records, connector configs, session keys, task-count records. On becoming leader it calls <code>configBackingStore.claimWritePrivileges()</code> (<code>DistributedHerder.java:2677</code>); a non-leader worker that receives a config-change REST request <strong>forwards</strong> it to the leader's URL via the internal REST client (using the leader URL carried in the assignment). This is the single-writer discipline that <code>KafkaConfigBackingStore</code> assumes (<code>KafkaConfigBackingStore.java:181</code>). Internal REST calls are HMAC-signed with the rotating session key when the protocol is <code>sessioned</code> (V2), per <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-507:+Securing+Internal+Connect+REST+Endpoints">KIP-507</a></span> (<code>DistributedHerder.java:354</code>).</p>
 
-<h3>Incremental cooperative assignment (KIP-415)</h3>
+<h3>Incremental cooperative assignment (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-415:+Incremental+Cooperative+Rebalancing+in+Kafka+Connect">KIP-415</a>)</h3>
 
-<p>The default assignor is <code>IncrementalCooperativeAssignor</code> (<span class="pill kip">KIP-415</span>, cited at <code>IncrementalCooperativeAssignor.java:58</code>). Unlike the legacy <code>EagerAssignor</code> — which revokes <em>everything</em> from every worker on each rebalance (stop-the-world) — the cooperative assignor computes a minimal delta so that connectors/tasks that stay on the same worker are never interrupted. The leader's <code>performTaskAssignment()</code> works in terms of set algebra over snapshots (<code>IncrementalCooperativeAssignor.java:197</code>):</p>
+<p>The default assignor is <code>IncrementalCooperativeAssignor</code> (<span class="pill kip">KIP-415</span>, cited at <code>IncrementalCooperativeAssignor.java:58</code>). Unlike the legacy <code>EagerAssignor</code>, which revokes <em>everything</em> from every worker on each rebalance (stop-the-world), the cooperative assignor computes a minimal delta so that connectors/tasks that stay on the same worker are never interrupted. The leader's <code>performTaskAssignment()</code> works in terms of set algebra over snapshots (<code>IncrementalCooperativeAssignor.java:197</code>):</p>
 
 <div class="table-wrap"><table>
 <thead><tr><th>Derived set</th><th>Definition</th><th>Action</th></tr></thead>
@@ -341,13 +341,13 @@
 </tbody>
 </table></div>
 
-<p>New and lost-then-reclaimed work is spread by <code>assignConnectors()</code>/<code>assignTasks()</code>, which sort workers by current load and hand each item to the least-loaded worker (a load-balancing round robin — <code>IncrementalCooperativeAssignor.java:771</code>, <code>:801</code>). When the cluster is imbalanced, <code>performLoadBalancingRevocations()</code> revokes a few items from overloaded workers so a later round can rebalance them; an exponential backoff (<code>consecutiveRevokingRebalancesBackoff</code>) prevents thrashing across successive revoking rounds (<code>IncrementalCooperativeAssignor.java:298</code>).</p>
+<p>New and lost-then-reclaimed work is spread by <code>assignConnectors()</code>/<code>assignTasks()</code>, which sort workers by current load and hand each item to the least-loaded worker (a load-balancing round robin, <code>IncrementalCooperativeAssignor.java:771</code>, <code>:801</code>). When the cluster is imbalanced, <code>performLoadBalancingRevocations()</code> revokes a few items from overloaded workers so a later round can rebalance them; an exponential backoff (<code>consecutiveRevokingRebalancesBackoff</code>) prevents thrashing across successive revoking rounds (<code>IncrementalCooperativeAssignor.java:298</code>).</p>
 
-<div class="callout key"><span class="callout-title">Key idea — scheduled rebalance delay</span><p>When a worker leaves, its tasks become <code>lost</code>. Rather than immediately reshuffling them (only to reshuffle again seconds later when the worker rejoins after a transient blip or a rolling restart), the leader defers reassignment by up to <code>scheduled.rebalance.max.delay.ms</code> (default <strong>300 000 ms</strong>). It remembers the departed worker as a <em>candidate</em>; if that worker rejoins within the delay, its work is simply returned to it. Only when the delay expires are the lost tasks reassigned to the remaining workers (<code>IncrementalCooperativeAssignor.java:439</code>, <code>:470</code>). The per-worker delay is carried back in the assignment's <code>Delay</code> field so members know to schedule a follow-up rebalance.</p></div>
+<div class="callout key"><span class="callout-title">Key idea, scheduled rebalance delay</span><p>When a worker leaves, its tasks become <code>lost</code>. Rather than immediately reshuffling them (only to reshuffle again seconds later when the worker rejoins after a transient blip or a rolling restart), the leader defers reassignment by up to <code>scheduled.rebalance.max.delay.ms</code> (default <strong>300 000 ms</strong>). It remembers the departed worker as a <em>candidate</em>; if that worker rejoins within the delay, its work is simply returned to it. Only when the delay expires are the lost tasks reassigned to the remaining workers (<code>IncrementalCooperativeAssignor.java:439</code>, <code>:470</code>). The per-worker delay is carried back in the assignment's <code>Delay</code> field so members know to schedule a follow-up rebalance.</p></div>
 
 <h3>Status propagation</h3>
 
-<p>Task and connector state changes flow through the <code>TaskStatus.Listener</code>/<code>ConnectorStatus.Listener</code> interfaces (which <code>AbstractHerder</code> implements) into <code>KafkaStatusBackingStore</code>, which writes to the status topic; the new state only becomes visible to readers (and the REST API) after it is read back from the topic (<code>KafkaStatusBackingStore.java:70</code>). To reduce the window where a stale worker overwrites a newer status, <code>putSafe()</code> only writes when there is no prior value, the prior value came from the same <code>workerId</code>, or the current generation is higher; each cache entry also carries a sequence number so retried sends from an out-of-date generation are dropped (<code>KafkaStatusBackingStore.java:75</code>, <code>:293</code>). A <code>DESTROYED</code> status serializes to a <code>null</code> value — a compaction tombstone.</p>
+<p>Task and connector state changes flow through the <code>TaskStatus.Listener</code>/<code>ConnectorStatus.Listener</code> interfaces (which <code>AbstractHerder</code> implements) into <code>KafkaStatusBackingStore</code>, which writes to the status topic; the new state only becomes visible to readers (and the REST API) after it is read back from the topic (<code>KafkaStatusBackingStore.java:70</code>). To reduce the window where a stale worker overwrites a newer status, <code>putSafe()</code> only writes when there is no prior value, the prior value came from the same <code>workerId</code>, or the current generation is higher; each cache entry also carries a sequence number so retried sends from an out-of-date generation are dropped (<code>KafkaStatusBackingStore.java:75</code>, <code>:293</code>). A <code>DESTROYED</code> status serializes to a <code>null</code> value, a compaction tombstone.</p>
 
 <h2>Concurrency &amp; threading</h2>
 
@@ -372,8 +372,8 @@
 <div class="table-wrap"><table>
 <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
 <tbody>
-<tr><td><code>name</code></td><td>—</td><td>connector name; primary key (<code>ConnectorConfig.java:81</code>)</td></tr>
-<tr><td><code>connector.class</code></td><td>—</td><td>connector implementation class (<code>ConnectorConfig.java:85</code>)</td></tr>
+<tr><td><code>name</code></td><td>, </td><td>connector name; primary key (<code>ConnectorConfig.java:81</code>)</td></tr>
+<tr><td><code>connector.class</code></td><td>, </td><td>connector implementation class (<code>ConnectorConfig.java:85</code>)</td></tr>
 <tr><td><code>tasks.max</code></td><td><code>1</code></td><td>upper bound on task configs the connector may generate (<code>ConnectorConfig.java:137</code>)</td></tr>
 <tr><td><code>tasks.max.enforce</code></td><td><code>true</code></td><td>if true, exceeding <code>tasks.max</code> fails the connector instead of warning (<code>ConnectorConfig.java:144</code>)</td></tr>
 <tr><td><code>key.converter</code> / <code>value.converter</code></td><td>worker default</td><td>serialization for key/value; connector override falls back to worker config (<code>Worker.java:703</code>)</td></tr>
@@ -383,10 +383,10 @@
 <tr><td><code>offset.flush.interval.ms</code></td><td><code>60000</code></td><td>source offset flush period; also the sink offset-commit period (<code>WorkerConfig.java:116</code>)</td></tr>
 <tr><td><code>offset.flush.timeout.ms</code></td><td><code>5000</code></td><td>budget for a source offset flush before it's abandoned (<code>WorkerConfig.java:121</code>)</td></tr>
 <tr><td><code>task.shutdown.graceful.timeout.ms</code></td><td><code>5000</code></td><td>how long the worker waits for tasks to stop cleanly (<code>WorkerConfig.java:109</code>)</td></tr>
-<tr><td><code>group.id</code></td><td>—</td><td>distributed cluster identity (group membership)</td></tr>
-<tr><td><code>config.storage.topic</code></td><td>—</td><td>config topic; created with 1 partition, compacted (<code>DistributedConfig.java:156</code>)</td></tr>
-<tr><td><code>offset.storage.topic</code> / <code>.partitions</code></td><td>— / <code>25</code></td><td>source offsets topic; compacted (<code>DistributedConfig.java:138</code>, <code>:144</code>)</td></tr>
-<tr><td><code>status.storage.topic</code> / <code>.partitions</code></td><td>— / <code>5</code></td><td>status topic; compacted (<code>DistributedConfig.java:168</code>, <code>:174</code>)</td></tr>
+<tr><td><code>group.id</code></td><td>, </td><td>distributed cluster identity (group membership)</td></tr>
+<tr><td><code>config.storage.topic</code></td><td>, </td><td>config topic; created with 1 partition, compacted (<code>DistributedConfig.java:156</code>)</td></tr>
+<tr><td><code>offset.storage.topic</code> / <code>.partitions</code></td><td>, / <code>25</code></td><td>source offsets topic; compacted (<code>DistributedConfig.java:138</code>, <code>:144</code>)</td></tr>
+<tr><td><code>status.storage.topic</code> / <code>.partitions</code></td><td>, / <code>5</code></td><td>status topic; compacted (<code>DistributedConfig.java:168</code>, <code>:174</code>)</td></tr>
 <tr><td><code>connect.protocol</code></td><td><code>sessioned</code></td><td>group protocol: <code>eager</code> / <code>compatible</code> / <code>sessioned</code> (<code>DistributedConfig.java:186</code>)</td></tr>
 <tr><td><code>scheduled.rebalance.max.delay.ms</code></td><td><code>300000</code></td><td>how long lost tasks wait before reassignment (<code>DistributedConfig.java:193</code>)</td></tr>
 <tr><td><code>inter.worker.key.ttl.ms</code></td><td><code>3600000</code></td><td>session-key rotation period for signed internal requests (<code>DistributedConfig.java:211</code>)</td></tr>
@@ -394,26 +394,26 @@
 </tbody>
 </table></div>
 
-<h2>Exactly-once source (KIP-618)</h2>
+<h2>Exactly-once source (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-618:+Exactly-Once+Support+for+Source+Connectors">KIP-618</a>)</h2>
 
-<p>When <code>exactly.once.source.support</code> is enabled, the worker builds an <code>ExactlyOnceSourceTaskBuilder</code> and runs an <code>ExactlyOnceWorkerSourceTask</code> (<code>Worker.java:2003</code>; <code>DistributedHerder.java:2016</code>). It differs from the plain source task in two ways. First, records and their source offsets are written in the <em>same producer transaction</em>: the offsets store for an EOS task writes into the same topic via the same transactional producer, so a transaction atomically commits both the data and the offset (the <code>ConnectorOffsetBackingStore</code> participates in the producer transaction). Transaction boundaries follow the connector's <code>transaction.boundary</code> setting — per <code>POLL</code> batch (default), on a time <code>INTERVAL</code>, or driven by the connector via a <code>TransactionContext</code> (<code>ExactlyOnceWorkerSourceTask.java:124</code>; <code>SourceTask.java:41</code>).</p>
+<p>When <code>exactly.once.source.support</code> is enabled, the worker builds an <code>ExactlyOnceSourceTaskBuilder</code> and runs an <code>ExactlyOnceWorkerSourceTask</code> (<code>Worker.java:2003</code>; <code>DistributedHerder.java:2016</code>). It differs from the plain source task in two ways. First, records and their source offsets are written in the <em>same producer transaction</em>: the offsets store for an EOS task writes into the same topic via the same transactional producer, so a transaction atomically commits both the data and the offset (the <code>ConnectorOffsetBackingStore</code> participates in the producer transaction). Transaction boundaries follow the connector's <code>transaction.boundary</code> setting, per <code>POLL</code> batch (default), on a time <code>INTERVAL</code>, or driven by the connector via a <code>TransactionContext</code> (<code>ExactlyOnceWorkerSourceTask.java:124</code>; <code>SourceTask.java:41</code>).</p>
 
 <p>Second, <strong>zombie fencing</strong>: before a new generation of source tasks starts, the leader writes a <code>tasks-fencing-&lt;connector&gt;</code> (task-count) record and the worker fences out any older transactional producers using the connector's admin principal, via <code>Worker.fenceZombies()</code> (<code>Worker.java:764</code>). The task-start path runs <code>fenceZombieSourceTasks()</code> as a pre-producer check and verifies its own generation/ownership as a post-producer check (<code>DistributedHerder.java:2026</code>). This guarantees a crashed-but-still-producing old task cannot keep appending after a new one takes over.</p>
 
-<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Kafka clients and Streams had exactly-once for years, but Connect source connectors lacked it until Kafka 3.3. <span class="pill kip">KIP-618</span> added the atomic record+offset write plus producer fencing of zombie tasks. The requirement it imposes on connectors — each source partition owned by at most one task, and resumable from committed offsets — is exactly what <code>SubmittedRecords</code> and the per-task offset store already model, so EOS reuses the same offset machinery with a transactional producer bolted on. (Sink-side exactly-once is a separate concern handled by the consumer + idempotent/transactional writes in the sink system.)</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Kafka clients and Streams had exactly-once for years, but Connect source connectors lacked it until Kafka 3.3. <span class="pill kip">KIP-618</span> added the atomic record+offset write plus producer fencing of zombie tasks. The requirement it imposes on connectors, each source partition owned by at most one task, and resumable from committed offsets, is exactly what <code>SubmittedRecords</code> and the per-task offset store already model, so EOS reuses the same offset machinery with a transactional producer bolted on. (Sink-side exactly-once is a separate concern handled by the consumer + idempotent/transactional writes in the sink system.)</p></div>
 
 <h2>Failure modes, edge cases &amp; recovery</h2>
 
 <ul>
-  <li><strong>Task throws a non-retriable exception</strong> — <code>WorkerTask.doRun()</code> sets <code>failed=true</code>, fires <code>onFailure()</code>, and the task stays <code>FAILED</code> until manually restarted via the REST API. The connector keeps running and other tasks are unaffected (<code>WorkerTask.java:244</code>).</li>
-  <li><strong>Source producer send fails, tolerance=none</strong> — the failure is stashed in <code>producerSendException</code> and re-thrown on the next poll/send, killing the task without committing the failed offset (<code>WorkerSourceTask.java:344</code>). With <code>errors.tolerance=all</code> the record is dropped (and routed to a DLQ if configured) and its offset is committed so the task proceeds.</li>
-  <li><strong>Sink put() throws RetriableException</strong> — the batch is retried after pausing all partitions; the consumer keeps polling (to stay in the group and honor timeouts) but fetches no new data until delivery succeeds (<code>WorkerSinkTask.java:646</code>).</li>
-  <li><strong>Offset flush times out (source)</strong> — the flush is cancelled and recorded as a failure; the writer retains the offsets and retries on the next interval with the latest offsets (<code>WorkerSourceTask.java:319</code>).</li>
-  <li><strong>Config topic half-write + compaction</strong> — a connector with an incomplete buffered task-config set is marked <em>inconsistent</em> in <code>ClusterConfigState</code>; the herder will not start its tasks until the connector regenerates a complete set (<code>KafkaConfigBackingStore.java:1108</code>).</li>
-  <li><strong>Leader fenced from config topic</strong> — if a zombie leader caused a fence, the real leader reclaims write privileges at the top of the next tick; a demoted leader simply relinquishes them (<code>DistributedHerder.java:440</code>).</li>
-  <li><strong>Worker falls behind on configs</strong> — the assignor computes assignments at the max config offset seen; lagging workers receive an assignment tagged with that offset and refuse to act on it until they catch up (<code>IncrementalCooperativeAssignor.java:111</code>; <code>DistributedHerder.java:1826</code> forces a rebalance on offset mismatch).</li>
-  <li><strong>Worker crash / network partition</strong> — its tasks are <code>lost</code>; reassignment is deferred up to <code>scheduled.rebalance.max.delay.ms</code> so a transient outage or rolling restart doesn't trigger an avoidable global reshuffle.</li>
-  <li><strong>Slow task shutdown</strong> — the worker can <code>cancel()</code> a task, which proactively closes its producer/offset reader (to unblock a hung <code>send</code> or read) and suppresses any further status updates so a late-dying orphan cannot clobber the state of its replacement (<code>WorkerTask.java:160</code>; <code>AbstractWorkerSourceTask.java:293</code>).</li>
+  <li><strong>Task throws a non-retriable exception</strong>, <code>WorkerTask.doRun()</code> sets <code>failed=true</code>, fires <code>onFailure()</code>, and the task stays <code>FAILED</code> until manually restarted via the REST API. The connector keeps running and other tasks are unaffected (<code>WorkerTask.java:244</code>).</li>
+  <li><strong>Source producer send fails, tolerance=none</strong>, the failure is stashed in <code>producerSendException</code> and re-thrown on the next poll/send, killing the task without committing the failed offset (<code>WorkerSourceTask.java:344</code>). With <code>errors.tolerance=all</code> the record is dropped (and routed to a DLQ if configured) and its offset is committed so the task proceeds.</li>
+  <li><strong>Sink put() throws RetriableException</strong>, the batch is retried after pausing all partitions; the consumer keeps polling (to stay in the group and honor timeouts) but fetches no new data until delivery succeeds (<code>WorkerSinkTask.java:646</code>).</li>
+  <li><strong>Offset flush times out (source)</strong>, the flush is cancelled and recorded as a failure; the writer retains the offsets and retries on the next interval with the latest offsets (<code>WorkerSourceTask.java:319</code>).</li>
+  <li><strong>Config topic half-write + compaction</strong>, a connector with an incomplete buffered task-config set is marked <em>inconsistent</em> in <code>ClusterConfigState</code>; the herder will not start its tasks until the connector regenerates a complete set (<code>KafkaConfigBackingStore.java:1108</code>).</li>
+  <li><strong>Leader fenced from config topic</strong>, if a zombie leader caused a fence, the real leader reclaims write privileges at the top of the next tick; a demoted leader simply relinquishes them (<code>DistributedHerder.java:440</code>).</li>
+  <li><strong>Worker falls behind on configs</strong>, the assignor computes assignments at the max config offset seen; lagging workers receive an assignment tagged with that offset and refuse to act on it until they catch up (<code>IncrementalCooperativeAssignor.java:111</code>; <code>DistributedHerder.java:1826</code> forces a rebalance on offset mismatch).</li>
+  <li><strong>Worker crash / network partition</strong>, its tasks are <code>lost</code>; reassignment is deferred up to <code>scheduled.rebalance.max.delay.ms</code> so a transient outage or rolling restart doesn't trigger an avoidable global reshuffle.</li>
+  <li><strong>Slow task shutdown</strong>, the worker can <code>cancel()</code> a task, which proactively closes its producer/offset reader (to unblock a hung <code>send</code> or read) and suppresses any further status updates so a late-dying orphan cannot clobber the state of its replacement (<code>WorkerTask.java:160</code>; <code>AbstractWorkerSourceTask.java:293</code>).</li>
 </ul>
 
 <h2>Invariants &amp; guarantees</h2>
@@ -430,13 +430,13 @@
 <h2>Interactions with other subsystems</h2>
 
 <ul>
-  <li><a href="13-group-coordination.html">Group Coordination</a> — distributed workers form a group via the broker <code>GroupCoordinator</code> using a Connect-specific embedded protocol; sink tasks additionally form an ordinary consumer group. The Connect assignor plugs into the same JoinGroup/SyncGroup mechanics described there.</li>
-  <li><a href="16-producer-client.html">Producer Client</a> — every source task owns a <code>KafkaProducer</code>; EOS source tasks use the producer's transactional API (<code>transactional.id</code> per task) and zombie fencing.</li>
-  <li><a href="17-consumer-client.html">Consumer Client</a> — every sink task owns a <code>KafkaConsumer</code>, subscribes to its topics, and commits to <code>__consumer_offsets</code>; rebalance callbacks drive <code>open</code>/<code>close</code>.</li>
-  <li><a href="14-transactions-eos.html">Transactions &amp; EOS</a> — KIP-618 exactly-once source builds directly on Kafka transactions and producer fencing.</li>
-  <li><a href="04-storage-management.html">Log Management</a> — Connect's three internal topics are compacted; their correctness depends on log compaction semantics, which the config store explicitly reasons about.</li>
-  <li><a href="18-security.html">Security</a> — internal worker-to-worker REST calls are HMAC-signed with the rotating session key (KIP-507); connector client configs can be overridden subject to a <code>ConnectorClientConfigOverridePolicy</code>.</li>
-  <li><a href="00-overview.html">Architecture Overview</a> — Connect is a Kafka <em>client</em> application; it is KRaft-agnostic and talks only to broker APIs, never to the controller quorum directly.</li>
+  <li><a href="13-group-coordination.html">Group Coordination</a>, distributed workers form a group via the broker <code>GroupCoordinator</code> using a Connect-specific embedded protocol; sink tasks additionally form an ordinary consumer group. The Connect assignor plugs into the same JoinGroup/SyncGroup mechanics described there.</li>
+  <li><a href="16-producer-client.html">Producer Client</a>, every source task owns a <code>KafkaProducer</code>; EOS source tasks use the producer's transactional API (<code>transactional.id</code> per task) and zombie fencing.</li>
+  <li><a href="17-consumer-client.html">Consumer Client</a>, every sink task owns a <code>KafkaConsumer</code>, subscribes to its topics, and commits to <code>__consumer_offsets</code>; rebalance callbacks drive <code>open</code>/<code>close</code>.</li>
+  <li><a href="14-transactions-eos.html">Transactions &amp; EOS</a>, KIP-618 exactly-once source builds directly on Kafka transactions and producer fencing.</li>
+  <li><a href="04-storage-management.html">Log Management</a>, Connect's three internal topics are compacted; their correctness depends on log compaction semantics, which the config store explicitly reasons about.</li>
+  <li><a href="18-security.html">Security</a>, internal worker-to-worker REST calls are HMAC-signed with the rotating session key (KIP-507); connector client configs can be overridden subject to a <code>ConnectorClientConfigOverridePolicy</code>.</li>
+  <li><a href="00-overview.html">Architecture Overview</a>, Connect is a Kafka <em>client</em> application; it is KRaft-agnostic and talks only to broker APIs, never to the controller quorum directly.</li>
 </ul>
 
 <h2>MirrorMaker 2: Connect for cross-cluster replication</h2>
@@ -458,9 +458,9 @@
 
 <ul>
   <li><strong>The config topic must have exactly one partition.</strong> Multiple partitions break the total-ordering assumption and Connect refuses to operate correctly. Set replication factor high; you cannot repartition it later without losing ordering.</li>
-  <li><strong>Default <code>offset.flush.interval.ms</code> is 60 s.</strong> Source duplicate windows on restart are bounded by this interval — lower it for tighter at-least-once bounds at the cost of more writes to the offsets topic.</li>
+  <li><strong>Default <code>offset.flush.interval.ms</code> is 60 s.</strong> Source duplicate windows on restart are bounded by this interval, lower it for tighter at-least-once bounds at the cost of more writes to the offsets topic.</li>
   <li><strong>The herder tick thread is a single thread.</strong> A connector whose <code>taskConfigs()</code> or whose validation blocks (e.g. a slow network call to the upstream system) can stall REST responses cluster-wide. Connector authors must keep control-plane methods fast.</li>
-  <li><strong>Cooperative vs eager.</strong> Mixing workers configured with <code>connect.protocol=eager</code> and <code>sessioned</code> downgrades the whole cluster to the lowest common protocol and disables internal request signing — the herder logs a prominent warning (<code>DistributedHerder.java:2648</code>).</li>
+  <li><strong>Cooperative vs eager.</strong> Mixing workers configured with <code>connect.protocol=eager</code> and <code>sessioned</code> downgrades the whole cluster to the lowest common protocol and disables internal request signing, the herder logs a prominent warning (<code>DistributedHerder.java:2648</code>).</li>
   <li><strong>Scaling and the rebalance delay.</strong> Adding/removing workers triggers a delayed rebalance; during a rolling restart, set the delay high enough that work returns to a bouncing worker rather than churning across the cluster.</li>
   <li><strong>Converter mismatch is the most common data bug.</strong> Producing with a schema-bearing JSON value and consuming with <code>StringConverter</code> (or vice versa) silently corrupts data; key and value converters are independent and must match the data on the topic.</li>
   <li><strong>Failed tasks do not auto-restart.</strong> A task that hits a non-retriable error stays <code>FAILED</code> until <code>POST /connectors/{name}/tasks/{id}/restart</code>; monitor the status topic / REST status endpoint.</li>
@@ -468,7 +468,7 @@
       </article>
       <footer class="footer-meta">
         <p>Part of <strong>Apache Kafka Internals</strong> · derived from Apache Kafka 4.4 source · <a href="https://github.com/dmitrykrivaltsevich/kafka-internals">GitHub</a> · MIT-licensed.</p>
-        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide — not affiliated with or endorsed by the ASF.</p>
+        <p>Apache Kafka® is a registered trademark of the Apache Software Foundation. This is an independent, unofficial guide, not affiliated with or endorsed by the ASF.</p>
       </footer>
     </div>
   </main>

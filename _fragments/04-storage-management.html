@@ -2,7 +2,7 @@
 
 <blockquote class="provenance">Source: Apache Kafka 4.4.0-SNAPSHOT (git 04bfe7d, 2026-06-15), KRaft mode. Derived from source code, not copied from official documentation.</blockquote>
 
-<p class="lead">Chapter <a href="03-storage-log-engine.html">03</a> described a single <code>UnifiedLog</code> — an ordered sequence of immutable segments. This chapter zooms out to the <em>broker-wide</em> lifecycle that surrounds those logs: <code>LogManager</code>, the registry of every <code>UnifiedLog</code> across all <code>log.dirs</code> (JBOD), which creates and deletes logs, recovers them in parallel on startup, and drives the background schedulers for flushing, checkpointing, and retention. It then covers the two reclamation strategies — <strong>size/time retention</strong> (<code>cleanup.policy=delete</code>, drop whole old segments) and <strong>log compaction</strong> (<code>cleanup.policy=compact</code>, keep only the latest record per key) — and the asynchronous, crash-safe machinery (<code>.deleted</code>/<code>.cleaned</code>/<code>.swap</code> renames, the <code>LogCleaner</code> thread pool, the <code>SkimpyOffsetMap</code>, and the cleaner-offset checkpoint) that makes both safe in the presence of disk failure, truncation, and exactly-once transactions.</p>
+<p class="lead">Chapter <a href="03-storage-log-engine.html">03</a> described a single <code>UnifiedLog</code>, an ordered sequence of immutable segments. This chapter zooms out to the <em>broker-wide</em> lifecycle that surrounds those logs: <code>LogManager</code>, the registry of every <code>UnifiedLog</code> across all <code>log.dirs</code> (JBOD), which creates and deletes logs, recovers them in parallel on startup, and drives the background schedulers for flushing, checkpointing, and retention. It then covers the two reclamation strategies, <strong>size/time retention</strong> (<code>cleanup.policy=delete</code>, drop whole old segments) and <strong>log compaction</strong> (<code>cleanup.policy=compact</code>, keep only the latest record per key), and the asynchronous, crash-safe machinery (<code>.deleted</code>/<code>.cleaned</code>/<code>.swap</code> renames, the <code>LogCleaner</code> thread pool, the <code>SkimpyOffsetMap</code>, and the cleaner-offset checkpoint) that makes both safe in the presence of disk failure, truncation, and exactly-once transactions.</p>
 
 <h2>Role &amp; responsibilities</h2>
 
@@ -47,7 +47,7 @@
 <dt>Log start offset</dt><dd>The lowest offset still readable (raised by <code>DeleteRecords</code> or segment deletion). Checkpointed to <code>log-start-offset-checkpoint</code> so deleted data is not re-exposed after restart.</dd>
 <dt>Clean / dirty / cleanable section</dt><dd>For a compacted log, segments below the cleaner checkpoint are <em>clean</em>; above it is <em>dirty</em>, split into a <em>cleanable</em> prefix and an <em>uncleanable</em> tail (active segment, anything past the last stable offset, anything younger than <code>min.compaction.lag.ms</code>) (<code>LogCleaner.java:53-56</code>).</dd>
 <dt>Tombstone</dt><dd>A record with a non-null key and <em>null value</em>; treated as a delete during compaction. Retained for <code>delete.retention.ms</code> after the batch enters the clean section, then dropped.</dd>
-<dt>Cleanable ratio</dt><dd><code>cleanableBytes / (cleanBytes + cleanableBytes)</code> — the cleaner's "dirtiness" estimate and the selection key for the filthiest log (<code>LogToClean.java:45-54</code>).</dd>
+<dt>Cleanable ratio</dt><dd><code>cleanableBytes / (cleanBytes + cleanableBytes)</code>, the cleaner's "dirtiness" estimate and the selection key for the filthiest log (<code>LogToClean.java:45-54</code>).</dd>
 </dl>
 
 <h2>Data structures</h2>
@@ -67,7 +67,7 @@
 <tr><td><code>directoryIds</code></td><td><code>ConcurrentHashMap&lt;String, Uuid&gt;</code></td><td>Each dir's UUID from its <code>meta.properties</code> (for JBOD directory assignment).</td></tr>
 <tr><td><code>dirLocks</code></td><td><code>List&lt;FileLock&gt;</code></td><td>One <code>.lock</code> per dir, preventing a second broker process from opening it.</td></tr>
 <tr><td><code>recoveryPointCheckpoints</code> / <code>logStartOffsetCheckpoints</code></td><td><code>Map&lt;File, OffsetCheckpointFile&gt;</code></td><td>One checkpoint file per dir for each of the two offset kinds.</td></tr>
-<tr><td><code>partitionsInitializing</code></td><td><code>ConcurrentHashMap&lt;TopicPartition, Boolean&gt;</code></td><td>Detects a config update racing with log load (KAFKA-8813); the flag forces a config reload after init.</td></tr>
+<tr><td><code>partitionsInitializing</code></td><td><code>ConcurrentHashMap&lt;TopicPartition, Boolean&gt;</code></td><td>Detects a config update racing with log load (<a href="https://issues.apache.org/jira/browse/KAFKA-8813">KAFKA-8813</a>); the flag forces a config reload after init.</td></tr>
 </tbody>
 </table></div>
 
@@ -75,9 +75,9 @@
 
 <p>Two maps under one <code>ReentrantLock</code> (<code>LogCleanerManager.java:84-100</code>):</p>
 <ul>
-  <li><code>inProgress: Map&lt;TopicPartition, LogCleaningState&gt;</code> — the per-partition state machine.</li>
-  <li><code>uncleanablePartitions: Map&lt;String, Set&lt;TopicPartition&gt;&gt;</code> — partitions that threw during cleaning, keyed by log dir; excluded until restart or recovery.</li>
-  <li><code>checkpoints: Map&lt;File, OffsetCheckpointFile&gt;</code> — the <code>cleaner-offset-checkpoint</code> per dir, recording the first dirty offset (cleaner point) of each compacted partition.</li>
+  <li><code>inProgress: Map&lt;TopicPartition, LogCleaningState&gt;</code>, the per-partition state machine.</li>
+  <li><code>uncleanablePartitions: Map&lt;String, Set&lt;TopicPartition&gt;&gt;</code>, partitions that threw during cleaning, keyed by log dir; excluded until restart or recovery.</li>
+  <li><code>checkpoints: Map&lt;File, OffsetCheckpointFile&gt;</code>, the <code>cleaner-offset-checkpoint</code> per dir, recording the first dirty offset (cleaner point) of each compacted partition.</li>
 </ul>
 
 <h3>On-disk: the offset checkpoint file</h3>
@@ -103,7 +103,7 @@
 
 <p>Writes are crash-consistent: <code>checkpoint.write</code> ultimately calls <code>Utils.atomicMoveWithFallback</code>, which writes a temp file, fsyncs, renames, and flushes the parent directory (noted at <code>LogManager.java:1054</code>). The three checkpoint <em>file names</em> are constants: <code>RECOVERY_POINT_CHECKPOINT_FILE</code>, <code>LOG_START_OFFSET_CHECKPOINT_FILE</code> (<code>LogManager.java:85-86</code>), and <code>LogCleanerManager.OFFSET_CHECKPOINT_FILE = "cleaner-offset-checkpoint"</code> (<code>LogCleanerManager.java:66</code>).</p>
 
-<h3>The dedupe hash table — <code>SkimpyOffsetMap</code></h3>
+<h3>The dedupe hash table, <code>SkimpyOffsetMap</code></h3>
 
 <p>Compaction's working memory is a fixed-size open-addressing hash table that stores a cryptographic <em>hash</em> of each key (not the key itself) alongside the latest offset for that key (<code>SkimpyOffsetMap.java:28-88</code>). Each slot is <code>bytesPerEntry = hashSize + 8</code> bytes; with the default <code>MD5</code> (16-byte digest) that is 24 bytes per entry, so a per-thread buffer holds <code>memory / 24</code> slots.</p>
 
@@ -170,22 +170,22 @@
 
 <h3>Startup: validate, lock, recover, schedule</h3>
 
-<p>Construction calls <code>createAndValidateLogDirs</code> then <code>lockLogDirs</code> then <code>loadDirectoryIds</code> (<code>LogManager.java:229-232</code>). Validation creates missing dirs, rejects duplicates by canonical path, and routes any failing dir to the failure channel rather than aborting — unless <em>every</em> dir fails, in which case the broker halts (<code>LogManager.java:376-379</code>). Locking acquires an exclusive <code>FileLock</code> on each dir's <code>.lock</code> file (<code>LogManager.java:449-462</code>).</p>
+<p>Construction calls <code>createAndValidateLogDirs</code> then <code>lockLogDirs</code> then <code>loadDirectoryIds</code> (<code>LogManager.java:229-232</code>). Validation creates missing dirs, rejects duplicates by canonical path, and routes any failing dir to the failure channel rather than aborting, unless <em>every</em> dir fails, in which case the broker halts (<code>LogManager.java:376-379</code>). Locking acquires an exclusive <code>FileLock</code> on each dir's <code>.lock</code> file (<code>LogManager.java:449-462</code>).</p>
 
 <p><code>loadLogs</code> (<code>LogManager.java:608</code>) recovers logs <strong>per directory, in parallel</strong>:</p>
 <ol>
   <li>For each live dir it spins up a fixed pool of <code>num.recovery.threads.per.data.dir</code> threads named <code>log-recovery-&lt;dirPath&gt;-&lt;n&gt;</code> (<code>LogManager.java:590-591,625</code>).</li>
-  <li>It reads the dir's <code>CleanShutdownFileHandler</code>. If the clean-shutdown marker exists, it is <em>deleted</em> immediately and <code>hadCleanShutdown</code> is cached — so a crash mid-load is correctly treated as unclean next boot (KAFKA-10471, <code>LogManager.java:629-636</code>).</li>
+  <li>It reads the dir's <code>CleanShutdownFileHandler</code>. If the clean-shutdown marker exists, it is <em>deleted</em> immediately and <code>hadCleanShutdown</code> is cached, so a crash mid-load is correctly treated as unclean next boot (<a href="https://issues.apache.org/jira/browse/KAFKA-10471">KAFKA-10471</a>, <code>LogManager.java:629-636</code>).</li>
   <li>It reads the recovery-point and log-start checkpoints (tolerating a corrupt checkpoint by resetting to 0 / first segment).</li>
   <li>It lists topic-partition subdirectories, skipping the <code>remote-log-index-cache</code> dir and the cluster-metadata topic (<code>LogManager.java:653-660</code>), and submits one <code>loadLog</code> job per partition. With a clean shutdown, segment recovery is skipped entirely; otherwise every segment above the recovery point is re-validated.</li>
   <li><code>loadLog</code> (<code>LogManager.java:511</code>) opens each <code>UnifiedLog</code> and routes it: a <code>-delete</code>-suffixed dir → <code>logsToBeDeleted</code>; a <code>-stray</code> dir → logged; a still-present-but-orphaned replica → renamed <code>-stray</code>; otherwise inserted into <code>currentLogs</code>/<code>futureLogs</code> (a duplicate is a fatal <code>IllegalStateException</code>).</li>
 </ol>
 
-<p>Two gauges — <code>remainingLogsToRecover</code> (per dir) and <code>remainingSegmentsToRecover</code> (per recovery thread) — let operators watch progress (<code>LogManager.java:741-753</code>). After loading, <code>startupWithConfigOverrides</code> schedules the five tasks and, if <code>cleanerConfig.enableCleaner</code>, builds and starts the <code>LogCleaner</code> (<code>LogManager.java:811-841</code>).</p>
+<p>Two gauges, <code>remainingLogsToRecover</code> (per dir) and <code>remainingSegmentsToRecover</code> (per recovery thread), let operators watch progress (<code>LogManager.java:741-753</code>). After loading, <code>startupWithConfigOverrides</code> schedules the five tasks and, if <code>cleanerConfig.enableCleaner</code>, builds and starts the <code>LogCleaner</code> (<code>LogManager.java:811-841</code>).</p>
 
 <div class="callout note"><span class="callout-title">Note</span><p>All five schedulers fire after an initial delay of <code>log.initial.task.delay.ms</code> (default 30 000 ms, <code>ServerLogConfigs.LOG_INITIAL_TASK_DELAY_MS_DEFAULT</code>), staggering background work away from the startup spike (<code>LogManager.java:814-833</code>).</p></div>
 
-<h2>Detailed mechanics — retention (cleanup.policy=delete)</h2>
+<h2>Detailed mechanics, retention (cleanup.policy=delete)</h2>
 
 <p>The <code>kafka-log-retention</code> task runs <code>cleanupLogs</code> every <code>log.retention.check.interval.ms</code> (default 5 minutes, <code>ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_DEFAULT</code>). It first pauses the cleaner on all <em>non-compacted</em> partitions to avoid a race, iterates them calling <code>UnifiedLog.deleteOldSegments()</code> (and the same on any future log), then resumes (<code>LogManager.java:1705-1744</code>).</p>
 
@@ -196,12 +196,12 @@
       futureLogs[tp]?.deleteOldSegments()
   finally: cleaner.resumeCleaning(deletable.keySet())</code></pre>
 
-<p><code>UnifiedLog.deleteOldSegments()</code> (<code>UnifiedLog.java:1967</code>) dispatches on policy. For <code>cleanup.policy=delete</code> it runs three predicates in order — log-start-offset breach, then size breach, then time breach:</p>
+<p><code>UnifiedLog.deleteOldSegments()</code> (<code>UnifiedLog.java:1967</code>) dispatches on policy. For <code>cleanup.policy=delete</code> it runs three predicates in order, log-start-offset breach, then size breach, then time breach:</p>
 
 <div class="table-wrap"><table>
 <thead><tr><th>Predicate</th><th>Condition (per candidate segment)</th><th>Code</th></tr></thead>
 <tbody>
-<tr><td>logStartOffset breach</td><td><code>nextSegment.baseOffset() &le; logStartOffset</code> — the whole segment is below the start offset.</td><td><code>UnifiedLog.java:2071</code></td></tr>
+<tr><td>logStartOffset breach</td><td><code>nextSegment.baseOffset() &le; logStartOffset</code>, the whole segment is below the start offset.</td><td><code>UnifiedLog.java:2071</code></td></tr>
 <tr><td>retention.bytes breach</td><td>Walk oldest-first while running total of bytes-to-remove (<code>logSize − retentionSize</code>) still covers the segment; delete those.</td><td><code>UnifiedLog.java:2040</code></td></tr>
 <tr><td>retention.ms breach</td><td><code>now − segment.largestTimestamp() &gt; retentionMs</code>.</td><td><code>UnifiedLog.java:2002</code></td></tr>
 </tbody>
@@ -211,7 +211,7 @@
 
 <p><code>deletableSegments</code> walks segments oldest-first and stops at the first that fails the predicate (<code>UnifiedLog.java:1879-1914</code>). Two crucial guards:</p>
 <ul>
-  <li><strong>High-watermark guard.</strong> A segment is deletable only if <code>highWatermark() &ge; upperBoundOffset</code> — never delete data at or above the HW, so the log start offset can never exceed the HW (<code>UnifiedLog.java:1892-1894</code>).</li>
+  <li><strong>High-watermark guard.</strong> A segment is deletable only if <code>highWatermark() &ge; upperBoundOffset</code>, never delete data at or above the HW, so the log start offset can never exceed the HW (<code>UnifiedLog.java:1892-1894</code>).</li>
   <li><strong>Never-empty guard.</strong> The final segment, if empty, is never returned; and if deletion would remove <em>all</em> segments, <code>deleteSegments</code> first rolls a fresh active segment so the log always has at least one (<code>UnifiedLog.java:1933-1942</code>).</li>
 </ul>
 
@@ -224,7 +224,7 @@
 <figure class="diagram"><div class="dflow">
   <div class="node cat-storage store"><span class="nt">t0 · rename segment files</span><span class="nd"><code>00098112.{log,index,timeindex,txnindex}</code> ⇒ <code>*.deleted</code></span></div>
   <div class="conn"></div>
-  <div class="node cat-broker"><span class="nt">remove segment from in-memory index</span><span class="nd">immediate — no longer served</span></div>
+  <div class="node cat-broker"><span class="nt">remove segment from in-memory index</span><span class="nd">immediate, no longer served</span></div>
   <div class="conn dashed ec-async" data-label="wait file.delete.delay.ms"></div>
   <div class="node cat-coord"><span class="nt">await delay</span><span class="nd">lets in-flight reads release their file handles</span></div>
   <div class="conn"></div>
@@ -247,7 +247,7 @@
 
 <div class="callout invariant"><span class="callout-title">Invariant</span><p>A log always has at least one segment, and the active segment is never deleted by retention. The log start offset never exceeds the high watermark. These two together guarantee a consumer can always read from the current start offset up to the HW.</p></div>
 
-<h2>Detailed mechanics — compaction (cleanup.policy=compact)</h2>
+<h2>Detailed mechanics, compaction (cleanup.policy=compact)</h2>
 
 <p>Compaction's contract (<code>LogCleaner.java:50-51</code>): "A message with key K and offset O is obsolete if there exists a message with key K and offset O' such that O &lt; O'." The cleaner keeps, for every key, only the record at its highest offset (plus tombstones within their retention window).</p>
 
@@ -256,7 +256,7 @@
 <p>Each <code>CleanerThread.doWork()</code> calls <code>tryCleanFilthiestLog</code>; if nothing was cleaned it sleeps <code>log.cleaner.backoff.ms</code> (default 15 s) (<code>LogCleaner.java:512-523</code>). Selection happens in <code>LogCleanerManager.grabFilthiestCompactedLog</code> under the manager lock (<code>LogCleanerManager.java:239</code>):</p>
 
 <ol>
-  <li>Read all cleaner checkpoints (<code>allCleanerCheckpoints</code>) — the per-partition first-dirty offset.</li>
+  <li>Read all cleaner checkpoints (<code>allCleanerCheckpoints</code>), the per-partition first-dirty offset.</li>
   <li>For every compacted log not already in-progress and not uncleanable, compute <code>cleanableOffsets</code> → <code>(firstDirtyOffset, firstUncleanableDirtyOffset)</code>, and build a <code>LogToClean</code> (which computes <code>cleanBytes</code>, <code>cleanableBytes</code>, and the cleanable ratio).</li>
   <li>Keep only logs that either <em>need compaction now</em> (forced by <code>max.compaction.lag.ms</code>) with non-zero cleanable bytes, or whose cleanable ratio exceeds the per-topic <code>min.cleanable.dirty.ratio</code> (<code>LogCleanerManager.java:281-283</code>).</li>
   <li>Pick the maximum cleanable ratio; mark it <code>LOG_CLEANING_IN_PROGRESS</code> and return it.</li>
@@ -264,7 +264,7 @@
 
 <p><code>cleanableOffsets</code> computes the <strong>first uncleanable offset</strong> as the minimum of three bounds (<code>LogCleanerManager.java:730-742</code>):</p>
 <ul>
-  <li>the <strong>last stable offset</strong> (never clean past the LSO — see transactions below);</li>
+  <li>the <strong>last stable offset</strong> (never clean past the LSO, see transactions below);</li>
   <li>the <strong>active segment's base offset</strong> (the active segment is always uncleanable);</li>
   <li>if <code>min.compaction.lag.ms &gt; 0</code>, the base offset of the first segment whose <code>largestTimestamp &gt; now − minCompactionLagMs</code> (<code>findFirstUncleanableSegment</code>, <code>LogCleanerManager.java:767-783</code>).</li>
 </ul>
@@ -285,13 +285,13 @@
   <span class="lgi"><b>clean</b> &lt; <code>firstDirtyOffset</code> &le; <b>cleanable</b> &lt; <code>firstUncleanableDirtyOffset</code> &le; <b>uncleanable</b></span>
 </div></figure>
 
-<h3>Pass 1 — build the offset map</h3>
+<h3>Pass 1, build the offset map</h3>
 
 <p><code>Cleaner.doClean</code> (<code>Cleaner.java:159</code>) first calls <code>buildOffsetMap</code> over the dirty section <code>[firstDirtyOffset, firstUncleanableOffset)</code> (<code>Cleaner.java:710</code>). For each dirty segment it iterates batches, and for each non-control, non-aborted record with a key at or above the start offset, it puts <code>key → offset</code> into the <code>SkimpyOffsetMap</code> (<code>Cleaner.java:807-817</code>). Because later offsets overwrite earlier ones, the map ends holding each key's <em>highest</em> offset in the dirty range. It stops adding once the map reaches <code>slots × loadFactor</code> entries and returns "full", so a single clean may cover only part of the dirty range; <code>endOffset = map.latestOffset() + 1</code> becomes the new cleaner point (<code>Cleaner.java:178,810-814</code>).</p>
 
-<h3>Pass 2 — recopy segments keeping only survivors</h3>
+<h3>Pass 2, recopy segments keeping only survivors</h3>
 
-<p>Segments from offset 0 up to <code>endOffset</code> are grouped by <code>groupSegmentsBySize</code> so a group's combined log and index bytes stay under <code>segment.bytes</code> / <code>segment.index.bytes</code> and the offset span stays under <code>Integer.MAX_VALUE</code> — this merges tiny segments and "prevents segment sizes from shrinking too much" with repeated cleanings (<code>Cleaner.java:641-676</code>). Each group is rewritten by <code>cleanSegments</code> into one or more <code>.cleaned</code> segments (<code>Cleaner.java:228</code>), and finally swapped in via <code>UnifiedLog.replaceSegments</code> (<code>Cleaner.java:328</code>).</p>
+<p>Segments from offset 0 up to <code>endOffset</code> are grouped by <code>groupSegmentsBySize</code> so a group's combined log and index bytes stay under <code>segment.bytes</code> / <code>segment.index.bytes</code> and the offset span stays under <code>Integer.MAX_VALUE</code>, this merges tiny segments and "prevents segment sizes from shrinking too much" with repeated cleanings (<code>Cleaner.java:641-676</code>). Each group is rewritten by <code>cleanSegments</code> into one or more <code>.cleaned</code> segments (<code>Cleaner.java:228</code>), and finally swapped in via <code>UnifiedLog.replaceSegments</code> (<code>Cleaner.java:328</code>).</p>
 
 <p>The retain/discard decision for each record is <code>shouldRetainRecord</code> (<code>Cleaner.java:567-602</code>):</p>
 <ul>
@@ -326,7 +326,7 @@
 
 <h3>Tombstones and <code>delete.retention.ms</code></h3>
 
-<p>A tombstone (null value) must survive long enough that a consumer reading from offset 0 still observes the delete before it disappears — otherwise it could see the pre-tombstone value and never learn the key was removed. The cleaner therefore retains a tombstone for <code>delete.retention.ms</code> (default 86 400 000 ms = 24 h, <code>LogConfig.DEFAULT_DELETE_RETENTION_MS</code>) measured from when its batch enters the clean section. For the modern v2 record format this is tracked by stamping a <strong>delete horizon</strong> into the batch header on the first clean that encounters it; the record is dropped only once <code>currentTime &ge; batch.deleteHorizonMs()</code> (<code>Cleaner.java:589-596</code>). For legacy (&lt; v2) formats a coarser horizon based on the last clean segment's <code>lastModified − deleteRetentionMs</code> is used (<code>Cleaner.java:166-170,260</code>).</p>
+<p>A tombstone (null value) must survive long enough that a consumer reading from offset 0 still observes the delete before it disappears, otherwise it could see the pre-tombstone value and never learn the key was removed. The cleaner therefore retains a tombstone for <code>delete.retention.ms</code> (default 86 400 000 ms = 24 h, <code>LogConfig.DEFAULT_DELETE_RETENTION_MS</code>) measured from when its batch enters the clean section. For the modern v2 record format this is tracked by stamping a <strong>delete horizon</strong> into the batch header on the first clean that encounters it; the record is dropped only once <code>currentTime &ge; batch.deleteHorizonMs()</code> (<code>Cleaner.java:589-596</code>). For legacy (&lt; v2) formats a coarser horizon based on the last clean segment's <code>lastModified − deleteRetentionMs</code> is used (<code>Cleaner.java:166-170,260</code>).</p>
 
 <h3>Interaction with transactions / markers</h3>
 
@@ -335,7 +335,7 @@
   <li><strong>Never clean past the LSO.</strong> Because <code>firstUncleanableOffset</code> is bounded by <code>lastStableOffset()</code>, every record the cleaner sees is already committed or aborted, so the transaction index can be consulted up front (<code>LogCleanerManager.java:730-733</code>).</li>
   <li><strong>Aborted-transaction records are dropped unconditionally</strong>, ignoring keys (<code>CleanedTransactionMetadata</code> drives <code>discardBatchRecords</code>, <code>Cleaner.java:386-391</code>).</li>
   <li><strong>The last batch of each active producer is retained even if empty</strong> (<code>RETAIN_EMPTY</code>) to preserve sequence-number continuity; likewise the batch whose next offset equals the high watermark is retained so the last-offset information survives (<code>Cleaner.java:394-420</code>).</li>
-  <li><strong>Transaction markers</strong> (control batches) are retained until all records from their transaction are gone and a delete-horizon has passed — the same tombstone-retention logic, applied to markers (<code>Cleaner.java:384-389</code>).</li>
+  <li><strong>Transaction markers</strong> (control batches) are retained until all records from their transaction are gone and a delete-horizon has passed, the same tombstone-retention logic, applied to markers (<code>Cleaner.java:384-389</code>).</li>
 </ul>
 
 <h2>Concurrency &amp; threading</h2>
@@ -374,7 +374,7 @@
 <div class="legend">
   <span class="lgi"><span class="sw round cat-coord"></span><b>pill</b> = cleaning state</span>
   <span class="lgi"><span class="sw round cat-error dash"></span><b>warn</b> = Aborted (failure / interrupt)</span>
-  <span class="lgi"><span class="sw round"></span>◉ = <em>None</em> (start / terminal — not being cleaned)</span>
+  <span class="lgi"><span class="sw round"></span>◉ = <em>None</em> (start / terminal, not being cleaned)</span>
   <span class="lgi"><span class="arr"></span>guarded transition (under manager lock)</span>
   <span class="lgi"><span class="mono">↺</span> = self-transition · <span class="mono">label</span> = triggering call</span>
 </div></figure>
@@ -434,7 +434,7 @@
 
 <p>Any class doing log I/O routes an <code>IOException</code> to <code>LogDirFailureChannel.maybeAddOfflineLogDir</code>, which records the dir once and enqueues it onto a bounded queue (<code>LogDirFailureChannel.java:60-65</code>). The single <code>LogDirFailureHandler</code> thread drains it and calls <code>ReplicaManager.handleLogDirFailure</code> → <code>LogManager.handleLogDirFailure</code> (<code>LogManager.java:411</code>), which under <code>logCreationOrDeletionLock</code>:</p>
 <ol>
-  <li>removes the dir from <code>liveLogDirs</code> and <code>directoryIds</code> — and <strong>halts the broker if it was the last live dir</strong> (<code>LogManager.java:416-419</code>);</li>
+  <li>removes the dir from <code>liveLogDirs</code> and <code>directoryIds</code>, and <strong>halts the broker if it was the last live dir</strong> (<code>LogManager.java:416-419</code>);</li>
   <li>drops the dir's recovery-point and log-start checkpoint maps;</li>
   <li>tells the cleaner to stop cleaning that dir (drops its cleaner-offset checkpoint, <code>LogCleanerManager.handleLogDirFailure</code>);</li>
   <li>removes and closes all current and future logs under that dir, marking those partitions offline;</li>
@@ -450,7 +450,7 @@
 
 <h3>Buffer too small for a batch</h3>
 
-<p>If a chunk read yields zero complete batches, the cleaner doubles its I/O buffers up to <code>max(maxLogMessageSize, maxIoBufferSize)</code> (a single oversized batch — e.g. compression pushing a set just over <code>max.message.bytes</code>, or a later reduction of that config — is still made to fit), failing only if the message genuinely exceeds the allowed maximum (<code>Cleaner.java:508-617</code>). A first write to an empty cleaned segment is always allowed to avoid an infinite overflow loop (<code>Cleaner.java:469-472</code>).</p>
+<p>If a chunk read yields zero complete batches, the cleaner doubles its I/O buffers up to <code>max(maxLogMessageSize, maxIoBufferSize)</code> (a single oversized batch, e.g. compression pushing a set just over <code>max.message.bytes</code>, or a later reduction of that config, is still made to fit), failing only if the message genuinely exceeds the allowed maximum (<code>Cleaner.java:508-617</code>). A first write to an empty cleaned segment is always allowed to avoid an infinite overflow loop (<code>Cleaner.java:469-472</code>).</p>
 
 <h3>Unclean shutdown</h3>
 
@@ -470,26 +470,26 @@
 <h2>Interactions with other subsystems</h2>
 
 <ul>
-  <li><a href="03-storage-log-engine.html">03 · The Log Storage Engine</a> — <code>UnifiedLog</code>/<code>LocalLog</code>/<code>LogSegment</code> provide the segments this chapter creates, deletes, recopies, and swaps; <code>replaceSegments</code> and <code>deleteSegmentFiles</code> live there.</li>
-  <li><a href="05-tiered-storage.html">05 · Tiered Storage</a> — when remote copy is enabled, retention switches to <code>local.retention.ms</code>/<code>local.retention.bytes</code> and only deletes local segments already uploaded (<code>UnifiedLog.java:1857-1869,1979-1982</code>).</li>
-  <li><a href="08-replication.html">08 · Replication, ISR &amp; High Watermark</a> — the high-watermark guard in <code>deletableSegments</code> and the LSO bound on compaction tie reclamation to replication progress.</li>
-  <li><a href="14-transactions-eos.html">14 · Transactions &amp; Exactly-Once</a> — the cleaner consults the transaction index, drops aborted records, and retains markers/last-producer batches.</li>
-  <li><a href="12-metadata-propagation.html">12 · Metadata Propagation &amp; Broker Lifecycle</a> — stray-replica detection (<code>isStrayReplica</code>) and intra-broker moves (future logs) are driven by the metadata image and the JBOD directory assignment.</li>
-  <li><a href="13-group-coordination.html">13 · Group Coordination</a> — the internal <code>__consumer_offsets</code> topic is compacted; the cleaner must run for offset/group state not to grow unbounded (the deprecation note warns about exactly this, <code>CleanerConfig.java:73-74</code>).</li>
-  <li><a href="07-request-processing.html">07 · Request Processing</a> — <code>DeleteRecords</code> raises the log start offset, which then drives <code>deleteLogStartOffsetBreachedSegments</code>.</li>
+  <li><a href="03-storage-log-engine.html">03 · The Log Storage Engine</a>, <code>UnifiedLog</code>/<code>LocalLog</code>/<code>LogSegment</code> provide the segments this chapter creates, deletes, recopies, and swaps; <code>replaceSegments</code> and <code>deleteSegmentFiles</code> live there.</li>
+  <li><a href="05-tiered-storage.html">05 · Tiered Storage</a>, when remote copy is enabled, retention switches to <code>local.retention.ms</code>/<code>local.retention.bytes</code> and only deletes local segments already uploaded (<code>UnifiedLog.java:1857-1869,1979-1982</code>).</li>
+  <li><a href="08-replication.html">08 · Replication, ISR &amp; High Watermark</a>, the high-watermark guard in <code>deletableSegments</code> and the LSO bound on compaction tie reclamation to replication progress.</li>
+  <li><a href="14-transactions-eos.html">14 · Transactions &amp; Exactly-Once</a>, the cleaner consults the transaction index, drops aborted records, and retains markers/last-producer batches.</li>
+  <li><a href="12-metadata-propagation.html">12 · Metadata Propagation &amp; Broker Lifecycle</a>, stray-replica detection (<code>isStrayReplica</code>) and intra-broker moves (future logs) are driven by the metadata image and the JBOD directory assignment.</li>
+  <li><a href="13-group-coordination.html">13 · Group Coordination</a>, the internal <code>__consumer_offsets</code> topic is compacted; the cleaner must run for offset/group state not to grow unbounded (the deprecation note warns about exactly this, <code>CleanerConfig.java:73-74</code>).</li>
+  <li><a href="07-request-processing.html">07 · Request Processing</a>, <code>DeleteRecords</code> raises the log start offset, which then drives <code>deleteLogStartOffsetBreachedSegments</code>.</li>
 </ul>
 
 <h2>Design rationale &amp; evolution</h2>
 
-<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Log compaction was introduced in <span class="pill kip">KIP-58</span>; the <code>min.compaction.lag.ms</code>/<code>max.compaction.lag.ms</code> bounds that let operators trade compaction promptness against rewrite amplification came with <span class="pill kip">KIP-354</span>. The cleaner's transaction-aware behaviour (never cleaning past the LSO, dropping aborted records, retaining markers and the last producer batch) is part of the exactly-once design line of <span class="pill kip">KIP-98</span> and the delete-horizon batch stamping refined under <span class="pill kip">KIP-534</span> (record v2 <code>baseTimestamp</code>/delete-horizon). The MD5 <code>SkimpyOffsetMap</code> deliberately stores hashes rather than keys to bound memory to ~24 bytes per dirty key regardless of key size.</p></div>
+<div class="callout rationale"><span class="callout-title">Design rationale</span><p>Log compaction was introduced in <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-58+-+Make+Log+Compaction+Point+Configurable">KIP-58</a></span>; the <code>min.compaction.lag.ms</code>/<code>max.compaction.lag.ms</code> bounds that let operators trade compaction promptness against rewrite amplification came with <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-354:+Add+a+Maximum+Log+Compaction+Lag">KIP-354</a></span>. The cleaner's transaction-aware behaviour (never cleaning past the LSO, dropping aborted records, retaining markers and the last producer batch) is part of the exactly-once design line of <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging">KIP-98</a></span> and the delete-horizon batch stamping refined under <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-534:+Retain+tombstones+and+transaction+markers+for+approximately+delete.retention.ms+milliseconds">KIP-534</a></span> (record v2 <code>baseTimestamp</code>/delete-horizon). The MD5 <code>SkimpyOffsetMap</code> deliberately stores hashes rather than keys to bound memory to ~24 bytes per dirty key regardless of key size.</p></div>
 
 <p>The cleaner is being simplified for Kafka 5.0: <code>log.cleaner.enable</code> is deprecated and the cleaner will always run (<code>LogManager.java:838-841</code>, <code>CleanerConfig.java:53</code>). Reconfiguration of cleaner threads (<code>LogCleaner</code> implements <code>BrokerReconfigurable</code>) shuts down and recreates the pool, which also resurrects any threads that had died (<code>LogCleaner.java:289-301</code>).</p>
 
 <h2>Gotchas &amp; operational notes</h2>
 
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>A compacted topic whose only churn is below <code>min.cleanable.dirty.ratio</code> (default 0.5) may <em>never</em> compact unless <code>max.compaction.lag.ms</code> is set — half the log must be dirty before the ratio rule fires. For <code>__consumer_offsets</code> and similar, set <code>max.compaction.lag.ms</code> to bound staleness.</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>A compacted topic whose only churn is below <code>min.cleanable.dirty.ratio</code> (default 0.5) may <em>never</em> compact unless <code>max.compaction.lag.ms</code> is set, half the log must be dirty before the ratio rule fires. For <code>__consumer_offsets</code> and similar, set <code>max.compaction.lag.ms</code> to bound staleness.</p></div>
 
-<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Tombstones are not gone the instant a key is superseded — they linger for <code>delete.retention.ms</code> (24 h by default) <em>after</em> entering the clean section so slow full-scan consumers still observe the delete. Shrinking this risks consumers missing deletes; the value is also a soft bound on how long a from-zero scan may take (<code>CleanerConfig.java:75-77</code>).</p></div>
+<div class="callout gotcha"><span class="callout-title">Gotcha</span><p>Tombstones are not gone the instant a key is superseded, they linger for <code>delete.retention.ms</code> (24 h by default) <em>after</em> entering the clean section so slow full-scan consumers still observe the delete. Shrinking this risks consumers missing deletes; the value is also a soft bound on how long a from-zero scan may take (<code>CleanerConfig.java:75-77</code>).</p></div>
 
 <div class="callout gotcha"><span class="callout-title">Gotcha</span><p>A wall-clock-future record timestamp makes a segment ineligible for <code>retention.ms</code> deletion (it is never "old enough"); the broker logs a warning but cannot reclaim it until time catches up (<code>UnifiedLog.java:2008-2009</code>). Misconfigured producer clocks can therefore stall time-based retention.</p></div>
 

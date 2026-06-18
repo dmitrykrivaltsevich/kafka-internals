@@ -221,26 +221,26 @@
 
 <p>We close the foundation chapter with the most basic question, posed as a decision tree. This is deliberately coarse, the full, force-weighted framework (with the anti-patterns and their mitigations) is <a href="bp01-when-to-use.html">the next chapter</a>, but it captures the first cut: does your problem have the <em>shape</em> the log is good at? The shape is: <em>history matters, fan-out or replay is valuable, and per-key ordering is enough.</em> If instead you need current-state queries, per-message control, or synchronous replies, you are looking at a database, a queue, or RPC.</p>
 
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
 <div class="node cat-broker"><span class="nt">a stream of facts/events to move or store</span></div>
 <div class="conn" data-label="ask first"></div>
+<div class="gate">
 <div class="node cat-broker decision">do you need the <em>history</em>, replay, audit, late readers, or many independent consumers?</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="no, only the latest value, queried by key"></div><div class="node cat-error">use a <strong>database / KV store</strong><br/>(log is the wrong primitive, no point lookup)</div></div>
-<div class="col"><div class="conn" data-label="yes, history / fan-out / replay matters"></div><div class="node decision">is <em>per-key</em> order enough, or do you need <em>global</em> total order?</div></div>
+<div class="off ec-err"><div class="arm" data-label="no"></div><div class="node cat-error">use a <strong>database / KV store</strong><br/>(log is the wrong primitive, no point lookup)</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="need strict global order at high volume"></div><div class="node cat-error">the log can't (N=1 kills scale)<br/>rethink the ordering requirement</div></div>
-<div class="col"><div class="conn" data-label="per-key order suffices"></div><div class="node decision">do you need per-<em>message</em> ack / redelivery / routing / priority?</div></div>
+<div class="conn" data-label="yes, history / fan-out / replay matters"></div>
+<div class="gate">
+<div class="node decision">is <em>per-key</em> order enough, or do you need <em>global</em> total order?</div>
+<div class="off ec-err"><div class="arm" data-label="global"></div><div class="node cat-error">the log can't (N=1 kills scale)<br/>rethink the ordering requirement</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-async" data-label="yes, work distribution semantics"></div><div class="node cat-coord">use a <strong>queue</strong> (or Kafka <a href="15-share-groups.html">share groups</a> for queue-on-a-log)</div></div>
-<div class="col"><div class="conn" data-label="no, stream processing / integration"></div><div class="node cat-storage">the <strong>distributed log</strong> fits<br/>(durable, ordered, replayable, fan-out)</div></div>
+<div class="conn" data-label="per-key order suffices"></div>
+<div class="gate">
+<div class="node decision">do you need per-<em>message</em> ack / redelivery / routing / priority?</div>
+<div class="off ec-async"><div class="arm" data-label="yes"></div><div class="node cat-coord">use a <strong>queue</strong> (or Kafka <a href="15-share-groups.html">share groups</a> for queue-on-a-log)</div></div>
 </div>
-</div><figcaption>The coarse first cut. Three questions separate the log from its neighbors: history (vs a database's current-state), ordering granularity (per-key vs an impossible-at-scale global order), and delivery model (stream/fan-out vs per-message queue control). A "no" at any gate routes you to the right primitive instead.</figcaption>
+<div class="conn" data-label="no, stream processing / integration"></div>
+<div class="node cat-storage">the <strong>distributed log</strong> fits<br/>(durable, ordered, replayable, fan-out)</div>
+</div><figcaption>The coarse first cut, read top to bottom along the spine. Three questions separate the log from its neighbors: history (vs a database's current-state), ordering granularity (per-key vs an impossible-at-scale global order), and delivery model (stream/fan-out vs per-message queue control). A "no" at any gate routes you off the spine to the right primitive instead.</figcaption>
 <div class="legend">
   <span class="lgi"><span class="sw cat-storage"></span> the log is the fit &nbsp; <span class="sw cat-coord"></span> queue / share-group territory &nbsp; <span class="sw cat-error"></span> log is the <em>wrong</em> choice</span>
   <span class="lgi"><span class="sw cat-broker"></span> the question under evaluation</span>

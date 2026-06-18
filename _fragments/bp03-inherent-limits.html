@@ -200,25 +200,25 @@
 
 <h2>When the log is the wrong choice, the negative space</h2>
 <p>Stacking the inherent limitations gives the most useful output of this chapter: a crisp list of workloads where the distributed log is <em>structurally</em> the wrong tool, no matter how it is tuned. An architect who memorises this list will save a team from months of fighting the abstraction.</p>
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
 <div class="node cat-broker decision"><span class="nt">Is the distributed log the right pattern?</span></div>
 <div class="conn" data-label="ask in order"></div>
+<div class="gate">
 <div class="node cat-client decision">Need synchronous sub-ms request/reply?</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error"><span class="nt">WRONG, use RPC / in-memory store</span><span class="nd">§5 latency floor; no native reply path</span></div></div>
-<div class="col"><div class="conn" data-label="no"></div><div class="node cat-coord decision">Need point-lookup / ad-hoc query / index?</div></div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">WRONG, use RPC / in-memory store</span><span class="nd">§5 latency floor; no native reply path</span></div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes, as the primary store"></div><div class="node cat-error"><span class="nt">WRONG, use a database</span><span class="nd">§7 no index; materialise a derived store instead</span></div></div>
-<div class="col"><div class="conn" data-label="no"></div><div class="node cat-coord decision">Need per-message routing/priority/TTL, no order?</div></div>
+<div class="conn" data-label="no"></div>
+<div class="gate">
+<div class="node cat-coord decision">Need point-lookup / ad-hoc query / index?</div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">WRONG, use a database</span><span class="nd">§7 no index; materialise a derived store instead</span></div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes &amp; rich routing"></div><div class="node cat-error"><span class="nt">WEAK, prefer a message broker</span><span class="nd">§3 RabbitMQ-style routing; share groups only partial</span></div></div>
-<div class="col"><div class="conn" data-label="no, ordered, replayable, fan-out, high-throughput"></div><div class="node cat-storage"><span class="nt">RIGHT, the log is the sweet spot</span><span class="nd">ordered per-key history, decoupled fan-out, replay/CDC</span></div></div>
+<div class="conn" data-label="no, not as primary store"></div>
+<div class="gate">
+<div class="node cat-coord decision">Need per-message routing/priority/TTL, no order?</div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">WEAK, prefer a message broker</span><span class="nd">§3 RabbitMQ-style routing; share groups only partial</span></div></div>
 </div>
-</div><figcaption>The negative-space decision tree: three structural disqualifiers (sub-ms request/reply, primary-store ad-hoc query, rich per-message routing) route you away from the log; what remains, ordered, replayable, high-throughput fan-out, is exactly where it wins.</figcaption><div class="legend"><span class="lgi"><span class="sw cat-storage"></span> log is right</span> <span class="lgi"><span class="sw cat-error"></span> log is wrong/weak</span> <span class="lgi"><span class="sw cat-client"></span> / <span class="sw cat-coord"></span> decision</span> <span class="lgi"><span class="arr"></span> path</span> <span class="lgi"><span class="arr dashed"></span> ec-err (disqualifier)</span></div></figure>
+<div class="conn" data-label="no, ordered, replayable, fan-out, high-throughput"></div>
+<div class="node cat-storage pill"><span class="nt">RIGHT, the log is the sweet spot</span><span class="nd">ordered per-key history, decoupled fan-out, replay/CDC</span></div>
+</div><figcaption>The negative-space decision spine: three structural disqualifiers (sub-ms request/reply, primary-store ad-hoc query, rich per-message routing) branch off to the right and route you away from the log; what remains, ordered, replayable, high-throughput fan-out, is exactly where it wins.</figcaption><div class="legend"><span class="lgi"><span class="sw cat-storage"></span> log is right</span> <span class="lgi"><span class="sw cat-error"></span> log is wrong/weak</span> <span class="lgi"><span class="sw cat-client"></span> / <span class="sw cat-coord"></span> decision</span> <span class="lgi"><span class="arr"></span> path</span> <span class="lgi"><span class="arr dashed"></span> ec-err off-ramp (disqualifier)</span></div></figure>
 <div class="callout key"><span class="callout-title">The three structural disqualifiers</span><p><strong>(1) Synchronous sub-millisecond request/reply</strong>, the latency floor (§5) and the absence of a native reply path make the log the wrong transport; use RPC/HTTP or an in-memory store. <strong>(2) Primary store for point lookups or ad-hoc queries</strong>, no index, no query language (§7); the log feeds derived query stores, it does not replace them. <strong>(3) Rich per-message routing, priority, or TTL with no ordering need</strong>, a smart-broker (RabbitMQ) is the better fit (§3); share groups close part but not all of the gap. Everything else, durable ordered history, decoupled high-throughput fan-out, replay, CDC, stream processing, is the log's home ground, and the limitations in this chapter are the price you knowingly pay for it. Carry this list to <a href="bp01-when-to-use.html">When To Use</a> and the consolidated <a href="bp07-architect-cheatsheet.html">Architect's Cheat-Sheet</a>.</p></div>
 <div class="callout note"><span class="callout-title">The transferable meta-lesson</span><p>The single most valuable habit this chapter teaches is not Kafka-specific: <strong>for any system you evaluate, separate the inherent from the mitigated from the tunable before you commit.</strong> Inherent limits define the problem class the system can serve; mitigated limits define how much operational maturity you must buy; tunable limits define the curve you will spend your career picking points on. Vendors and benchmarks blur these lines on purpose, the reference repeatedly flags claims that present a tunable default as an inherent flaw, or an inherent flaw as a "just tune it" non-issue (empirical: <em>ops-blueprint-reference §9 cautions</em>). The architect's edge is refusing that blur.</p></div>

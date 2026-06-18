@@ -41,30 +41,19 @@
 <p><strong>Principle.</strong> Almost every operation has a fixed per-call cost (a syscall, a round-trip, a header, a checksum, a lock) plus a variable per-byte cost. If the fixed cost dominates at small sizes, the single most effective optimisation in computing is to <em>do more per call</em>: group N items into one operation and divide the fixed cost by N. Batching is the universal amortiser, and its price is always the same, <strong>latency</strong> (you wait to accumulate) and <strong>memory</strong> (you buffer).</p>
 <p><strong>In Kafka.</strong> Batching is pervasive and recursive. The producer (<a href="16-producer-client.html">16</a>) accumulates records per partition into a <code>RecordBatch</code>, controlled by <code>batch.size</code> (default 16 KB) and <code>linger.ms</code> (how long to wait for it to fill). The batch is the unit of compression (<a href="01-record-format.html">01</a>), one compressed block with one header set and one CRC, which is why tiny batches compress poorly, and the unit of the wire protocol, replication, the on-disk segment, and the zero-copy fetch. The tradeoff is concrete: with <code>linger.ms=0</code>, batches averaged ~1,215 bytes despite a 16 KB cap; at <code>linger.ms=1500</code> they reached ~275 KB <span class="cite">[<a href="https://developer.confluent.io/courses/architecture/producer-hands-on/">Confluent producer hands-on</a>]</span>; roll-ups cite 10–50× throughput gains from batching <span class="cite">[Confluent]</span>.</p>
 <p><strong>Beyond Kafka.</strong> Batching is everywhere fixed costs hide: SQL bulk inserts, the Nagle algorithm coalescing TCP segments, GPU kernels amortising launch overhead across a tensor, syscall batching (<code>io_uring</code>, <code>writev</code>), and database group-commit (fsync once per N transactions). The decision is always the same shape: does the fixed cost dominate at your item size, and can you tolerate the latency of accumulation?</p>
-<figure class="diagram"><div class="dflow">
-  <div class="node cat-control decision"><span class="nt">Is the per-op fixed cost ≫ per-item cost?</span><span class="nd">syscall · round-trip · header · CRC · lock</span></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn" data-label="no, already amortised"></div>
-      <div class="node cat-coord"><span class="nt">Do not batch</span><span class="nd">batching only adds latency &amp; buffering; ship items individually</span></div>
-    </div>
-    <div class="col">
-      <div class="conn" data-label="yes"></div>
-      <div class="node cat-control decision"><span class="nt">Can you tolerate accumulation latency?</span><span class="nd">how long to wait for a full batch?</span></div>
-    </div>
+<figure class="diagram"><div class="dflow spine">
+  <div class="gate">
+    <div class="node cat-control decision"><span class="nt">Is the per-op fixed cost ≫ per-item cost?</span><span class="nd">syscall · round-trip · header · CRC · lock</span></div>
+    <div class="off"><div class="arm" data-label="no"></div><div class="node cat-coord"><span class="nt">Do not batch</span><span class="nd">already amortised; batching only adds latency &amp; buffering; ship items individually</span></div></div>
   </div>
-  <div class="conn" data-label="from: latency-tolerant branch"></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn ec-err" data-label="no, latency-critical"></div>
-      <div class="node cat-client"><span class="nt">Size-trigger only</span><span class="nd">linger≈0 · flush when full · accept small batches at low rate (Kafka default)</span></div>
-    </div>
-    <div class="col">
-      <div class="conn ec-data" data-label="yes, throughput-first"></div>
-      <div class="node cat-client"><span class="nt">Size + time trigger</span><span class="nd">linger.ms&gt;0 · larger batch.size · flush on whichever fires first</span></div>
-    </div>
+  <div class="conn" data-label="yes, fixed cost dominates"></div>
+  <div class="gate">
+    <div class="node cat-control decision"><span class="nt">Can you tolerate accumulation latency?</span><span class="nd">how long to wait for a full batch?</span></div>
+    <div class="off ec-err"><div class="arm" data-label="no"></div><div class="node cat-client"><span class="nt">Size-trigger only</span><span class="nd">latency-critical · linger≈0 · flush when full · accept small batches at low rate (Kafka default)</span></div></div>
   </div>
-</div><figcaption>Batching decision tree: batch only when fixed cost dominates; choose a size trigger, a time trigger, or both, by your latency budget.</figcaption>
+  <div class="conn ec-data" data-label="yes, throughput-first"></div>
+  <div class="node cat-client"><span class="nt">Size + time trigger</span><span class="nd">linger.ms&gt;0 · larger batch.size · flush on whichever fires first</span></div>
+</div><figcaption>Batching decision spine: batch only when fixed cost dominates; choose a size trigger, a time trigger, or both, by your latency budget.</figcaption>
 <div class="legend">
   <span class="lgi"><span class="sw cat-control"></span>decision point</span>
   <span class="lgi"><span class="sw cat-coord"></span>no-batch outcome</span>

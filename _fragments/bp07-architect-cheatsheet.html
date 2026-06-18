@@ -41,31 +41,31 @@
 
 <p>The log is the right architecture when you need <strong>ordered, durable, replayable history that many independent consumers read at their own pace</strong>. It is the wrong tool for point lookups, synchronous request/reply, per-message routing/priority, and per-message-parallel task queues, those fight the structure (share groups <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-932:+Queues+for+Kafka">KIP-932</a></span> address the last). Full reasoning in <a href="bp01-when-to-use.html">bp01 · When To Use</a>.</p>
 
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
 <div class="node cat-control"><span class="nt">requirement</span><span class="nd">what does the workload actually need?</span></div>
 <div class="conn" data-label="classify"></div>
+<div class="gate">
 <div class="node decision cat-control">need ordered, durable, replayable history with many independent readers?</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="no, point lookup by key / ad-hoc query"></div><div class="node cat-error">use a database / KV store<br/>(Kafka has no random access, materialize INTO one)</div></div>
-<div class="col"><div class="conn" data-label="yes"></div><div class="node decision cat-control">need synchronous reply to the caller?</div></div>
+<div class="off ec-err"><div class="arm" data-label="no"></div><div class="node cat-error">use a database / KV store<br/>(Kafka has no random access, materialize INTO one)</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes, request/reply"></div><div class="node cat-error">use RPC / gRPC<br/>(request-reply over a log re-couples what you decoupled)</div></div>
-<div class="col"><div class="conn" data-label="no, fire &amp; fan-out"></div><div class="node decision cat-control">need per-message TTL, priority, or content routing?</div></div>
+<div class="conn" data-label="yes"></div>
+<div class="gate">
+<div class="node decision cat-control">need synchronous reply to the caller?</div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error">use RPC / gRPC<br/>(request-reply over a log re-couples what you decoupled)</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error">use <a href="https://www.rabbitmq.com/">RabbitMQ</a> / a broker<br/>(Kafka retention is topic-level; no priority/routing)</div></div>
-<div class="col"><div class="conn" data-label="no"></div><div class="node decision cat-control">per-message parallel work, order doesn't matter?</div></div>
+<div class="conn" data-label="no, fire &amp; fan-out"></div>
+<div class="gate">
+<div class="node decision cat-control">need per-message TTL, priority, or content routing?</div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error">use <a href="https://www.rabbitmq.com/">RabbitMQ</a> / a broker<br/>(Kafka retention is topic-level; no priority/routing)</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-data" data-label="yes, task queue"></div><div class="node cat-coord">use share groups (KIP-932) / a queue<br/>classic groups head-of-line-block on per-partition order</div></div>
-<div class="col"><div class="conn" data-label="no, ordered stream"></div><div class="node cat-storage pill">USE THE LOG ✓<br/>event backbone, CDC, stream processing, replay</div></div>
+<div class="conn" data-label="no"></div>
+<div class="gate">
+<div class="node decision cat-control">per-message parallel work, order doesn't matter?</div>
+<div class="off ec-data"><div class="arm" data-label="yes"></div><div class="node cat-coord">use share groups (KIP-932) / a queue<br/>classic groups head-of-line-block on per-partition order</div></div>
 </div>
-</div><figcaption>Use-a-log decision tree. Every red exit is a documented anti-pattern; the log wins precisely when ordered durable replayable fan-out is the requirement and none of the disqualifiers apply.</figcaption><div class="legend"><span class="sw cat-control"></span> decision &nbsp; <span class="sw cat-storage"></span> use the log &nbsp; <span class="sw cat-coord"></span> log-adjacent feature &nbsp; <span class="sw cat-error"></span> wrong tool &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> qualified-yes.</div></figure>
+<div class="conn" data-label="no, ordered stream"></div>
+<div class="node cat-storage pill">USE THE LOG ✓<br/>event backbone, CDC, stream processing, replay</div>
+</div><figcaption>Use-a-log decision spine. Every red off-ramp is a documented anti-pattern; the log wins precisely when ordered durable replayable fan-out is the requirement and none of the disqualifiers apply.</figcaption><div class="legend"><span class="sw cat-control"></span> decision &nbsp; <span class="sw cat-storage"></span> use the log &nbsp; <span class="sw cat-coord"></span> log-adjacent feature &nbsp; <span class="sw cat-error"></span> wrong tool &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> qualified-yes.</div></figure>
 
 <div class="callout gotcha"><span class="callout-title">The four anti-patterns, one sentence each</span><p><strong>As a database</strong>, no key lookups, no ad-hoc SQL, no multi-key ACID; Kafka replicates <em>into</em> specialized stores, it does not replace them (empirical: <em>Kreps; <a href="https://www.kai-waehner.de/blog/2022/01/04/when-not-to-use-apache-kafka/">Waehner</a></em>). <strong>As RPC</strong>, a throughput-optimized log has no native reply channel; request-reply "returns the coupling we were trying to avoid." <strong>As a routing broker</strong>, no per-message TTL, priority, or content-based routing (that is RabbitMQ's domain). <strong>As a per-message task queue</strong>, per-partition order + one consumer per partition means "throughput collapses to the speed of the slowest message"; a poison pill stalls everything behind it. Share groups (<a href="15-share-groups.html">Part I · 15</a>) address the last one explicitly. These are intentional log-semantics tradeoffs, not bugs (empirical: <em>ops-blueprint reference §8</em>).</p></div>
 
@@ -73,7 +73,7 @@
 
 <p>The sizing formula is <code>N = max(T/T<sub>p</sub>, T/T<sub>c</sub>)</code>, target throughput over the measured single-partition produce and consume rates, and the binding term is <em>almost always the consumer</em>, because consumption parallelism is hard-capped at the partition count. Then add headroom, because resharding a keyed topic is a migration, not a config change. Full mechanism in <a href="op03-partitioning.html">Part II · 03 Partitioning</a>.</p>
 
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
 <div class="node cat-broker"><span class="nt">measure T<sub>p</sub>, T<sub>c</sub> at YOUR record size / compression / acks</span><span class="nd">never assume the ~10 MB/s planning number</span></div>
 <div class="conn" data-label="compute both terms"></div>
 <div class="row">
@@ -82,19 +82,21 @@
 </div>
 <div class="conn" data-label="take larger"></div>
 <div class="node cat-storage decision">N = max(T/T<sub>p</sub>, T/T<sub>c</sub>)</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn" data-label="keyed topic?"></div><div class="node cat-storage">×2 growth headroom + divisor-rich (12, 24, 60)<br/>, you can't reshard keyed in place</div></div>
-<div class="col"><div class="conn ec-data" data-label="unkeyed"></div><div class="node cat-coord">small/zero headroom<br/>, growing in place is safe</div></div>
+<div class="conn" data-label="size for resharding risk"></div>
+<div class="gate">
+<div class="node decision cat-control">keyed topic?</div>
+<div class="off ec-data"><div class="arm" data-label="unkeyed"></div><div class="node cat-coord">small/zero headroom<br/>, growing in place is safe</div></div>
 </div>
+<div class="conn" data-label="keyed"></div>
+<div class="node cat-storage">×2 growth headroom + divisor-rich (12, 24, 60)<br/>, you can't reshard keyed in place</div>
 <div class="conn" data-label="finally"></div>
+<div class="gate">
 <div class="node decision cat-control">N &gt; ~1,000 per topic OR over per-broker budget?</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-err" data-label="yes"></div><div class="node cat-error">back off: latency knee &amp; FD/mmap ceiling<br/>spread across brokers, don't inflate count</div></div>
-<div class="col"><div class="conn" data-label="no"></div><div class="node cat-storage pill">set N · set RF=3 · never ship defaults (1/1)</div></div>
+<div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error">back off: latency knee &amp; FD/mmap ceiling<br/>spread across brokers, don't inflate count</div></div>
 </div>
-</div><figcaption>Partition-count decision tree. The consumer term usually binds; keyed topics get growth headroom because resharding is a new-topic migration; and the count is capped from above by the latency knee and per-broker ceilings.</figcaption><div class="legend"><span class="sw cat-client"></span> produce term &nbsp; <span class="sw cat-coord"></span> consume term &nbsp; <span class="sw cat-storage"></span> result/action &nbsp; <span class="sw cat-error"></span> back off &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> unkeyed branch.</div></figure>
+<div class="conn" data-label="no"></div>
+<div class="node cat-storage pill">set N · set RF=3 · never ship defaults (1/1)</div>
+</div><figcaption>Partition-count sizing spine. The consumer term usually binds; keyed topics get growth headroom because resharding is a new-topic migration; and the count is capped from above by the latency knee and per-broker ceilings.</figcaption><div class="legend"><span class="sw cat-client"></span> produce term &nbsp; <span class="sw cat-coord"></span> consume term &nbsp; <span class="sw cat-storage"></span> result/action &nbsp; <span class="sw cat-error"></span> back off &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> unkeyed branch.</div></figure>
 
 <div class="callout warning"><span class="callout-title">The two partition facts that bite hardest</span><p><strong>You cannot decrease partitions</strong> (the controller rejects it by construction), and <strong>growing a keyed topic remaps keys</strong> via <code>murmur2(key) % N</code>, a key at <code>7654321</code> moves from partition <code>1</code> (N=4) to <code>3</code> (N=6), splitting its history across two logs and breaking per-key order, compaction, and co-partitioned Streams joins (empirical: <em>Confluent; <a href="https://arpitbhayani.me/blogs/kafka-partitions/">Arpit Bhayani</a></em>). Treat keyed-topic partition count as near-immutable; over-partition modestly up front. And remember: <strong>more partitions never fixes a hot key</strong>, that key still hashes to one partition; redesign or salt it instead. See <a href="op03-partitioning.html">Part II · 03</a>.</p></div>
 
@@ -102,25 +104,25 @@
 
 <p>Durability is three dials owned by three actors: <code>acks</code> (producer's request), <code>min.insync.replicas</code> (broker's pre-append floor), <code>replication.factor</code> (topology). The canonical setting <strong>RF=3 / minISR=2 / acks=all / unclean=false</strong> is the unique point that survives one broker loss both <em>losslessly</em> and <em>writably</em>: minISR=2 is exactly one above the survivable failure count of 1. Eligible Leader Replicas <span class="pill kip"><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-966:+Eligible+Leader+Replicas">KIP-966</a></span> (GA in this build) further narrows safe recovery. Full arithmetic and source in <a href="op06-durability.html">Part II · 06 Durability</a>.</p>
 
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
 <div class="node cat-control"><span class="nt">how much loss can this topic tolerate?</span></div>
 <div class="conn" data-label="classify the topic"></div>
+<div class="gate">
 <div class="node decision cat-control">acknowledged data loss acceptable?</div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn ec-data" data-label="yes, lossy telemetry"></div><div class="node cat-coord">RF=2 or 3, <code>acks=1</code> (or 0)<br/>availability/cost over durability (e.g. <a href="https://netflixtechblog.com/kafka-inside-keystone-pipeline-dd5aeabaf6bb">Netflix Keystone</a>)</div></div>
-<div class="col"><div class="conn" data-label="no, system of record"></div><div class="node decision cat-control">must stay <em>writable</em> through one failure?</div></div>
+<div class="off ec-data"><div class="arm" data-label="yes"></div><div class="node cat-coord">RF=2 or 3, <code>acks=1</code> (or 0)<br/>availability/cost over durability (e.g. <a href="https://netflixtechblog.com/kafka-inside-keystone-pipeline-dd5aeabaf6bb">Netflix Keystone</a>)</div></div>
 </div>
-<div class="conn"></div>
-<div class="row">
-<div class="col"><div class="conn" data-label="yes (the usual answer)"></div><div class="node cat-storage pill">RF=3 · minISR=2 · acks=all · unclean=false<br/>survives 1 loss lossless + writable; 2nd ⇒ read-only</div></div>
-<div class="col"><div class="conn" data-label="prefer refuse-write over any risk"></div><div class="node cat-storage">RF=3 · minISR=3 · acks=all<br/>any single loss ⇒ read-only (strict, less available)</div></div>
+<div class="conn" data-label="no, system of record"></div>
+<div class="gate">
+<div class="node decision cat-control">must stay <em>writable</em> through one failure?</div>
+<div class="off"><div class="arm" data-label="strict"></div><div class="node cat-storage">RF=3 · minISR=3 · acks=all<br/>any single loss ⇒ read-only (strict, less available)</div></div>
 </div>
+<div class="conn" data-label="yes, the usual answer"></div>
+<div class="node cat-storage pill">RF=3 · minISR=2 · acks=all · unclean=false<br/>survives 1 loss lossless + writable; 2nd ⇒ read-only</div>
 <div class="conn" data-label="then, always"></div>
 <div class="node cat-control store">spread RF across racks/AZs (<code>broker.rack</code>) · enable ELR (KIP-966) · verify minISR ≤ RF</div>
 <div class="conn" data-label="only if regulated"></div>
 <div class="node cat-storage">small <code>flush.ms</code> on the critical topic, shrinks the page-cache loss window at a latency cost</div>
-</div><figcaption>Durability decision tree. The default answer is RF=3/minISR=2; the divergences are deliberate, lossy-tolerant telemetry relaxes it, strict-consistency tightens it to minISR=3, and rack spread is non-negotiable because it converts the page-cache window from a single-event certainty into a multi-event improbability.</figcaption><div class="legend"><span class="sw cat-control"></span> decision/placement &nbsp; <span class="sw cat-storage"></span> durable setting &nbsp; <span class="sw cat-coord"></span> availability-leaning &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> lossy-tolerant branch.</div></figure>
+</div><figcaption>Durability decision spine. The default answer is RF=3/minISR=2; the divergences are deliberate, lossy-tolerant telemetry relaxes it, strict-consistency tightens it to minISR=3, and rack spread is non-negotiable because it converts the page-cache window from a single-event certainty into a multi-event improbability.</figcaption><div class="legend"><span class="sw cat-control"></span> decision/placement &nbsp; <span class="sw cat-storage"></span> durable setting &nbsp; <span class="sw cat-coord"></span> availability-leaning &nbsp; <span class="arr"></span> path &nbsp; <span class="arr dashed"></span> lossy-tolerant branch.</div></figure>
 
 <div class="callout invariant"><span class="callout-title">Why these exact numbers (the mechanism, not folklore)</span><p>The pre-append gate <code>if (inSyncSize &lt; minIsr &amp;&amp; requiredAcks == -1) throw NotEnoughReplicasException</code> (<code>Partition.scala:1234</code>) fires <em>before</em> the record is appended, so an unaccepted write can never be "lost", it was never in the log. With minISR=2, every accepted <code>acks=all</code> write sat on ≥2 brokers at ack time; lose one and a copy remains. RF=3 supplies the third copy purely as availability headroom. <strong>Failure independence dominates replication factor</strong>: RF=3 across 3 AZs gives loss probability ≈ p³ ≈ 10⁻⁹, but RF=3 in <em>one</em> AZ collapses to ≈ q ≈ 10⁻³ when a single power event takes all three, a million times worse at identical RF. Spend the durability budget on rack spread before more replicas. And the honest caveat: <code>acks=all</code> means "in the page cache of every ISR member," <em>not</em> fsynced, Kafka bets N independent replicas beat one fsynced copy, which is correct for every failure except simultaneous power loss of the whole ISR (empirical: <em>Kreps/LinkedIn; <a href="https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up">Vanlightly</a></em>). See <a href="op06-durability.html">Part II · 06</a> and <a href="08-replication.html">Part I · 08</a>.</p></div>
 

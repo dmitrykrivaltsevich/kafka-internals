@@ -672,6 +672,31 @@ figure.diagram .mermaid .node circle, figure.diagram .mermaid .node path { filte
 .dflow .col > .conn:has(+ .row)::after { display: none; content: none; }
 .dflow .ec-data { --ec: var(--cat-broker); } .dflow .ec-async { --ec: var(--cat-coord); } .dflow .ec-err { --ec: var(--cat-error); }
 
+/* ----- dflow.spine: a vertical decision gate-chain with side off-ramps -----
+   For multi-gate "should I use X?" flows. Questions stack on a straight left
+   spine (fixed width, so connectors line up under each question); each gate's
+   exit answer branches off to the right; the spine runs straight down through
+   the "no / continue" connectors and ends in the recommended node, so every
+   connector visibly leaves its question (a flat fork tree centres each inter-row
+   stem, which reads as the line leaving the wrong box). */
+.dflow.spine { align-items: flex-start; }
+.dflow.spine .gate { display: flex; align-items: center; }
+.dflow.spine .gate > .node { width: 21rem; flex: none; box-sizing: border-box; }
+.dflow.spine > .conn { align-self: flex-start; margin-left: 10.5rem; }
+.dflow.spine > .node { width: 21rem; box-sizing: border-box; }
+.dflow.spine .gate > .off { display: flex; align-items: center; }
+.dflow.spine .gate > .off > .arm { width: 2.2rem; height: 0; flex: none; position: relative; border-top: 2px solid var(--ec, var(--fg-faint)); }
+.dflow.spine .gate > .off.ec-err { --ec: var(--cat-error); }
+.dflow.spine .gate > .off.dashed > .arm { border-top-style: dashed; }
+.dflow.spine .gate > .off > .arm::after {
+  content: ""; position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+  border-top: 4.5px solid transparent; border-bottom: 4.5px solid transparent; border-left: 7px solid var(--ec, var(--fg-faint));
+}
+.dflow.spine .gate > .off > .arm[data-label]::before {
+  content: attr(data-label); position: absolute; left: 50%; top: -1.2rem; transform: translateX(-50%);
+  white-space: nowrap; font-size: 0.7rem; color: var(--fg-muted); background: var(--canvas); padding: 0 0.3rem;
+}
+
 /* ----- dstack: layered architecture / planes ------------------------------ */
 .dstack { display: flex; flex-direction: column; gap: 5px; }
 .dstack .layer {

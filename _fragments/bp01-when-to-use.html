@@ -69,59 +69,31 @@
 
 <p>The framework collapses into a single traversal. Walk it top-down for any candidate workload; the first hard "no" routes you off the log. The tree encodes the central asymmetry: the forces <em>against</em> are mostly inherent, so a workload that trips one of the early gates will not be rescued by tuning, whereas a workload that clears them benefits more from the log the more of the later forces it accumulates.</p>
 
-<figure class="diagram"><div class="dflow">
+<figure class="diagram"><div class="dflow spine">
   <div class="node cat-client"><span class="nt">candidate workload</span><span class="nd">data in motion, events, commands, changes, telemetry</span></div>
   <div class="conn" data-label="characterize the dominant access pattern"></div>
-  <div class="node cat-control decision">Primary need = lookup-by-key, update-in-place, or ad-hoc query?</div>
-  <div class="conn"></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn ec-err" data-label="yes, it's a store"></div>
-      <div class="node cat-error"><span class="nt">use a database</span><span class="nd">log has no index / no mutation / topic-wide retention. Optionally feed it FROM a log via CDC.</span></div>
-    </div>
-    <div class="col">
-      <div class="conn" data-label="no, it's a stream"></div>
-      <div class="node cat-control decision">Need a synchronous reply within tens of ms?</div>
-    </div>
+  <div class="gate">
+    <div class="node cat-control decision">Primary need = lookup-by-key, update-in-place, or ad-hoc query?</div>
+    <div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">use a database</span><span class="nd">log has no index / no mutation / topic-wide retention. Optionally feed it FROM a log via CDC.</span></div></div>
   </div>
-  <div class="conn"></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn ec-err" data-label="yes, request/response"></div>
-      <div class="node cat-error"><span class="nt">use RPC / gRPC / HTTP</span><span class="nd">replication + poll floor + no correlation; a reply topic re-couples the services.</span></div>
-    </div>
-    <div class="col">
-      <div class="conn" data-label="no, fire-and-forward"></div>
-      <div class="node cat-coord decision">Do you need replay, OR fan-out to ≥ 2 independent consumers?</div>
-    </div>
+  <div class="conn" data-label="no, it's a stream"></div>
+  <div class="gate">
+    <div class="node cat-control decision">Need a synchronous reply within tens of ms?</div>
+    <div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">use RPC / gRPC / HTTP</span><span class="nd">replication + poll floor + no correlation; a reply topic re-couples the services.</span></div></div>
   </div>
-  <div class="conn"></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn dashed" data-label="no to both, single consume-once"></div>
-      <div class="node cat-coord decision">Need per-message ack / priority / TTL / routing?</div>
-    </div>
-    <div class="col">
-      <div class="conn" data-label="yes, replay and/or fan-out"></div>
-      <div class="node cat-storage decision">Throughput high &amp; sustained, OR per-key order required?</div>
-    </div>
+  <div class="conn" data-label="no, fire-and-forward"></div>
+  <div class="gate">
+    <div class="node cat-coord decision">Need per-message ack / priority / TTL / routing?</div>
+    <div class="off ec-err"><div class="arm" data-label="yes"></div><div class="node cat-error"><span class="nt">use a queue / broker</span><span class="nd">RabbitMQ for routing+priority+TTL; share groups (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-932:+Queues+for+Kafka">KIP-932</a>) for ack+redelivery+DLQ but no priority/routing.</span></div></div>
   </div>
-  <div class="conn"></div>
-  <div class="row">
-    <div class="col">
-      <div class="conn ec-err" data-label="yes &amp; classic semantics"></div>
-      <div class="node cat-error"><span class="nt">use a queue / broker</span><span class="nd">RabbitMQ for routing+priority+TTL; share groups (<a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-932:+Queues+for+Kafka">KIP-932</a>) for ack+redelivery+DLQ but no priority/routing.</span></div>
-    </div>
-    <div class="col">
-      <div class="conn dashed" data-label="no, plain decoupling, low volume"></div>
-      <div class="node cat-coord"><span class="nt">a managed queue may be simpler</span><span class="nd">log works, but weigh its fixed ops cost vs. Kinesis/Pub-Sub/SQS at tiny scale.</span></div>
-    </div>
-    <div class="col">
-      <div class="conn" data-label="yes, throughput / ordering"></div>
-      <div class="node cat-storage pill"><span class="nt">USE THE LOG</span><span class="nd">Kafka (or a log-shaped system). Materialize queryable views downstream; keep the log as source of truth.</span></div>
-    </div>
+  <div class="conn" data-label="no, stream semantics suffice"></div>
+  <div class="gate">
+    <div class="node cat-storage decision">Replay or fan-out to ≥ 2 consumers, AND high sustained throughput or per-key order?</div>
+    <div class="off dashed"><div class="arm" data-label="no"></div><div class="node cat-coord"><span class="nt">a managed queue may be simpler</span><span class="nd">log works, but weigh its fixed ops cost vs. Kinesis/Pub-Sub/SQS at tiny scale.</span></div></div>
   </div>
-</div><figcaption>The decision tree. Three early gates eliminate the misuses (store, RPC, classic queue); the workload reaches "use the log" only after clearing them and then exhibiting replay/fan-out <em>and</em> throughput/ordering. Note the two amber "maybe" leaves: a low-volume decoupling job runs fine on a log but may not justify its fixed cost, and a per-message-semantics job lands on share groups only if it can live without priority/routing (see the next sections). The dashed paths are the "it works but interrogate it" branches; solid paths are clean fits or clean misfits.</figcaption>
+  <div class="conn" data-label="yes, on both counts"></div>
+  <div class="node cat-storage pill"><span class="nt">USE THE LOG</span><span class="nd">Kafka (or a log-shaped system). Materialize queryable views downstream; keep the log as source of truth.</span></div>
+</div><figcaption>The decision as a spine. Three early gates rule out the misuses (store, RPC, classic queue), each branching off to the right; a workload reaches USE THE LOG only after clearing all three and then needing replay or fan-out <em>and</em> sustained throughput or per-key ordering. The single dashed off-ramp is the "works, but interrogate it" branch: a low-volume decoupling job runs on a log but may not earn its fixed ops cost. The solid red off-ramps are clean misfits, routed off the log.</figcaption>
 <div class="legend">
   <span class="lgi"><span class="sw cat-client"></span>workload entry</span>
   <span class="lgi"><span class="sw cat-control"></span>store/RPC gate</span>

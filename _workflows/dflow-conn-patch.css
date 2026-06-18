@@ -1,0 +1,95 @@
+/* ----- dflow connectors: directional arrows (source -> destination) -------- */
+/* Replaces the .conn / .conn::after / .conn[data-label] / .dflow.h .conn block
+   and the .col manifold + arrowhead-suppressor block. Monochrome preserved;
+   every arrowhead is a single crisp triangle centred on its 2px connector line
+   and seated at the DESTINATION end, pointing INTO the next node, so the read is
+   always source(question) -> destination(answer), top->bottom (or left->right
+   in .dflow.h). Arrowhead geometry: side borders 5px, point border 6px; for a
+   2px line the centre is 1px, so left/top = 1px - 5px = -4px puts the apex dead
+   on the line. */
+
+/* default = vertical connector (also every connector that lives inside a .col,
+   because a column always stacks top->bottom even within a horizontal .dflow.h) */
+.dflow .conn {
+  align-self: center;
+  width: 0; height: 1.7rem; margin: 0.05rem 0;
+  border-left: 2px solid var(--ec, var(--fg-faint));
+  position: relative;
+}
+.dflow .conn.dashed { border-left-style: dashed; }
+.dflow .conn::after {                       /* down-arrow at the bottom (into the node) */
+  content: ""; position: absolute; bottom: -1px; left: -4px;
+  width: 0; height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--ec, var(--fg-faint));
+}
+.dflow .conn[data-label]::before {
+  content: attr(data-label); position: absolute; left: 0.6rem; top: 50%;
+  transform: translateY(-50%); white-space: nowrap; font-size: 0.7rem;
+  color: var(--fg-muted); background: var(--canvas); padding: 0 0.3rem;
+}
+
+/* horizontal connector — the inline flow steps of a .dflow.h. Same selector as
+   the original so it swaps in place; the .col exception below overrides it (by
+   higher specificity) for the per-branch connectors that live in a column. */
+.dflow.h .conn {
+  width: 2rem; height: 0; margin: 0 0.1rem;
+  border-left: none; border-top: 2px solid var(--ec, var(--fg-faint));
+}
+.dflow.h .conn.dashed { border-top-style: dashed; }
+.dflow.h .conn::after {                   /* right-arrow at the right end (into the node) */
+  bottom: auto; left: auto; right: -1px; top: -4px;
+  border-left: 6px solid var(--ec, var(--fg-faint));
+  border-right: none;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+}
+.dflow.h .conn[data-label]::before {
+  left: 50%; top: -1.2rem; transform: translateX(-50%);
+}
+
+/* a .col stacks vertically: force its connector back to the vertical form even
+   when the surrounding flow is .dflow.h (this is the main wrong-origin / detached
+   sideways-arrow bug for horizontal branching trees). Higher specificity than
+   .dflow.h .conn above, so it wins regardless of source order. */
+.dflow.h .col > .conn {
+  width: 0; height: 1.7rem; margin: 0.05rem 0;
+  border-top: none; border-left: 2px solid var(--ec, var(--fg-faint));
+}
+.dflow.h .col > .conn.dashed { border-left-style: dashed; border-top-style: solid; }
+.dflow.h .col > .conn::after {
+  bottom: -1px; left: -4px; right: auto; top: auto;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--ec, var(--fg-faint));
+  border-bottom: none;
+}
+.dflow.h .col > .conn[data-label]::before {
+  left: 0.6rem; top: 50%; transform: translateY(-50%);
+}
+
+/* fork manifold: the horizontal bar that joins the branch columns at their tops.
+   It is the undirected JOIN of the fork; the per-branch connectors below carry
+   the direction. Stays neutral --fg-faint (the --ec edge-colour var lives on the
+   .conn, not the .col, so it falls back here) — unchanged from the original. */
+.dflow .row { position: relative; }
+.dflow .col {
+  flex: 1 1 auto; min-width: 7rem; max-width: 24rem;
+  display: flex; flex-direction: column; align-items: center; position: relative;
+}
+.dflow .col::before {
+  content: ""; position: absolute; top: 0; height: 0;
+  border-top: 2px solid var(--ec, var(--fg-faint));
+  left: -0.8rem; right: -0.8rem;
+}
+.dflow .col:first-child::before { left: 50%; }
+.dflow .col:last-child::before { right: 50%; }
+.dflow .col:only-child::before { display: none; }
+.dflow .col > .conn:first-child { margin-top: 0; }
+
+/* a connector that FEEDS a fork (immediately precedes a .row) is just the stem
+   from the question down to the manifold — it must NOT carry an arrowhead, or the
+   fork would read as an arrow landing on the bar instead of on the answers. */
+.dflow > .conn:has(+ .row)::after,
+.dflow .col > .conn:has(+ .row)::after { display: none; content: none; }
